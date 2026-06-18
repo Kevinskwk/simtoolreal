@@ -1,4 +1,4 @@
-"""Train an isaacsimenvs task with our vendored rl_games.
+r"""Train an isaacsimenvs task with our vendored rl_games.
 
 Pipeline:
     argparse (--task, --agent, AppLauncher, wandb/video flags)
@@ -85,9 +85,9 @@ def main() -> None:
     )
     # --- wandb ---
     parser.add_argument("--wandb_activate", action="store_true")
-    parser.add_argument("--wandb_project", default="isaacsimenvs")
+    parser.add_argument("--wandb_project", default="simtoolreal")
     parser.add_argument("--wandb_group", default="")
-    parser.add_argument("--wandb_entity", default="")
+    parser.add_argument("--wandb_entity", default="kevinskwk-nus")
     parser.add_argument("--wandb_name", default="", help="Defaults to agent_cfg.params.config.name")
     parser.add_argument("--wandb_tags", nargs="*", default=[])
     parser.add_argument("--wandb_notes", default="")

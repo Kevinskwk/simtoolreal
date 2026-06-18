@@ -1,0 +1,13 @@
+# TacMap-enabled SimToolReal task overlay.
+#
+# The policy and critic observation spaces intentionally remain identical to
+# SimToolReal.yaml. TacMap buffers are updated by the env for debugging and
+# later tactile-policy branches.
+
+use_tacmap: true
+enable_vbts: true
+resolution_step: 20
+vbts_update_period: 0.016666666666666666
+
+scene:
+  num_envs: 24576
