@@ -1272,6 +1272,98 @@ def _apply_urdf_sdf_collision_markers(
         )
 
 
+def _load_adjacent_links_map() -> dict[str, list[str]]:
+    """Load the gym-side link adjacency map (the link pairs whose self-collision
+    must be filtered) and merge LEFT+RIGHT into one map.
+
+    We load adjacent_links.py by file path: importing it as
+    ``isaacgymenvs.tasks.simtoolreal.adjacent_links`` would trigger
+    ``isaacgymenvs.tasks.__init__`` -> ``from isaacgym import gymapi``, which is
+    absent in ``.venv_isaacsim``. The file itself is pure dict literals.
+    Merging both handednesses is safe: links absent from the imported robot
+    (e.g. the right-hand links for a left-hand URDF) simply find no prim and are
+    skipped.
+    """
+    import importlib.util
+
+    from isaacgymenvs.utils.utils import get_repo_root_dir
+
+    path = get_repo_root_dir() / "isaacgymenvs/tasks/simtoolreal/adjacent_links.py"
+    spec = importlib.util.spec_from_file_location("_simtoolreal_adjacent_links", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    merged: dict[str, list[str]] = {}
+    for src in (
+        mod.LEFT_SHARPA_KUKA_LINK_TO_ADJACENT_LINKS,
+        mod.RIGHT_SHARPA_KUKA_LINK_TO_ADJACENT_LINKS,
+    ):
+        for link, neighbors in src.items():
+            merged.setdefault(link, [])
+            for nb in neighbors:
+                if nb not in merged[link]:
+                    merged[link].append(nb)
+    return merged
+
+
+def _apply_self_collision_filters(usd_path: str) -> None:
+    """Author USD ``FilteredPairsAPI`` on the robot's articulation links so the
+    adjacent-link pairs in ``adjacent_links.py`` do NOT self-collide — mirroring
+    Isaac Gym, which enables all self-collisions then masks adjacent links.
+
+    Only effective when the articulation has self-collision enabled
+    (``enabled_self_collisions=True`` + URDF import ``self_collision=True``).
+    Links merged away by ``merge_fixed_joints`` have no rigid-body prim and are
+    skipped (a merged link shares its parent's body and cannot self-collide
+    anyway).
+    """
+    from pxr import Usd, UsdPhysics
+
+    adjacency = _load_adjacent_links_map()
+
+    raw_usd_path = Path(usd_path)
+    physics_usd_path = raw_usd_path.parent / "configuration" / f"{raw_usd_path.stem}_physics.usd"
+    edit_usd_path = physics_usd_path if physics_usd_path.exists() else raw_usd_path
+
+    stage = Usd.Stage.Open(str(edit_usd_path), Usd.Stage.LoadAll)
+    if stage is None:
+        raise RuntimeError(f"Failed to open USD while applying self-collision filters: {edit_usd_path}")
+    stage.Load()
+
+    body_by_name: dict[str, Usd.Prim] = {}
+    for prim in Usd.PrimRange(stage.GetPseudoRoot(), Usd.TraverseInstanceProxies()):
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            body_by_name[prim.GetName()] = prim
+
+    pairs_filtered = 0
+    missing: set[str] = set()
+    for link, neighbors in adjacency.items():
+        a = body_by_name.get(link)
+        if a is None:
+            missing.add(link)
+            continue
+        rel = UsdPhysics.FilteredPairsAPI.Apply(a).CreateFilteredPairsRel()
+        existing = set(rel.GetTargets())
+        for nb in neighbors:
+            b = body_by_name.get(nb)
+            if b is None:
+                missing.add(nb)
+                continue
+            if b.GetPath() not in existing:
+                rel.AddTarget(b.GetPath())
+                existing.add(b.GetPath())
+                pairs_filtered += 1
+
+    stage.GetRootLayer().Save()
+
+    print(
+        f"[scene_utils] self-collision: filtered {pairs_filtered} adjacent link pairs "
+        f"across {len(body_by_name)} robot bodies in {edit_usd_path.name}"
+        + (f"; skipped {len(missing)} merged/absent links" if missing else ""),
+        flush=True,
+    )
+
+
 def _generate_scaled_table_urdfs(
     base_urdf_path: str,
     num_variants: int,
@@ -1626,16 +1718,21 @@ def setup_scene(env) -> None:
         for usd in object_raw_usds
     ]
 
+    robot_converted_usd = _convert_urdf_to_usd(
+        assets_cfg.robot_urdf, usd_work_dir,
+        fix_base=True, self_collision=True,
+        joint_drive=_robot_joint_drive_cfg(),
+    )
+    # Isaac Gym enables all robot self-collisions then masks adjacent links; mirror
+    # that by authoring FilteredPairsAPI for the adjacent_links.py pairs before the
+    # bake (PhysX additionally auto-filters directly-jointed parent/child links).
+    _apply_self_collision_filters(robot_converted_usd)
     robot_usd_path = _bake_usd(
-        _convert_urdf_to_usd(
-            assets_cfg.robot_urdf, usd_work_dir,
-            fix_base=True, self_collision=False,
-            joint_drive=_robot_joint_drive_cfg(),
-        ),
+        robot_converted_usd,
         bake_root, "robot",
         props=dict(
             disable_gravity=True, max_depenetration_velocity=1000.0,
-            enabled_self_collisions=False,
+            enabled_self_collisions=True,
             solver_position_iterations=8, solver_velocity_iterations=0,
         ),
         apply_physx_articulation=True,
