@@ -27,6 +27,21 @@ agent.params.config.minibatch_size=1024
 agent.params.config.central_value_config.minibatch_size=1024
 ```
 
+To train with compact TacMap tactile features, use the contact-feature task.
+The env appends 15 compact tactile values to the actor observation: per finger,
+`[contact_area, center_x, center_y]`. The centroid values are gated to zero
+when contact is absent, and temporal history is handled by the same LSTM path as
+the proprio policy.
+
+```bash
+python isaacsimenvs/train.py \
+  --task Isaacsimenvs-SimToolReal-TacMap-Contact-Direct-v0 \
+  --agent rl_games_sapg_cfg_entry_point \
+  --headless \
+  --capture_viewer \
+  --wandb_activate
+```
+
 ## Scope
 
 Included:
@@ -37,10 +52,10 @@ Included:
 - TacMap map assets under `assets/tacmap`.
 - A registered proprio-only TacMap task:
   `Isaacsimenvs-SimToolReal-TacMap-Direct-v0`.
+- A registered compact tactile-contact task:
+  `Isaacsimenvs-SimToolReal-TacMap-Contact-Direct-v0`.
 
 Deferred:
 
-- Feeding tactile tensors into the policy.
-- TacMap CNN policy fusion.
 - rl_games structured-dict observation patches.
 - Any replacement of official reward, reset, action, or termination code.

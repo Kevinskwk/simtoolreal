@@ -10,25 +10,36 @@ from .reset_utils import reset_goal_trackers
 def update_tolerance_curriculum(env) -> None:
     """Shrink success tolerance when completed episodes average enough goals."""
     env._frame_counter += 1
+    env._curriculum_updated_this_step = False
     term = env.cfg.termination
+
+    successes = env._prev_episode_successes.float()
+    eligible_mask = None
+    if hasattr(env, "_curriculum_eligible_mask"):
+        eligible_mask = env._curriculum_eligible_mask()
+    if eligible_mask is not None:
+        successes = successes[eligible_mask]
+
+    threshold = term.tolerance_curriculum_success_threshold
+    if hasattr(env, "_curriculum_success_threshold"):
+        custom_threshold = env._curriculum_success_threshold()
+        if custom_threshold is not None:
+            threshold = float(custom_threshold)
+
+    env._curriculum_success_mean = (
+        float(successes.mean().item()) if successes.numel() > 0 else 0.0
+    )
+    env._curriculum_success_threshold_value = float(threshold)
+    env._curriculum_eligible_count = int(successes.numel())
+
     if env._frame_counter - env._last_curriculum_update >= term.tolerance_curriculum_interval:
-        successes = env._prev_episode_successes.float()
-        eligible_mask = None
-        if hasattr(env, "_curriculum_eligible_mask"):
-            eligible_mask = env._curriculum_eligible_mask()
-        if eligible_mask is not None:
-            successes = successes[eligible_mask]
-
-        threshold = term.tolerance_curriculum_success_threshold
-        if hasattr(env, "_curriculum_success_threshold"):
-            custom_threshold = env._curriculum_success_threshold()
-            if custom_threshold is not None:
-                threshold = float(custom_threshold)
-
-        if successes.numel() > 0 and successes.mean().item() >= threshold:
+        if successes.numel() > 0 and env._curriculum_success_mean >= threshold:
             new_tol = env._current_success_tolerance * term.tolerance_curriculum_increment
             new_tol = max(min(new_tol, term.success_tolerance), term.target_success_tolerance)
-            env._current_success_tolerance = new_tol
+            if new_tol != env._current_success_tolerance:
+                env._current_success_tolerance = new_tol
+                env._curriculum_updated_this_step = True
+                env._curriculum_update_count += 1
             env._last_curriculum_update = env._frame_counter
 
     # Eval pins the success criterion.

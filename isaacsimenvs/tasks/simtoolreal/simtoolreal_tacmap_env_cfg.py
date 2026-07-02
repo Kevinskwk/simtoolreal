@@ -1,8 +1,9 @@
 """TacMap-enabled SimToolReal config.
 
-This config extends the official SimToolReal IsaacSim task without changing the
-policy or critic observation contract. TacMap buffers are exposed for debugging
-and later tactile-policy branches.
+This config extends the official SimToolReal IsaacSim task. The base TacMap
+variant keeps the policy and critic observation contract unchanged; the tactile
+contact variant appends compact per-finger contact features to the actor
+observation.
 """
 
 from __future__ import annotations
@@ -14,11 +15,12 @@ from isaaclab.utils import configclass
 
 from isaacsimenvs.sensors.tacmap import SharpaTacmapCfg
 
-from .simtoolreal_env_cfg import SimToolRealEnvCfg
+from .simtoolreal_env_cfg import ObsCfg, SimToolRealEnvCfg
 
 
 _TACMAP_ROOT = Path(__file__).resolve().parents[3] / "assets" / "tacmap"
 _ELASTOMER_OFFSET_ROT_WXYZ = (0.5, 0.5, -0.5, 0.5)
+_BASE_OBS = ObsCfg()
 
 
 @configclass
@@ -157,3 +159,30 @@ class SimToolRealTacMapEnvCfg(SimToolRealEnvCfg):
         side_h = 240 // int(self.resolution_step)
         side_w = 240 // int(self.resolution_step)
         return len(self.vbts_sensor) * side_h * side_w
+
+
+@configclass
+class SimToolRealTacMapContactEnvCfg(SimToolRealTacMapEnvCfg):
+    """TacMap task variant with Sharpa rotation-style tactile contact features."""
+
+    include_tacmap_in_policy: bool = True
+    tacmap_obs_normalization: float = 255.0
+    enable_tactile: bool = True
+    binary_contact: bool = False
+    contact_smooth: float = 0.5
+    contact_latency: float = 0.005
+    contact_threshold: float = 0.05
+    contact_sensor_noise: float = 0.01
+    tacmap_history_len: int = 5
+    disable_tactile_ids: list[int] = []
+
+    obs: ObsCfg = ObsCfg(
+        obs_list=_BASE_OBS.obs_list + ("tacmap",),
+        state_list=_BASE_OBS.state_list,
+        clamp_abs_observations=_BASE_OBS.clamp_abs_observations,
+    )
+
+    def compute_tacmap_obs_size(self) -> int:
+        if self.tacmap_history_len <= 0:
+            raise ValueError("tacmap_history_len must be positive.")
+        return len(self.vbts_sensor) * 3 * int(self.tacmap_history_len)

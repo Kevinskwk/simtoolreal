@@ -54,6 +54,11 @@ OBS_FIELD_SIZES: dict[str, int] = {
 }
 
 
+def register_obs_field_size(name: str, size: int) -> None:
+    """Register an optional observation field size before env construction."""
+    OBS_FIELD_SIZES[name] = int(size)
+
+
 def compute_obs_dim(field_list) -> int:
     """Return total tensor dim for an ordered list of obs field names."""
     return sum(OBS_FIELD_SIZES[f] for f in field_list)
@@ -326,6 +331,9 @@ def build_observations(env) -> dict[str, torch.Tensor]:
         "reward": (env.reward_buf * 0.01).unsqueeze(-1),
     }
 
+    if "tacmap" in set(env.cfg.obs.obs_list) | set(env.cfg.obs.state_list):
+        obs_clean["tacmap"] = env.get_tacmap_policy_obs()
+
     obs_noisy = dict(obs_clean)
     obs_noisy["object_rot"] = noisy_obj_rot_xyzw
     obs_noisy["object_vel"] = noisy_obj_vel
@@ -466,6 +474,7 @@ __all__ = [
     "NUM_KEYPOINTS",
     "KEYPOINT_CORNERS",
     "OBS_FIELD_SIZES",
+    "register_obs_field_size",
     "compute_obs_dim",
     "compute_intermediate_values",
     "build_observations",

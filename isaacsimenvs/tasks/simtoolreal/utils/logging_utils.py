@@ -28,6 +28,35 @@ def log_step_metrics(env) -> None:
     env.extras["episode_final"] = episode_final
     env.extras["successes"] = env._prev_episode_successes.float()
     env.extras["current_success_tolerance"] = float(env._current_success_tolerance)
+    env.extras["curriculum/current_success_tolerance"] = float(
+        env._current_success_tolerance
+    )
+    env.extras["curriculum/start_success_tolerance"] = float(
+        term_cfg.success_tolerance
+    )
+    env.extras["curriculum/target_success_tolerance"] = float(
+        term_cfg.target_success_tolerance
+    )
+    env.extras["curriculum/success_mean"] = float(
+        getattr(env, "_curriculum_success_mean", 0.0)
+    )
+    default_success_threshold = term_cfg.tolerance_curriculum_success_threshold
+    env.extras["curriculum/success_threshold"] = float(
+        getattr(env, "_curriculum_success_threshold_value", default_success_threshold)
+    )
+    env.extras["curriculum/eligible_count"] = float(
+        getattr(env, "_curriculum_eligible_count", env.num_envs)
+    )
+    env.extras["curriculum/updated_this_step"] = float(
+        getattr(env, "_curriculum_updated_this_step", False)
+    )
+    env.extras["curriculum/update_count"] = float(
+        getattr(env, "_curriculum_update_count", 0)
+    )
+    env.extras["curriculum/frames_since_update"] = float(
+        env._frame_counter - env._last_curriculum_update
+    )
+    env.extras["curriculum/frame_counter"] = float(env._frame_counter)
 
 
 __all__ = ["log_step_metrics"]

@@ -116,11 +116,11 @@ reset:
   table_object_z_offset: 0.25
 
   goal_sampling_type: delta           # "delta" | "absolute"
-  delta_goal_distance: 0.1
-  delta_rotation_degrees: 90.0
+  delta_goal_distance: 0.5
+  delta_rotation_degrees: 45.0
   target_volume_mins: [-0.35, -0.2, 0.6]
   target_volume_maxs: [0.35, 0.2, 0.95]
-  target_volume_region_scale: 1.0
+  target_volume_region_scale: 0.75 #1.0
 
 # -----------------------------------------------------------------------------
 # 7) termination — end-of-episode conditions + tolerance curriculum

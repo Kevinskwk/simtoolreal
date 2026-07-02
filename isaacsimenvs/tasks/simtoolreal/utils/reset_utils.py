@@ -117,6 +117,13 @@ def allocate_state_buffers(env) -> None:
     )
     env._frame_counter: int = 0
     env._last_curriculum_update: int = 0
+    env._curriculum_update_count: int = 0
+    env._curriculum_updated_this_step: bool = False
+    env._curriculum_success_mean: float = 0.0
+    env._curriculum_success_threshold_value: float = (
+        env.cfg.termination.tolerance_curriculum_success_threshold
+    )
+    env._curriculum_eligible_count: int = env.num_envs
 
     # --- Object lifted-reward reference z (updated on each _reset_object_pose) ---
     init_z = env.cfg.reset.table_reset_z + env.cfg.reset.table_object_z_offset

@@ -32,6 +32,13 @@ import argparse
 import math
 import os
 import sys
+from pathlib import Path
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_VENDOR_RL_GAMES = _REPO_ROOT / "rl_games"
+if _VENDOR_RL_GAMES.is_dir():
+    sys.path.insert(0, str(_VENDOR_RL_GAMES))
 
 
 def main() -> None:
@@ -51,9 +58,10 @@ def main() -> None:
     parser.add_argument("--checkpoint", default=None, help="Path to .pth to restore")
     parser.add_argument(
         "--checkpoint_load_mode",
-        choices=("resume", "weights"),
+        choices=("resume", "weights", "expand_obs"),
         default="resume",
-        help="resume restores optimizer/rollout/env state; weights starts fresh from model weights.",
+        help="resume restores optimizer/rollout/env state; weights starts fresh from model weights; "
+        "expand_obs loads old smaller-observation weights into a larger observation model.",
     )
     parser.add_argument("--rl_device", default="cuda:0")
     parser.add_argument("--sim_device", default="cuda:0")

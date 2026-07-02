@@ -19,12 +19,13 @@ import gymnasium as gym
 from .simtoolreal_env import SimToolRealEnv
 from .simtoolreal_env_cfg import SimToolRealEnvCfg
 from .simtoolreal_tacmap_env import SimToolRealTacMapEnv
-from .simtoolreal_tacmap_env_cfg import SimToolRealTacMapEnvCfg
+from .simtoolreal_tacmap_env_cfg import SimToolRealTacMapContactEnvCfg, SimToolRealTacMapEnvCfg
 
 __all__ = [
     "SimToolRealEnv",
     "SimToolRealEnvCfg",
     "SimToolRealTacMapEnv",
+    "SimToolRealTacMapContactEnvCfg",
     "SimToolRealTacMapEnvCfg",
 ]
 
@@ -51,6 +52,19 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": "isaacsimenvs.tasks.simtoolreal.simtoolreal_tacmap_env_cfg:SimToolRealTacMapEnvCfg",
         "env_cfg_yaml_entry_point": str(_CFG_DIR / "task" / "SimToolRealTacMap.yaml"),
+        "rl_games_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealPPO.yaml"),
+        "rl_games_sapg_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealSAPG.yaml"),
+    },
+)
+
+gym.register(
+    id="Isaacsimenvs-SimToolReal-TacMap-Contact-Direct-v0",
+    entry_point="isaacsimenvs.tasks.simtoolreal.simtoolreal_tacmap_env:SimToolRealTacMapEnv",
+    order_enforce=False,
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": "isaacsimenvs.tasks.simtoolreal.simtoolreal_tacmap_env_cfg:SimToolRealTacMapContactEnvCfg",
+        "env_cfg_yaml_entry_point": str(_CFG_DIR / "task" / "SimToolRealTacMapContact.yaml"),
         "rl_games_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealPPO.yaml"),
         "rl_games_sapg_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealSAPG.yaml"),
     },
