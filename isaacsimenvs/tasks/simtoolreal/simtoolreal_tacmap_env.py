@@ -37,12 +37,9 @@ class SimToolRealTacMapEnv(SimToolRealEnv):
             device=self.device,
         )
         self._prev_raw_contacts = torch.zeros_like(self.last_contacts)
+        history_len = int(getattr(self.cfg, "tacmap_history_len", 1))
         self._tacmap_policy_obs_history = torch.zeros(
-            (
-                self.num_envs,
-                int(getattr(self.cfg, "tacmap_history_len", 1)),
-                num_sensors * 3,
-            ),
+            (self.num_envs, history_len, num_sensors * 5),
             dtype=torch.float32,
             device=self.device,
         )
@@ -137,7 +134,16 @@ class SimToolRealTacMapEnv(SimToolRealEnv):
         contact_weights = torch.where(contact_mask, tactile, torch.zeros_like(tactile))
 
         contact_area = contact_mask.to(torch.float32).mean(dim=(-1, -2))
+        contact_count = contact_mask.to(torch.float32).sum(dim=(-1, -2))
         contact_mass = contact_weights.sum(dim=(-1, -2)).clamp_min(1.0e-6)
+        contact_depth_mean = torch.where(
+            contact_count > 0.0,
+            contact_weights.sum(dim=(-1, -2)) / contact_count.clamp_min(1.0),
+            torch.zeros_like(contact_area),
+        )
+        contact_depth_max = torch.where(
+            contact_mask, tactile, torch.zeros_like(tactile)
+        ).amax(dim=(-1, -2))
         contact_cx = (
             (contact_weights * self._tacmap_grid_x).sum(dim=(-1, -2))
             / contact_mass
@@ -154,6 +160,8 @@ class SimToolRealTacMapEnv(SimToolRealEnv):
         if disabled:
             disabled_ids = torch.as_tensor(disabled, device=self.device, dtype=torch.long)
             contact_area[:, disabled_ids] = 0.0
+            contact_depth_mean[:, disabled_ids] = 0.0
+            contact_depth_max[:, disabled_ids] = 0.0
             contact_cx[:, disabled_ids] = 0.0
             contact_cy[:, disabled_ids] = 0.0
 
@@ -197,15 +205,24 @@ class SimToolRealTacMapEnv(SimToolRealEnv):
         if disabled:
             sensed_contacts[:, disabled_ids] = 0.0
         contact_present = sensed_contacts > 0.0
+        contact_depth_mean = torch.where(
+            contact_present, contact_depth_mean, torch.zeros_like(contact_depth_mean)
+        )
+        contact_depth_max = torch.where(
+            contact_present, contact_depth_max, torch.zeros_like(contact_depth_max)
+        )
         contact_cx = torch.where(contact_present, contact_cx, torch.zeros_like(contact_cx))
         contact_cy = torch.where(contact_present, contact_cy, torch.zeros_like(contact_cy))
         if not bool(getattr(self.cfg, "enable_tactile", True)):
             sensed_contacts[:] = 0.0
+            contact_depth_mean[:] = 0.0
+            contact_depth_max[:] = 0.0
             contact_cx[:] = 0.0
             contact_cy[:] = 0.0
-        return torch.stack((sensed_contacts, contact_cx, contact_cy), dim=-1).reshape(
-            self.num_envs, -1
-        )
+        return torch.stack(
+            (sensed_contacts, contact_depth_mean, contact_depth_max, contact_cx, contact_cy),
+            dim=-1,
+        ).reshape(self.num_envs, -1)
 
     def get_tacmap_policy_obs(self) -> torch.Tensor:
         frame = self._get_tacmap_policy_obs_frame()

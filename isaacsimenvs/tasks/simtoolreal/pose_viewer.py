@@ -23,7 +23,7 @@ from .utils.scene_utils import JOINT_NAMES_CANONICAL
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-GITHUB_RAW_BASE_MAIN = "https://raw.githubusercontent.com/tylerlum/simtoolreal/main/"
+REMOTE_ASSET_BASE_MAIN = "https://cdn.jsdelivr.net/gh/tylerlum/simtoolreal@main/"
 ROBOT_URDF_RELATIVE_PATH = "assets/urdf/kuka_sharpa_description/iiwa14_left_sharpa_adjusted_restricted.urdf"
 TABLE_URDF_PATH = REPO_ROOT / "assets" / "urdf" / "table_narrow.urdf"
 
@@ -49,9 +49,10 @@ def _pose_xyzw(pos, quat_wxyz) -> np.ndarray:
 
 
 def _normalize_raw_base(github_raw_base: str | None) -> str:
-    # Meshes are immutable and present on main, so a fixed main URL is
-    # the most durable link (branch/commit pins break when refs vanish).
-    base = github_raw_base or GITHUB_RAW_BASE_MAIN
+    # WandB viewers run in the user's browser.  Loading assets from
+    # raw.githubusercontent.com can hit GitHub's unauthenticated rate limit
+    # across repeated media-panel opens, so default to jsDelivr's GitHub CDN.
+    base = github_raw_base or REMOTE_ASSET_BASE_MAIN
     return base if base.endswith("/") else base + "/"
 
 

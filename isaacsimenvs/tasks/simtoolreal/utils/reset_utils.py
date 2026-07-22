@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from isaaclab.utils.math import random_orientation
+from isaaclab.utils.math import quat_from_angle_axis, quat_mul, random_orientation
 
 from .action_utils import sample_log_uniform
 from .goal_sampling import sample_absolute_goal_pose, sample_delta_goal_pose
@@ -131,10 +131,14 @@ def allocate_state_buffers(env) -> None:
         (env.num_envs,), init_z, device=env.device
     )
 
-    # --- Per-env table surface z (randomized in _reset_table_pose) ---
+    # --- Per-env table pose (randomized in _reset_table_pose) ---
     env._table_z_per_env = torch.full(
         (env.num_envs,), env.cfg.reset.table_reset_z, device=env.device
     )
+    env._table_quat_wxyz_per_env = torch.zeros(
+        env.num_envs, 4, dtype=torch.float32, device=env.device
+    )
+    env._table_quat_wxyz_per_env[:, 0] = 1.0
 
     # --- DR rolling buffers ---
     env._object_state_queue = torch.zeros(
@@ -256,6 +260,22 @@ def _reset_table_pose(env, env_ids: torch.Tensor) -> None:
         pos_local[:, 0] = rx
         pos_local[:, 1] = ry
 
+    quat = torch.tensor(
+        [1.0, 0.0, 0.0, 0.0], device=env.device, dtype=torch.float32
+    ).unsqueeze(0).expand(n, -1).clone()
+
+    pitch_roll_range_deg = float(getattr(cfg, "table_reset_pitch_roll_range_deg", 0.0))
+    if pitch_roll_range_deg > 0.0:
+        angles = (
+            torch.empty(n, 2, device=env.device).uniform_(-1.0, 1.0)
+            * pitch_roll_range_deg * (torch.pi / 180.0)
+        )
+        x_axis = torch.tensor([1.0, 0.0, 0.0], device=env.device).expand(n, -1)
+        y_axis = torch.tensor([0.0, 1.0, 0.0], device=env.device).expand(n, -1)
+        q_roll = quat_from_angle_axis(angles[:, 0], x_axis)
+        q_pitch = quat_from_angle_axis(angles[:, 1], y_axis)
+        quat = quat_mul(q_pitch, q_roll)
+
     # Yaw noise — sample uniform [-r, r] degrees, build a z-axis rotation quat.
     yaw_range_deg = float(cfg.table_reset_yaw_range_deg)
     if yaw_range_deg > 0.0:
@@ -263,15 +283,11 @@ def _reset_table_pose(env, env_ids: torch.Tensor) -> None:
             torch.empty(n, device=env.device).uniform_(-1.0, 1.0)
             * yaw_range_deg * (torch.pi / 180.0)
         )
-        half = yaw_rad * 0.5
-        w = torch.cos(half)
-        z = torch.sin(half)
-        quat = torch.stack([w, torch.zeros_like(w), torch.zeros_like(w), z], dim=-1)
-    else:
-        quat = torch.tensor(
-            [1.0, 0.0, 0.0, 0.0], device=env.device, dtype=torch.float32
-        ).unsqueeze(0).expand(n, -1)
+        z_axis = torch.tensor([0.0, 0.0, 1.0], device=env.device).expand(n, -1)
+        q_yaw = quat_from_angle_axis(yaw_rad, z_axis)
+        quat = quat_mul(q_yaw, quat)
 
+    env._table_quat_wxyz_per_env[env_ids] = quat
     pose = torch.cat([pos_local + env_origins, quat], dim=-1)
     env.table.write_root_pose_to_sim(pose, env_ids=env_ids)
 

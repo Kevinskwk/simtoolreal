@@ -184,11 +184,17 @@ def build_robot_articulation_usd_cfg(
     )
 
 
-def build_rigid_object_cfg(prim_path: str, usd_paths: list[str]) -> RigidObjectCfg:
+def build_rigid_object_cfg(
+    prim_path: str, usd_paths: list[str], *, activate_contact_sensors: bool = False
+) -> RigidObjectCfg:
     """Spawn a RigidObject from one or more pre-baked USDs (round-robin)."""
     return RigidObjectCfg(
         prim_path=prim_path,
-        spawn=MultiUsdFileCfg(usd_path=list(usd_paths), random_choice=False),
+        spawn=MultiUsdFileCfg(
+            usd_path=list(usd_paths),
+            random_choice=False,
+            activate_contact_sensors=bool(activate_contact_sensors),
+        ),
     )
 
 
@@ -1798,8 +1804,23 @@ def setup_scene(env) -> None:
         robot_usd_path,
         start_arm_higher=getattr(env.cfg.reset, "start_arm_higher", False),
     ))
-    env.table = RigidObject(build_rigid_object_cfg("/World/envs/env_.*/Table", table_usd_paths))
-    env.object = RigidObject(build_rigid_object_cfg("/World/envs/env_.*/Object", object_usd_paths))
+    activate_tool_table_contact_sensors = bool(
+        getattr(env.cfg, "enable_tool_table_contact_force_reward", False)
+    )
+    env.table = RigidObject(
+        build_rigid_object_cfg(
+            "/World/envs/env_.*/Table",
+            table_usd_paths,
+            activate_contact_sensors=activate_tool_table_contact_sensors,
+        )
+    )
+    env.object = RigidObject(
+        build_rigid_object_cfg(
+            "/World/envs/env_.*/Object",
+            object_usd_paths,
+            activate_contact_sensors=activate_tool_table_contact_sensors,
+        )
+    )
     env.goal_viz = RigidObject(build_rigid_object_cfg("/World/envs/env_.*/GoalViz", goalviz_usd_paths))
     _log_scene_step(setup_t0, "spawned robot/table/object/goalviz")
 

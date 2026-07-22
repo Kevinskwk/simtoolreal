@@ -83,7 +83,7 @@ def main() -> None:
     parser.add_argument(
         "--capture_viewer_github_raw_base",
         default="",
-        help="GitHub raw base URL used by the browser to fetch robot URDF meshes.",
+        help="Remote base URL used by the browser to fetch viewer URDF/mesh assets.",
     )
     parser.add_argument(
         "--capture_viewer_url_check",
@@ -97,6 +97,7 @@ def main() -> None:
     parser.add_argument("--wandb_group", default="")
     parser.add_argument("--wandb_entity", default="kevinskwk-nus")
     parser.add_argument("--wandb_name", default="", help="Defaults to agent_cfg.params.config.name")
+    parser.add_argument("--wandb_run_id", default="", help="Explicit WandB run id to resume/log into.")
     parser.add_argument("--wandb_tags", nargs="*", default=[])
     parser.add_argument("--wandb_notes", default="")
     parser.add_argument("--wandb_logcode_dir", default="")
@@ -203,6 +204,7 @@ def main() -> None:
                     "wandb_group": args_cli.wandb_group,
                     "wandb_entity": args_cli.wandb_entity,
                     "wandb_name": args_cli.wandb_name or agent_cfg["params"]["config"]["name"],
+                    "wandb_run_id": args_cli.wandb_run_id,
                     "wandb_tags": list(args_cli.wandb_tags),
                     "wandb_notes": args_cli.wandb_notes,
                     "wandb_logcode_dir": args_cli.wandb_logcode_dir,

@@ -384,6 +384,10 @@ class ResetCfg:
     # Per-env yaw noise applied at reset (uniform half-width in degrees about z).
     # Default 0.0 preserves the identity quat (legacy behavior).
     table_reset_yaw_range_deg: float = 0.0
+    # Per-env pitch/roll noise applied at reset (uniform half-width in degrees
+    # about local/world x and y before yaw composition). Default 0.0 preserves
+    # the identity-or-yaw-only table orientation used by existing tasks.
+    table_reset_pitch_roll_range_deg: float = 0.0
 
     # Goal sampling
     goal_sampling_type: str = "delta"  # "delta" | "absolute"

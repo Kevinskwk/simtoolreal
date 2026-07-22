@@ -50,9 +50,14 @@ class WandbAlgoObserver(AlgoObserver):
         # The CLI `--wandb_name` value lives on `self.cfg.wandb_name` — prefer that
         # if set so per-run sub-file `EXPERIMENT_NAME`s actually show up in wandb.
         chosen = getattr(self.cfg, "wandb_name", "") or experiment_name
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        wandb_unique_id = f"{chosen}_{timestamp}"
-        display_name = f"{chosen}_{timestamp}"
+        requested_run_id = getattr(self.cfg, "wandb_run_id", "")
+        if requested_run_id:
+            wandb_unique_id = requested_run_id
+            display_name = chosen or requested_run_id
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            wandb_unique_id = f"{chosen}_{timestamp}"
+            display_name = f"{chosen}_{timestamp}"
         print(f"[Wandb] unique id: {wandb_unique_id}")
 
         cfg = self.cfg

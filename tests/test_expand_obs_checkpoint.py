@@ -25,9 +25,11 @@ class _DummyAgent:
 def test_expand_obs_checkpoint_weights_moves_sapg_embedding_and_zeroes_tactile_columns():
     old_obs_dim = 140
     tactile_dim = 75
+    tool_contact_dim = 10
+    added_obs_dim = tactile_dim + tool_contact_dim
     embed_dim = 32
     hidden4 = 16
-    new_obs_dim = old_obs_dim + tactile_dim
+    new_obs_dim = old_obs_dim + added_obs_dim
 
     source_rnn = torch.arange(hidden4 * (old_obs_dim + embed_dim), dtype=torch.float32).reshape(
         hidden4, old_obs_dim + embed_dim

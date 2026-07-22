@@ -51,6 +51,21 @@ OBS_FIELD_SIZES: dict[str, int] = {
     "progress": 1,
     "successes": 1,
     "reward": 1,
+    "scrape_tool_table_normal_force": 1,
+    "scrape_target_contact_normal_force": 1,
+    "scrape_contact_force_error": 1,
+    "scrape_edge_contact_error": 1,
+    "scrape_table_height": 1,
+    "scrape_table_normal": 3,
+}
+
+SCRAPE_CONTACT_FIELDS: set[str] = {
+    "scrape_tool_table_normal_force",
+    "scrape_target_contact_normal_force",
+    "scrape_contact_force_error",
+    "scrape_edge_contact_error",
+    "scrape_table_height",
+    "scrape_table_normal",
 }
 
 
@@ -70,6 +85,53 @@ def _stack_obs_dict(obs_dict: dict[str, torch.Tensor], field_list) -> torch.Tens
         [obs_dict[f].reshape(obs_dict[f].shape[0], -1) for f in field_list],
         dim=-1,
     )
+
+
+def _require_env_tensor(env, name: str) -> torch.Tensor:
+    value = getattr(env, name, None)
+    if value is None:
+        raise RuntimeError(
+            f"Observation requested scrape contact field, but env.{name} is missing."
+        )
+    if not isinstance(value, torch.Tensor):
+        raise RuntimeError(f"env.{name} must be a torch.Tensor, got {type(value)!r}.")
+    if value.shape != (env.num_envs,):
+        raise RuntimeError(
+            f"env.{name} must have shape ({env.num_envs},), got {tuple(value.shape)}."
+        )
+    if not torch.isfinite(value).all():
+        raise RuntimeError(f"env.{name} contains NaN or Inf.")
+    return value
+
+
+def _scrape_contact_obs(env) -> dict[str, torch.Tensor]:
+    max_force = float(getattr(env.cfg, "max_contact_normal_force", 1.0))
+    if max_force <= 0.0:
+        raise RuntimeError(f"cfg.max_contact_normal_force must be positive, got {max_force}.")
+    edge_scale = float(getattr(env.cfg, "edge_contact_reward_sigma_start_m", 1.0))
+    if edge_scale <= 0.0:
+        raise RuntimeError(
+            f"cfg.edge_contact_reward_sigma_start_m must be positive, got {edge_scale}."
+        )
+
+    normal_force = _require_env_tensor(env, "_scrape_table_normal_force")
+    target_force = _require_env_tensor(env, "_scrape_target_contact_normal_force")
+    edge_error = _require_env_tensor(env, "_scrape_edge_contact_error")
+    force_error = torch.abs(normal_force - target_force)
+
+    table_quat = getattr(env, "_table_quat_wxyz_per_env", env.table.data.root_quat_w)
+    z_axis = torch.tensor([0.0, 0.0, 1.0], device=table_quat.device, dtype=table_quat.dtype)
+    table_normal = quat_apply(table_quat, z_axis.expand(env.num_envs, -1))
+    table_height = (env.table.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]).unsqueeze(-1)
+
+    return {
+        "scrape_tool_table_normal_force": (normal_force / max_force).unsqueeze(-1),
+        "scrape_target_contact_normal_force": (target_force / max_force).unsqueeze(-1),
+        "scrape_contact_force_error": (force_error / max_force).unsqueeze(-1),
+        "scrape_edge_contact_error": (edge_error / edge_scale).unsqueeze(-1),
+        "scrape_table_height": table_height,
+        "scrape_table_normal": table_normal,
+    }
 
 
 # ----------------------------------------------------------------------------
@@ -331,8 +393,11 @@ def build_observations(env) -> dict[str, torch.Tensor]:
         "reward": (env.reward_buf * 0.01).unsqueeze(-1),
     }
 
-    if "tacmap" in set(env.cfg.obs.obs_list) | set(env.cfg.obs.state_list):
+    requested_fields = set(env.cfg.obs.obs_list) | set(env.cfg.obs.state_list)
+    if "tacmap" in requested_fields:
         obs_clean["tacmap"] = env.get_tacmap_policy_obs()
+    if requested_fields & SCRAPE_CONTACT_FIELDS:
+        obs_clean.update(_scrape_contact_obs(env))
 
     obs_noisy = dict(obs_clean)
     obs_noisy["object_rot"] = noisy_obj_rot_xyzw

@@ -42,8 +42,8 @@ def test_tacmap_task_registration_and_cfg_contract():
     contact_cfg = SimToolRealTacMapContactEnvCfg()
     register_obs_field_size("tacmap", contact_cfg.compute_tacmap_obs_size())
     assert contact_cfg.tacmap_history_len == 5
-    assert contact_cfg.compute_tacmap_obs_size() == 75
-    assert compute_obs_dim(contact_cfg.obs.obs_list) == compute_obs_dim(base_cfg.obs.obs_list) + 75
+    assert contact_cfg.compute_tacmap_obs_size() == 125
+    assert compute_obs_dim(contact_cfg.obs.obs_list) == compute_obs_dim(base_cfg.obs.obs_list) + 125
     assert compute_obs_dim(contact_cfg.obs.state_list) == compute_obs_dim(base_cfg.obs.state_list)
 
 
@@ -87,7 +87,7 @@ def test_tacmap_contact_policy_obs_stacks_history_without_sim():
     env.vbts_deform = torch.zeros(2, 5, 12, 12, dtype=torch.uint8)
     env.last_contacts = torch.zeros(2, 5)
     env._prev_raw_contacts = torch.zeros(2, 5)
-    env._tacmap_policy_obs_history = torch.zeros(2, 5, 15)
+    env._tacmap_policy_obs_history = torch.zeros(2, 5, 25)
     env.episode_length_buf = torch.zeros(2, dtype=torch.long)
     env._tacmap_grid_y, env._tacmap_grid_x = torch.meshgrid(
         torch.linspace(-1.0, 1.0, 12),
@@ -98,17 +98,19 @@ def test_tacmap_contact_policy_obs_stacks_history_without_sim():
     env.vbts_deform[0, 0, 0, 0] = 255
     first = env.get_tacmap_policy_obs()
 
-    assert first.shape == (2, 75)
-    assert torch.allclose(first[:, 0:15], first[:, 15:30])
+    assert first.shape == (2, 125)
+    assert torch.allclose(first[:, 0:25], first[:, 25:50])
     assert first[0, 0] > 0.0
-    assert first[0, 1] == -1.0
-    assert first[0, 2] == -1.0
+    assert first[0, 1] == 1.0
+    assert first[0, 2] == 1.0
+    assert first[0, 3] == -1.0
+    assert first[0, 4] == -1.0
 
     env.episode_length_buf[:] = 1
     env.vbts_deform.zero_()
     second = env.get_tacmap_policy_obs()
 
-    assert second.shape == (2, 75)
-    assert torch.all(second[:, 0:15] == 0.0)
-    assert torch.allclose(second[:, 15:30], first[:, 0:15])
+    assert second.shape == (2, 125)
+    assert torch.all(second[:, 0:25] == 0.0)
+    assert torch.allclose(second[:, 25:50], first[:, 0:25])
 

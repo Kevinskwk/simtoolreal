@@ -1,0 +1,71 @@
+# TacMap pose-only scrape finetuning task.
+# Keeps the original SimToolReal pose reward and changes only target goal sampling.
+
+use_tacmap: true
+enable_vbts: true
+include_tacmap_in_policy: true
+resolution_step: 20
+vbts_update_period: 0.016666666666666666
+
+tacmap_obs_normalization: 255.0
+enable_tactile: true
+binary_contact: false
+contact_smooth: 0.5
+contact_latency: 0.005
+contact_threshold: 0.05
+contact_sensor_noise: 0.01
+tacmap_history_len: 5
+disable_tactile_ids: []
+
+table_pitch_roll_range_deg: 8.0
+edge_contact_xy_range_m: [0.08, 0.08]
+edge_contact_yaw_range_deg: 90.0
+edge_tilt_range_deg: [5.0, 45.0]
+edge_contact_reward_max_weight: 5.0 # 1.0
+edge_contact_reward_sigma_start_m: 0.03
+edge_contact_reward_sigma_target_m: 0.005
+edge_contact_reward_sigma_increment: 0.9
+edge_contact_curriculum_success_threshold: 0.8
+enable_tool_table_contact_force_reward: true
+contact_force_reward_relative_weight: 1.0 # 0.5
+target_contact_normal_force: null
+target_contact_normal_force_range: [2.0, 6.0]
+max_contact_normal_force: 20.0
+contact_force_sigma_start: 4.0
+contact_force_sigma_target: 1.0
+contact_force_sigma_increment: 0.9
+contact_force_curriculum_success_threshold: 0.8
+tool_table_contact_sensor_update_period: 0.016666666666666666
+tool_table_contact_sensor_history_len: 1
+tool_table_contact_sensor_force_threshold: 0.1
+contact_force_filter_alpha: 0.2
+
+scene:
+  num_envs: 12288
+
+assets:
+  handle_head_types: [spatula, eraser, brush, marker]
+
+reset:
+  table_reset_z: 0.38
+  table_reset_z_range: 0.01
+  table_reset_pitch_roll_range_deg: 8.0
+  table_reset_yaw_range_deg: 0.0
+
+termination:
+  episode_length: 600
+  max_consecutive_successes: 50
+
+obs:
+  state_list: [joint_pos, joint_vel, prev_action_targets, palm_pos, palm_rot, palm_vel,
+               object_rot, object_vel, fingertip_pos_rel_palm, keypoints_rel_palm,
+               keypoints_rel_goal, object_scales, closest_keypoint_max_dist,
+               closest_fingertip_dist, lifted_object, progress, successes, reward,
+               scrape_tool_table_normal_force, scrape_target_contact_normal_force,
+               scrape_contact_force_error, scrape_edge_contact_error,
+               scrape_table_height, scrape_table_normal]
+  obs_list: [joint_pos, joint_vel, prev_action_targets, palm_pos, palm_rot,
+             object_rot, fingertip_pos_rel_palm, keypoints_rel_palm,
+             keypoints_rel_goal, object_scales, tacmap,
+             scrape_target_contact_normal_force]
+  clamp_abs_observations: 10.0
