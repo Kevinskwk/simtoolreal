@@ -368,6 +368,18 @@ class SimToolRealFixedGraspNormalForceEnv(SimToolRealTacMapScrapePoseEnv):
             raise RuntimeError("DLS joint velocity contains NaN or Inf.")
         arm_targets = self._prev_targets[:, self._arm_joint_ids] + qdot * float(self.step_dt)
         arm_targets = torch.clamp(arm_targets, self._arm_lower, self._arm_upper)
+        freeze_mask = getattr(self, "_diagnostic_freeze_arm_targets", None)
+        if freeze_mask is not None:
+            if freeze_mask.shape != (self.num_envs,) or freeze_mask.dtype != torch.bool:
+                raise RuntimeError(
+                    "_diagnostic_freeze_arm_targets must be a boolean "
+                    f"({self.num_envs},) tensor"
+                )
+            arm_targets = torch.where(
+                freeze_mask.unsqueeze(-1),
+                self._prev_targets[:, self._arm_joint_ids],
+                arm_targets,
+            )
         self._cur_targets.copy_(self._fixed_robot_joint_pos)
         self._cur_targets[:, self._arm_joint_ids] = arm_targets
         self._prev_targets.copy_(self._cur_targets)

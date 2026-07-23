@@ -20,7 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=("smoke", "tactile-audit", "pi-baseline", "evaluate"),
+        choices=("smoke", "tactile-audit", "pi-baseline", "passive-dwell", "evaluate"),
         default="smoke",
     )
     parser.add_argument(
@@ -49,6 +49,35 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override the environment EMA coefficient for controller diagnostics.",
     )
+    parser.add_argument("--solver-position-iterations", type=int, default=None)
+    parser.add_argument("--solver-velocity-iterations", type=int, default=None)
+    parser.add_argument("--arm-damping-scale", type=float, default=None)
+    parser.add_argument("--max-depenetration-velocity", type=float, default=None)
+    parser.add_argument(
+        "--external-forces-every-iteration",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--physics-dt",
+        type=float,
+        default=None,
+        help="Physics timestep; decimation is adjusted to retain 60 Hz control.",
+    )
+    parser.add_argument(
+        "--sensor-update-period",
+        type=float,
+        default=None,
+        help="Contact sensor update period; defaults to the task configuration.",
+    )
+    parser.add_argument("--dwell-acquire-force", type=float, default=1.0)
+    parser.add_argument("--dwell-approach-action", type=float, default=0.5)
+    parser.add_argument("--dwell-settle-steps", type=int, default=60)
+    parser.add_argument("--dwell-record-steps", type=int, default=180)
+    parser.add_argument("--dwell-min-completion-ratio", type=float, default=0.8)
+    parser.add_argument("--dwell-min-contact-ratio", type=float, default=0.95)
+    parser.add_argument("--dwell-max-raw-std", type=float, default=1.0)
+    parser.add_argument("--dwell-max-filtered-std", type=float, default=0.5)
     AppLauncher.add_app_launcher_args(parser)
     parser.set_defaults(headless=True)
     return parser.parse_args()
@@ -179,6 +208,73 @@ def make_env(feedback_mode: str):
     cfg.enable_vbts = feedback_mode == "tactile"
     if ARGS.force_filter_alpha is not None:
         cfg.contact_force_filter_alpha = float(ARGS.force_filter_alpha)
+    if ARGS.solver_position_iterations is not None:
+        value = int(ARGS.solver_position_iterations)
+        if value <= 0:
+            raise ValueError("--solver-position-iterations must be positive")
+        cfg.sim.physx.min_position_iteration_count = value
+        cfg.sim.physx.max_position_iteration_count = value
+    if ARGS.solver_velocity_iterations is not None:
+        value = int(ARGS.solver_velocity_iterations)
+        if value < 0:
+            raise ValueError("--solver-velocity-iterations must be non-negative")
+        cfg.sim.physx.min_velocity_iteration_count = value
+        cfg.sim.physx.max_velocity_iteration_count = value
+    if ARGS.arm_damping_scale is not None:
+        if float(ARGS.arm_damping_scale) <= 0.0:
+            raise ValueError("--arm-damping-scale must be positive")
+        cfg.arm_drive_damping_scale = float(ARGS.arm_damping_scale)
+    if ARGS.max_depenetration_velocity is not None:
+        if float(ARGS.max_depenetration_velocity) <= 0.0:
+            raise ValueError("--max-depenetration-velocity must be positive")
+        cfg.contact_max_depenetration_velocity_mps = float(
+            ARGS.max_depenetration_velocity
+        )
+    if ARGS.external_forces_every_iteration is not None:
+        cfg.sim.physx.enable_external_forces_every_iteration = bool(
+            ARGS.external_forces_every_iteration
+        )
+    if ARGS.physics_dt is not None:
+        physics_dt = float(ARGS.physics_dt)
+        if physics_dt <= 0.0:
+            raise ValueError("--physics-dt must be positive")
+        decimation = round((1.0 / 60.0) / physics_dt)
+        if decimation <= 0 or not np.isclose(
+            decimation * physics_dt, 1.0 / 60.0, rtol=0.0, atol=1.0e-9
+        ):
+            raise ValueError("--physics-dt must divide the 1/60 s control period")
+        cfg.sim.dt = physics_dt
+        cfg.decimation = decimation
+        cfg.sim.render_interval = decimation
+    if ARGS.sensor_update_period is not None:
+        if float(ARGS.sensor_update_period) <= 0.0:
+            raise ValueError("--sensor-update-period must be positive")
+        cfg.tool_table_contact_sensor_update_period = float(
+            ARGS.sensor_update_period
+        )
+    if ARGS.mode == "passive-dwell":
+        required_steps = (
+            int(ARGS.steps)
+            + int(ARGS.dwell_settle_steps)
+            + int(ARGS.dwell_record_steps)
+            + 10
+        )
+        cfg.episode_length_s = max(
+            float(cfg.episode_length_s), required_steps / 60.0
+        )
+    print(
+        "[fixed-force] sim "
+        f"dt={cfg.sim.dt:g}, decimation={cfg.decimation}, "
+        f"position_iterations={cfg.sim.physx.max_position_iteration_count}, "
+        f"velocity_iterations={cfg.sim.physx.max_velocity_iteration_count}, "
+        f"arm_damping_scale={cfg.arm_drive_damping_scale:g}, "
+        "max_depenetration_velocity="
+        f"{cfg.contact_max_depenetration_velocity_mps:g}, "
+        "external_forces_every_iteration="
+        f"{cfg.sim.physx.enable_external_forces_every_iteration}, "
+        f"sensor_period={cfg.tool_table_contact_sensor_update_period:g}",
+        flush=True,
+    )
     print(f"[fixed-force] creating {ARGS.num_envs} envs in {feedback_mode} mode", flush=True)
     try:
         env = gym.make(TASK_ID, cfg=cfg)
@@ -391,6 +487,224 @@ def tracking_passed(summary: dict, over_force_ratio: float) -> bool:
     )
 
 
+def passive_dwell(env) -> dict:
+    """Measure open-loop force stability while holding normal offset constant."""
+    inner = env.unwrapped
+    env.reset()
+    device = inner.device
+    approach, settle, record, complete, failed = range(5)
+    phase = torch.full((inner.num_envs,), approach, dtype=torch.long, device=device)
+    inner._diagnostic_freeze_arm_targets = torch.zeros(
+        inner.num_envs, dtype=torch.bool, device=device
+    )
+    phase_age = torch.zeros(inner.num_envs, dtype=torch.long, device=device)
+    count = torch.zeros(inner.num_envs, dtype=torch.long, device=device)
+    raw_sum = torch.zeros(inner.num_envs, device=device)
+    raw_square_sum = torch.zeros(inner.num_envs, device=device)
+    filtered_sum = torch.zeros(inner.num_envs, device=device)
+    filtered_square_sum = torch.zeros(inner.num_envs, device=device)
+    contact_count = torch.zeros(inner.num_envs, dtype=torch.long, device=device)
+    raw_min = torch.full((inner.num_envs,), torch.inf, device=device)
+    raw_max = torch.full((inner.num_envs,), -torch.inf, device=device)
+    filtered_min = torch.full((inner.num_envs,), torch.inf, device=device)
+    filtered_max = torch.full((inner.num_envs,), -torch.inf, device=device)
+    palm_error_sum = torch.zeros(inner.num_envs, device=device)
+    palm_error_max = torch.zeros(inner.num_envs, device=device)
+    arm_error_sum = torch.zeros(inner.num_envs, device=device)
+    arm_error_max = torch.zeros(inner.num_envs, device=device)
+    tool_normal_speed_sum = torch.zeros(inner.num_envs, device=device)
+    tool_normal_speed_max = torch.zeros(inner.num_envs, device=device)
+    acquired_offset = torch.full((inner.num_envs,), torch.nan, device=device)
+    max_force = torch.zeros(inner.num_envs, device=device)
+
+    for _ in range(int(ARGS.steps)):
+        action = torch.zeros(inner.num_envs, 1, device=device)
+        action[phase == approach] = float(ARGS.dwell_approach_action)
+        _, _, terminated, truncated, _ = env.step(action)
+        raw = inner._scrape_table_normal_force_raw
+        filtered = inner._scrape_table_normal_force
+        if not torch.isfinite(raw).all() or not torch.isfinite(filtered).all():
+            raise RuntimeError("Passive dwell observed NaN or Inf contact force.")
+        max_force = torch.maximum(max_force, raw)
+        done = terminated | truncated
+        active = (phase == approach) | (phase == settle) | (phase == record)
+        phase[done & active] = failed
+
+        newly_acquired = (phase == approach) & (
+            filtered >= float(ARGS.dwell_acquire_force)
+        )
+        acquired_offset[newly_acquired] = inner._normal_offset[newly_acquired]
+        inner._diagnostic_freeze_arm_targets[newly_acquired] = True
+        phase[newly_acquired] = settle
+        phase_age[newly_acquired] = 0
+
+        settling = phase == settle
+        phase_age[settling] += 1
+        settled = settling & (phase_age >= int(ARGS.dwell_settle_steps))
+        phase[settled] = record
+        phase_age[settled] = 0
+
+        recording = phase == record
+        if bool(recording.any()):
+            table_normal = inner._table_normal()
+            palm_pos = inner.robot.data.body_link_pos_w[:, inner._palm_body_id]
+            palm_target = (
+                inner._fixed_palm_pos_w
+                - inner._normal_offset.unsqueeze(-1) * table_normal
+            )
+            palm_error = torch.abs(
+                ((palm_target - palm_pos) * table_normal).sum(dim=-1)
+            )
+            arm_error = (
+                inner._cur_targets[:, inner._arm_joint_ids]
+                - inner.robot.data.joint_pos[:, inner._arm_joint_ids]
+            ).abs().mean(dim=-1)
+            tool_normal_speed = torch.abs(
+                (
+                    inner.object.data.root_link_lin_vel_w * table_normal
+                ).sum(dim=-1)
+            )
+            count[recording] += 1
+            raw_sum[recording] += raw[recording]
+            raw_square_sum[recording] += raw[recording].square()
+            filtered_sum[recording] += filtered[recording]
+            filtered_square_sum[recording] += filtered[recording].square()
+            contact_count[recording] += (
+                raw[recording] >= float(ARGS.contact_threshold)
+            ).long()
+            raw_min[recording] = torch.minimum(raw_min[recording], raw[recording])
+            raw_max[recording] = torch.maximum(raw_max[recording], raw[recording])
+            filtered_min[recording] = torch.minimum(
+                filtered_min[recording], filtered[recording]
+            )
+            filtered_max[recording] = torch.maximum(
+                filtered_max[recording], filtered[recording]
+            )
+            palm_error_sum[recording] += palm_error[recording]
+            palm_error_max[recording] = torch.maximum(
+                palm_error_max[recording], palm_error[recording]
+            )
+            arm_error_sum[recording] += arm_error[recording]
+            arm_error_max[recording] = torch.maximum(
+                arm_error_max[recording], arm_error[recording]
+            )
+            tool_normal_speed_sum[recording] += tool_normal_speed[recording]
+            tool_normal_speed_max[recording] = torch.maximum(
+                tool_normal_speed_max[recording], tool_normal_speed[recording]
+            )
+            phase_age[recording] += 1
+        finished = recording & (phase_age >= int(ARGS.dwell_record_steps))
+        phase[finished] = complete
+        if bool(((phase == complete) | (phase == failed)).all()):
+            break
+
+    completed = phase == complete
+    completed_count = int(completed.sum())
+    completion_ratio = completed_count / inner.num_envs
+    if completed_count:
+        sample_count = count[completed].float()
+        raw_mean = raw_sum[completed] / sample_count
+        filtered_mean = filtered_sum[completed] / sample_count
+        raw_std = torch.sqrt(
+            (raw_square_sum[completed] / sample_count - raw_mean.square()).clamp_min(0.0)
+        )
+        filtered_std = torch.sqrt(
+            (
+                filtered_square_sum[completed] / sample_count
+                - filtered_mean.square()
+            ).clamp_min(0.0)
+        )
+        contact_ratio = contact_count[completed].float() / sample_count
+
+        def stats(value: torch.Tensor) -> dict:
+            return {
+                "mean": float(value.mean()),
+                "median": float(value.median()),
+                "p95": float(torch.quantile(value, 0.95)),
+                "max": float(value.max()),
+            }
+
+        completed_indices = completed.nonzero(as_tuple=True)[0]
+        result = {
+            "completion_ratio": completion_ratio,
+            "completed_envs": completed_count,
+            "failed_envs": int((phase == failed).sum()),
+            "never_acquired_envs": int((phase == approach).sum()),
+            "raw_force_mean_n": stats(raw_mean),
+            "filtered_force_mean_n": stats(filtered_mean),
+            "raw_force_std_n": stats(raw_std),
+            "filtered_force_std_n": stats(filtered_std),
+            "raw_force_range_n": stats(
+                raw_max[completed_indices] - raw_min[completed_indices]
+            ),
+            "filtered_force_range_n": stats(
+                filtered_max[completed_indices] - filtered_min[completed_indices]
+            ),
+            "contact_retention_ratio": stats(contact_ratio),
+            "acquired_offset_m": stats(acquired_offset[completed]),
+            "palm_normal_target_error_mean_m": stats(
+                palm_error_sum[completed] / sample_count
+            ),
+            "palm_normal_target_error_max_m": stats(palm_error_max[completed]),
+            "arm_joint_target_error_mean_rad": stats(
+                arm_error_sum[completed] / sample_count
+            ),
+            "arm_joint_target_error_max_rad": stats(arm_error_max[completed]),
+            "tool_normal_speed_mean_mps": stats(
+                tool_normal_speed_sum[completed] / sample_count
+            ),
+            "tool_normal_speed_max_mps": stats(tool_normal_speed_max[completed]),
+            "maximum_raw_force_n": float(max_force.max()),
+        }
+        result["passed"] = (
+            completion_ratio >= float(ARGS.dwell_min_completion_ratio)
+            and float(contact_ratio.median()) >= float(ARGS.dwell_min_contact_ratio)
+            and float(raw_std.median()) <= float(ARGS.dwell_max_raw_std)
+            and float(filtered_std.median())
+            <= float(ARGS.dwell_max_filtered_std)
+        )
+    else:
+        result = {
+            "passed": False,
+            "completion_ratio": completion_ratio,
+            "completed_envs": 0,
+            "failed_envs": int((phase == failed).sum()),
+            "never_acquired_envs": int((phase == approach).sum()),
+            "maximum_raw_force_n": float(max_force.max()),
+            "failure": "no environment completed the passive dwell window",
+        }
+    result["criteria"] = {
+        "minimum_completion_ratio": float(ARGS.dwell_min_completion_ratio),
+        "minimum_contact_retention_ratio": float(ARGS.dwell_min_contact_ratio),
+        "maximum_median_raw_std_n": float(ARGS.dwell_max_raw_std),
+        "maximum_median_filtered_std_n": float(ARGS.dwell_max_filtered_std),
+        "settle_steps": int(ARGS.dwell_settle_steps),
+        "record_steps": int(ARGS.dwell_record_steps),
+    }
+    result["sim"] = {
+        "physics_dt": float(inner.physics_dt),
+        "control_dt": float(inner.step_dt),
+        "position_iterations": int(
+            inner.cfg.sim.physx.max_position_iteration_count
+        ),
+        "velocity_iterations": int(
+            inner.cfg.sim.physx.max_velocity_iteration_count
+        ),
+        "arm_damping_scale": float(inner.cfg.arm_drive_damping_scale),
+        "max_depenetration_velocity": float(
+            inner.cfg.contact_max_depenetration_velocity_mps
+        ),
+        "external_forces_every_iteration": bool(
+            inner.cfg.sim.physx.enable_external_forces_every_iteration
+        ),
+        "sensor_update_period": float(
+            inner.cfg.tool_table_contact_sensor_update_period
+        ),
+        "joint_targets_frozen_after_acquisition": True,
+    }
+    return result
+
+
 def pi_baseline(env) -> dict:
     inner = env.unwrapped
     env.reset()
@@ -538,6 +852,8 @@ def main() -> int:
             result = tactile_audit(env)
         elif ARGS.mode == "pi-baseline":
             result = pi_baseline(env)
+        elif ARGS.mode == "passive-dwell":
+            result = passive_dwell(env)
         else:
             result = evaluate(env)
     finally:

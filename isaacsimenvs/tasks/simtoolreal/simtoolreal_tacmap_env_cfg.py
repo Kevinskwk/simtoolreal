@@ -278,6 +278,8 @@ class SimToolRealFixedGraspNormalForceEnvCfg(SimToolRealTacMapScrapePoseEnvCfg):
     dls_angular_gain: float = 3.0
     dls_joint_velocity_limit: float = 0.5
     fixed_grasp_max_drift_m: float = 0.005
+    arm_drive_damping_scale: float = 1.0
+    contact_max_depenetration_velocity_mps: float = 1000.0
 
     force_reward_weight: float = 1.0
     quadratic_force_error_penalty_weight: float = 0.5

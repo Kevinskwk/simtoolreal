@@ -149,8 +149,10 @@ _PHYSICS_SPECS: dict[str, tuple[str, str, str]] = {
 
 
 def build_robot_articulation_usd_cfg(
-    usd_path: str, *, start_arm_higher: bool = False
+    usd_path: str, *, start_arm_higher: bool = False, arm_damping_scale: float = 1.0
 ) -> ArticulationCfg:
+    if float(arm_damping_scale) <= 0.0:
+        raise ValueError("arm_damping_scale must be positive")
     arm_default = dict(ARM_DEFAULT_JOINT_POS)
     if start_arm_higher:
         # Matches the gym env's startArmHigher eval pose.
@@ -172,7 +174,10 @@ def build_robot_articulation_usd_cfg(
             "arm": ImplicitActuatorCfg(
                 joint_names_expr=[ARM_JOINT_REGEX],
                 stiffness=ARM_JOINT_STIFFNESS,
-                damping=ARM_JOINT_DAMPING,
+                damping={
+                    name: value * float(arm_damping_scale)
+                    for name, value in ARM_JOINT_DAMPING.items()
+                },
             ),
             "hand": ImplicitActuatorCfg(
                 joint_names_expr=[HAND_JOINT_REGEX],
@@ -1710,10 +1715,16 @@ def setup_scene(env) -> None:
         )
         for urdf in urdf_paths
     ]
+    max_depenetration_velocity = float(
+        getattr(env.cfg, "contact_max_depenetration_velocity_mps", 1000.0)
+    )
+    if max_depenetration_velocity <= 0.0:
+        raise ValueError("contact_max_depenetration_velocity_mps must be positive")
     object_usd_paths = [
         _bake_usd(usd, bake_root, "object", props=dict(
             kinematic_enabled=False, disable_gravity=False,
-            max_depenetration_velocity=1000.0, articulation_enabled=False,
+            max_depenetration_velocity=max_depenetration_velocity,
+            articulation_enabled=False,
         ))
         for usd in object_raw_usds
     ]
@@ -1737,9 +1748,15 @@ def setup_scene(env) -> None:
         robot_converted_usd,
         bake_root, "robot",
         props=dict(
-            disable_gravity=True, max_depenetration_velocity=1000.0,
+            disable_gravity=True,
+            max_depenetration_velocity=max_depenetration_velocity,
             enabled_self_collisions=True,
-            solver_position_iterations=8, solver_velocity_iterations=0,
+            solver_position_iterations=int(
+                env.cfg.sim.physx.max_position_iteration_count
+            ),
+            solver_velocity_iterations=int(
+                env.cfg.sim.physx.max_velocity_iteration_count
+            ),
         ),
         apply_physx_articulation=True,
     )
@@ -1803,6 +1820,7 @@ def setup_scene(env) -> None:
     env.robot = Articulation(build_robot_articulation_usd_cfg(
         robot_usd_path,
         start_arm_higher=getattr(env.cfg.reset, "start_arm_higher", False),
+        arm_damping_scale=float(getattr(env.cfg, "arm_drive_damping_scale", 1.0)),
     ))
     activate_tool_table_contact_sensors = bool(
         getattr(env.cfg, "enable_tool_table_contact_force_reward", False)
