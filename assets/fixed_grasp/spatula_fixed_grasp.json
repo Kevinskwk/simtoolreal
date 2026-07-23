@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "tool_type": "spatula",
+  "joint_positions": {
+    "iiwa14_joint_1": 0.7997314929962158,
+    "iiwa14_joint_2": -0.2803802490234375,
+    "iiwa14_joint_3": 0.9049772024154663,
+    "iiwa14_joint_4": 1.6635090112686157,
+    "iiwa14_joint_5": -0.7606269121170044,
+    "iiwa14_joint_6": 0.13202953338623047,
+    "iiwa14_joint_7": 0.3853481709957123,
+    "left_1_thumb_CMC_FE": -0.1735621988773346,
+    "left_2_index_MCP_FE": -0.1745351403951645,
+    "left_3_middle_MCP_FE": -0.17453479766845703,
+    "left_4_ring_MCP_FE": -0.1745309680700302,
+    "left_5_pinky_CMC": 0.2607925236225128,
+    "left_thumb_CMC_AA": 0.13105963170528412,
+    "left_index_MCP_AA": -0.011199958622455597,
+    "left_middle_MCP_AA": 0.034630581736564636,
+    "left_ring_MCP_AA": 0.03463582322001457,
+    "left_pinky_MCP_FE": 0.0235951729118824,
+    "left_thumb_MCP_FE": 0.5569254159927368,
+    "left_index_PIP": 1.7452856302261353,
+    "left_middle_PIP": -1.737985144245613e-06,
+    "left_ring_PIP": 9.732757888514243e-08,
+    "left_pinky_MCP_AA": -0.03492093086242676,
+    "left_thumb_MCP_AA": -0.3390285074710846,
+    "left_index_DIP": 1.3963000774383545,
+    "left_middle_DIP": 0.1983291357755661,
+    "left_ring_DIP": 1.3962936401367188,
+    "left_pinky_PIP": 9.382719144923612e-05,
+    "left_thumb_IP": 1.7452999353408813,
+    "left_pinky_DIP": 1.1522341083036736e-05
+  },
+  "palm_to_tool_pos": [
+    -0.07468438148498535,
+    0.045400023460388184,
+    0.2807200253009796
+  ],
+  "palm_to_tool_quat_wxyz": [
+    0.5985491275787354,
+    -0.4344235956668854,
+    0.611157238483429,
+    -0.28196099400520325
+  ],
+  "source_checkpoint": "/home/showlab/sharpa/simtoolreal/outputs/2026-07-20/17-51-49/0_simtoolreal_sapg/last/model.pth"
+}

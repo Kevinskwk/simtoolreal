@@ -375,16 +375,21 @@ class A2CBase(BaseAlgorithm):
                     )
                     offset += param.numel()
         else:
-            all_grads_list = []
-            for param in self.model.parameters():
-                if param.grad is not None:
-                    all_grads_list.append(param.grad.view(-1))
-
-            all_grads = torch.cat(all_grads_list)
+            all_grads = None
         
         if self.truncate_grads:
             self.scaler.unscale_(self.optimizer)
             nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm)
+
+        # Capture gradients after AMP unscaling and clipping. The pre-unscale
+        # tensors can overflow even when GradScaler correctly skips the update.
+        all_grads = torch.cat(
+            [
+                param.grad.detach().reshape(-1)
+                for param in self.model.parameters()
+                if param.grad is not None
+            ]
+        )
 
         self.scaler.step(self.optimizer)
         self.scaler.update()
@@ -1614,14 +1619,41 @@ class ContinuousA2CBase(A2CBase):
                     self.writer.add_scalar('episode_lengths/iter', mean_lengths, frame)
                     self.writer.add_scalar('episode_lengths/time', mean_lengths, frame)
 
-                    self.writer.add_histogram('auxiliary_stats/off_policy_contrib', np.array(extra_infos['off_policy_contrib']), frame)
-                    self.writer.add_histogram('auxiliary_stats/on_policy_contrib', np.array(extra_infos['on_policy_contrib']), frame)
+                    off_policy_contrib = np.asarray(extra_infos['off_policy_contrib'])
+                    on_policy_contrib = np.asarray(extra_infos['on_policy_contrib'])
+                    if not np.isfinite(off_policy_contrib).all():
+                        raise RuntimeError(
+                            "SAPG off_policy_contrib contains NaN or Inf."
+                        )
+                    if not np.isfinite(on_policy_contrib).all():
+                        raise RuntimeError(
+                            "SAPG on_policy_contrib contains NaN or Inf."
+                        )
+                    self.writer.add_histogram(
+                        'auxiliary_stats/off_policy_contrib', off_policy_contrib, frame
+                    )
+                    self.writer.add_histogram(
+                        'auxiliary_stats/on_policy_contrib', on_policy_contrib, frame
+                    )
 
                     on_policy_grads = torch.stack(extra_infos['on_policy_grads'])
                     off_policy_grads = torch.stack(extra_infos['off_policy_grads'])
+                    if not torch.isfinite(on_policy_grads).all():
+                        raise RuntimeError("SAPG on_policy_grads contains NaN or Inf.")
+                    if not torch.isfinite(off_policy_grads).all():
+                        raise RuntimeError("SAPG off_policy_grads contains NaN or Inf.")
 
                     self.writer.add_scalar('auxiliary_stats/off_on_grad_similarity', torch.cosine_similarity(on_policy_grads, off_policy_grads).diag().mean(),frame)
-                    self.writer.add_scalar('auxiliary_stats/off_on_relative_grad_norms', torch.norm(off_policy_grads, dim=-1).mean()/torch.norm(on_policy_grads, dim=-1).mean(), frame)
+                    on_policy_grad_norm = torch.norm(on_policy_grads, dim=-1).mean()
+                    relative_grad_norm = (
+                        torch.norm(off_policy_grads, dim=-1).mean()
+                        / on_policy_grad_norm.clamp_min(1.0e-12)
+                    )
+                    self.writer.add_scalar(
+                        'auxiliary_stats/off_on_relative_grad_norms',
+                        relative_grad_norm,
+                        frame,
+                    )
                     
                     if extra_infos['mb_intr_rewards'] is not None:
                         if hasattr(self, 'intr_coef_block_size'):

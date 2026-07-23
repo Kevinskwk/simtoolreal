@@ -59,6 +59,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pi-kp", type=float, default=8.0e-4)
     parser.add_argument("--pi-ki", type=float, default=2.0e-4)
     parser.add_argument("--force-velocity-limit", type=float, default=0.005)
+    parser.add_argument(
+        "--fixed-grasp-export",
+        default="",
+        help="Write the acquired robot pose and palm-to-tool fixed-joint frame to JSON.",
+    )
     parser.add_argument("--require-pass", action=argparse.BooleanOptionalAction, default=True)
     AppLauncher.add_app_launcher_args(parser)
     parser.set_defaults(headless=True)
@@ -372,7 +377,7 @@ def acquire_grasp(env, inner, player: RlPlayer) -> dict[str, torch.Tensor]:
     )
 
 
-def attach_tool_to_palm(inner) -> None:
+def attach_tool_to_palm(inner) -> dict:
     """Create an explicit rigid grasp while preserving the current tool transform."""
     stage = omni.usd.get_context().get_stage()
     palm_path = "/World/envs/env_0/Robot/iiwa14_link_7"
@@ -399,6 +404,25 @@ def attach_tool_to_palm(inner) -> None:
     joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0))
     joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, Gf.Vec3f(0.0)))
     print(f"[acquire] synthetic fixed grasp created at {FIXED_GRASP_JOINT_PATH}")
+    spec = {
+        "version": 1,
+        "tool_type": ARGS.tool_type,
+        "joint_positions": {
+            name: float(inner.robot.data.joint_pos[0, index].item())
+            for index, name in enumerate(inner.robot.data.joint_names)
+        },
+        "palm_to_tool_pos": [float(value) for value in p],
+        "palm_to_tool_quat_wxyz": [float(value) for value in q],
+        "source_checkpoint": str(Path(ARGS.checkpoint).resolve()),
+    }
+    if ARGS.fixed_grasp_export:
+        export_path = Path(ARGS.fixed_grasp_export).resolve()
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+        with export_path.open("w") as stream:
+            json.dump(spec, stream, indent=2)
+            stream.write("\n")
+        print(f"[acquire] fixed-grasp specification written to {export_path}")
+    return spec
 
 
 def palm_jacobian(inner) -> torch.Tensor:

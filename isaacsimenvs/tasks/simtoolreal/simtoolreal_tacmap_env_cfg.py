@@ -15,7 +15,7 @@ from isaaclab.utils import configclass
 
 from isaacsimenvs.sensors.tacmap import SharpaTacmapCfg
 
-from .simtoolreal_env_cfg import AssetsCfg, ObsCfg, SimToolRealEnvCfg
+from .simtoolreal_env_cfg import AssetsCfg, ObsCfg, ResetCfg, SimToolRealEnvCfg
 
 
 _TACMAP_ROOT = Path(__file__).resolve().parents[3] / "assets" / "tacmap"
@@ -244,3 +244,54 @@ class SimToolRealTacMapScrapePoseEnvCfg(SimToolRealTacMapContactEnvCfg):
     contact_force_filter_alpha: float = 0.2
     tool_table_contact_sensor_prim_path: str = "/World/envs/env_.*/Object/object_root"
     tool_table_contact_sensor_filter_paths: list[str] = ["/World/envs/env_.*/Table/box"]
+
+
+@configclass
+class SimToolRealFixedGraspNormalForceEnvCfg(SimToolRealTacMapScrapePoseEnvCfg):
+    """One-action diagnostic for normal-force RL controllability."""
+
+    action_space: int = 1
+    episode_length_s: float = 5.0
+    feedback_mode: str = "force"  # force | tactile | blind
+    fixed_grasp_spec_path: str = str(
+        Path(__file__).resolve().parents[3]
+        / "assets"
+        / "fixed_grasp"
+        / "spatula_fixed_grasp.json"
+    )
+
+    target_contact_normal_force: float | None = None
+    target_contact_normal_force_range: tuple[float, float] = (2.0, 6.0)
+    contact_force_sigma_start: float = 2.0
+    contact_force_sigma_target: float = 2.0
+    max_contact_normal_force: float = 20.0
+    soft_contact_normal_force_limit: float = 12.0
+    force_success_tolerance_n: float = 1.0
+    contact_force_filter_alpha: float = 0.2
+
+    normal_velocity_limit_mps: float = 0.005
+    normal_offset_min_m: float = -0.01
+    normal_offset_max_m: float = 0.05
+    normal_offset_limit_m: float = 0.05
+    dls_damping: float = 0.05
+    dls_linear_gain: float = 5.0
+    dls_angular_gain: float = 3.0
+    dls_joint_velocity_limit: float = 0.5
+    fixed_grasp_max_drift_m: float = 0.005
+
+    force_reward_weight: float = 1.0
+    over_force_penalty_weight: float = 0.1
+    action_rate_penalty_weight: float = 0.01
+
+    table_pitch_roll_range_deg: float = 8.0
+    reset: ResetCfg = ResetCfg(
+        reset_position_noise_x=0.0,
+        reset_position_noise_y=0.0,
+        reset_position_noise_z=0.0,
+        reset_dof_pos_random_interval_arm=0.0,
+        reset_dof_pos_random_interval_fingers=0.0,
+        reset_dof_vel_random_interval=0.0,
+        table_reset_z=0.37,
+        table_reset_z_range=0.01,
+        table_reset_pitch_roll_range_deg=8.0,
+    )

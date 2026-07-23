@@ -57,6 +57,12 @@ OBS_FIELD_SIZES: dict[str, int] = {
     "scrape_edge_contact_error": 1,
     "scrape_table_height": 1,
     "scrape_table_normal": 3,
+    "fixed_force_measured": 1,
+    "fixed_force_target": 1,
+    "fixed_force_error_signed": 1,
+    "fixed_normal_offset": 1,
+    "fixed_normal_velocity": 1,
+    "fixed_prev_action": 1,
 }
 
 SCRAPE_CONTACT_FIELDS: set[str] = {
@@ -66,6 +72,15 @@ SCRAPE_CONTACT_FIELDS: set[str] = {
     "scrape_edge_contact_error",
     "scrape_table_height",
     "scrape_table_normal",
+}
+
+FIXED_FORCE_FIELDS: set[str] = {
+    "fixed_force_measured",
+    "fixed_force_target",
+    "fixed_force_error_signed",
+    "fixed_normal_offset",
+    "fixed_normal_velocity",
+    "fixed_prev_action",
 }
 
 
@@ -131,6 +146,28 @@ def _scrape_contact_obs(env) -> dict[str, torch.Tensor]:
         "scrape_edge_contact_error": (edge_error / edge_scale).unsqueeze(-1),
         "scrape_table_height": table_height,
         "scrape_table_normal": table_normal,
+    }
+
+
+def _fixed_force_obs(env) -> dict[str, torch.Tensor]:
+    max_force = float(getattr(env.cfg, "max_contact_normal_force", 0.0))
+    max_offset = float(getattr(env.cfg, "normal_offset_limit_m", 0.0))
+    max_velocity = float(getattr(env.cfg, "normal_velocity_limit_mps", 0.0))
+    if max_force <= 0.0 or max_offset <= 0.0 or max_velocity <= 0.0:
+        raise RuntimeError("Fixed-force observation normalization limits must be positive.")
+
+    force = _require_env_tensor(env, "_scrape_table_normal_force")
+    target = _require_env_tensor(env, "_scrape_target_contact_normal_force")
+    offset = _require_env_tensor(env, "_normal_offset")
+    velocity = _require_env_tensor(env, "_normal_velocity")
+    previous_action = _require_env_tensor(env, "_previous_normal_action")
+    return {
+        "fixed_force_measured": (force / max_force).unsqueeze(-1),
+        "fixed_force_target": (target / max_force).unsqueeze(-1),
+        "fixed_force_error_signed": ((target - force) / max_force).unsqueeze(-1),
+        "fixed_normal_offset": (offset / max_offset).unsqueeze(-1),
+        "fixed_normal_velocity": (velocity / max_velocity).unsqueeze(-1),
+        "fixed_prev_action": previous_action.unsqueeze(-1),
     }
 
 
@@ -398,6 +435,8 @@ def build_observations(env) -> dict[str, torch.Tensor]:
         obs_clean["tacmap"] = env.get_tacmap_policy_obs()
     if requested_fields & SCRAPE_CONTACT_FIELDS:
         obs_clean.update(_scrape_contact_obs(env))
+    if requested_fields & FIXED_FORCE_FIELDS:
+        obs_clean.update(_fixed_force_obs(env))
 
     obs_noisy = dict(obs_clean)
     obs_noisy["object_rot"] = noisy_obj_rot_xyzw

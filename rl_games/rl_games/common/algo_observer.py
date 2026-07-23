@@ -3,6 +3,17 @@ import torch
 import numpy as np
 
 
+def _require_finite_scalar(name, value):
+    tensor = torch.as_tensor(value)
+    if tensor.numel() != 1:
+        raise RuntimeError(
+            f"TensorBoard scalar {name!r} must contain one value, got shape {tuple(tensor.shape)}"
+        )
+    if not bool(torch.isfinite(tensor).all()):
+        raise RuntimeError(f"TensorBoard scalar {name!r} contains NaN or Inf: {value}")
+    return value
+
+
 class AlgoObserver:
     def __init__(self):
         pass
@@ -124,16 +135,19 @@ class IsaacAlgoObserver(AlgoObserver):
                         ep_info[key] = ep_info[key].unsqueeze(0)
                     info_tensor = torch.cat((info_tensor, ep_info[key].to(self.algo.device)))
                 value = torch.mean(info_tensor)
-                self.writer.add_scalar("Episode/" + key, value, frame)
+                name = "Episode/" + key
+                self.writer.add_scalar(name, _require_finite_scalar(name, value), frame)
             self.ep_infos.clear()
         # log scalars from env information
         for k, v in self.direct_info.items():
-            self.writer.add_scalar(f"{k}/frame", v, frame)
-            self.writer.add_scalar(f"{k}/iter", v, frame)
-            self.writer.add_scalar(f"{k}/time", v, frame)
+            for suffix in ("frame", "iter", "time"):
+                name = f"{k}/{suffix}"
+                self.writer.add_scalar(name, _require_finite_scalar(name, v), frame)
         # log mean reward/score from the env
         if self.mean_scores.current_size > 0:
             mean_scores = self.mean_scores.get_mean()
-            self.writer.add_scalar("scores/mean", mean_scores, frame)
-            self.writer.add_scalar("scores/iter", mean_scores, frame)
-            self.writer.add_scalar("scores/time", mean_scores, frame)
+            for suffix in ("mean", "iter", "time"):
+                name = f"scores/{suffix}"
+                self.writer.add_scalar(
+                    name, _require_finite_scalar(name, mean_scores), frame
+                )

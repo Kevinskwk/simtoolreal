@@ -1,0 +1,90 @@
+# Fixed-grasp one-dimensional normal-force diagnostic.
+
+feedback_mode: force
+action_space: 1
+episode_length_s: 5.0
+
+use_tacmap: true
+enable_vbts: false
+include_tacmap_in_policy: false
+resolution_step: 20
+vbts_update_period: 0.016666666666666666
+tacmap_history_len: 5
+tacmap_obs_normalization: 255.0
+enable_tactile: true
+binary_contact: false
+contact_smooth: 0.5
+contact_latency: 0.005
+contact_threshold: 0.05
+contact_sensor_noise: 0.01
+disable_tactile_ids: []
+
+enable_tool_table_contact_force_reward: true
+target_contact_normal_force: null
+target_contact_normal_force_range: [2.0, 6.0]
+contact_force_sigma_start: 2.0
+contact_force_sigma_target: 2.0
+contact_force_filter_alpha: 0.2
+force_success_tolerance_n: 1.0
+soft_contact_normal_force_limit: 12.0
+max_contact_normal_force: 20.0
+tool_table_contact_sensor_update_period: 0.016666666666666666
+tool_table_contact_sensor_history_len: 1
+tool_table_contact_sensor_force_threshold: 0.0
+
+normal_velocity_limit_mps: 0.005
+normal_offset_min_m: -0.01
+normal_offset_max_m: 0.05
+normal_offset_limit_m: 0.05
+dls_damping: 0.05
+dls_linear_gain: 5.0
+dls_angular_gain: 3.0
+dls_joint_velocity_limit: 0.5
+fixed_grasp_max_drift_m: 0.005
+
+force_reward_weight: 1.0
+over_force_penalty_weight: 0.1
+action_rate_penalty_weight: 0.01
+
+table_pitch_roll_range_deg: 8.0
+
+scene:
+  num_envs: 8192
+
+assets:
+  handle_head_types: [spatula]
+  num_assets_per_type: 1
+  shuffle_assets: false
+
+reset:
+  reset_position_noise_x: 0.0
+  reset_position_noise_y: 0.0
+  reset_position_noise_z: 0.0
+  reset_dof_pos_random_interval_arm: 0.0
+  reset_dof_pos_random_interval_fingers: 0.0
+  reset_dof_vel_random_interval: 0.0
+  table_reset_z: 0.37
+  table_reset_z_range: 0.01
+  table_reset_pitch_roll_range_deg: 8.0
+  table_reset_yaw_range_deg: 0.0
+
+domain_randomization:
+  use_obs_delay: false
+  use_action_delay: false
+  use_object_state_delay_noise: false
+  joint_velocity_obs_noise_std: 0.0
+  force_scale: 0.0
+  torque_scale: 0.0
+  force_prob_range: [1.0e-12, 1.0e-12]
+  torque_prob_range: [1.0e-12, 1.0e-12]
+
+termination:
+  episode_length: 300
+  max_consecutive_successes: 0
+
+obs:
+  obs_list: [fixed_force_target, fixed_force_measured, fixed_force_error_signed,
+             fixed_normal_offset, fixed_normal_velocity, fixed_prev_action]
+  state_list: [fixed_force_target, fixed_force_measured, fixed_force_error_signed,
+               fixed_normal_offset, fixed_normal_velocity, fixed_prev_action]
+  clamp_abs_observations: 10.0

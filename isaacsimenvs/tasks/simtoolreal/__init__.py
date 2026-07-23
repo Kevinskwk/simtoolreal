@@ -18,11 +18,13 @@ import gymnasium as gym
 
 from .simtoolreal_env import SimToolRealEnv
 from .simtoolreal_env_cfg import SimToolRealEnvCfg
+from .simtoolreal_fixed_grasp_force_env import SimToolRealFixedGraspNormalForceEnv
 from .simtoolreal_tacmap_env import SimToolRealTacMapEnv
 from .simtoolreal_scrape_pose_env import SimToolRealTacMapScrapePoseEnv
 from .simtoolreal_tacmap_env_cfg import (
     SimToolRealTacMapContactEnvCfg,
     SimToolRealTacMapEnvCfg,
+    SimToolRealFixedGraspNormalForceEnvCfg,
     SimToolRealTacMapScrapePoseEnvCfg,
 )
 
@@ -34,6 +36,8 @@ __all__ = [
     "SimToolRealTacMapEnvCfg",
     "SimToolRealTacMapScrapePoseEnv",
     "SimToolRealTacMapScrapePoseEnvCfg",
+    "SimToolRealFixedGraspNormalForceEnv",
+    "SimToolRealFixedGraspNormalForceEnvCfg",
 ]
 
 _CFG_DIR = Path(__file__).resolve().parents[2] / "cfg"
@@ -88,5 +92,30 @@ gym.register(
         "env_cfg_yaml_entry_point": str(_CFG_DIR / "task" / "SimToolRealTacMapScrape.yaml"),
         "rl_games_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealPPO.yaml"),
         "rl_games_sapg_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealSAPG.yaml"),
+    },
+)
+
+gym.register(
+    id="Isaacsimenvs-SimToolReal-TacMap-FixedGrasp-NormalForce-Direct-v0",
+    entry_point=(
+        "isaacsimenvs.tasks.simtoolreal.simtoolreal_fixed_grasp_force_env:"
+        "SimToolRealFixedGraspNormalForceEnv"
+    ),
+    order_enforce=False,
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            "isaacsimenvs.tasks.simtoolreal.simtoolreal_tacmap_env_cfg:"
+            "SimToolRealFixedGraspNormalForceEnvCfg"
+        ),
+        "env_cfg_yaml_entry_point": str(
+            _CFG_DIR / "task" / "SimToolRealFixedGraspNormalForce.yaml"
+        ),
+        "rl_games_cfg_entry_point": str(
+            _CFG_DIR / "train" / "SimToolRealFixedGraspForceSAPG.yaml"
+        ),
+        "rl_games_sapg_cfg_entry_point": str(
+            _CFG_DIR / "train" / "SimToolRealFixedGraspForceSAPG.yaml"
+        ),
     },
 )
