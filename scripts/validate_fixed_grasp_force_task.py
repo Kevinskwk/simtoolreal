@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke-test, audit tactile signal, or evaluate fixed-grasp force RL."""
+"""Smoke-test, audit, run PI control, or evaluate fixed-grasp force RL."""
 
 from __future__ import annotations
 
@@ -18,7 +18,14 @@ from isaaclab.app import AppLauncher
 REPO_ROOT = Path(__file__).resolve().parents[1]
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("smoke", "tactile-audit", "evaluate"), default="smoke")
+    parser.add_argument(
+        "--mode",
+        choices=("smoke", "tactile-audit", "pi-baseline", "evaluate"),
+        default="smoke",
+    )
+    parser.add_argument(
+        "--feedback-mode", choices=("force", "blind", "tactile"), default="force"
+    )
     parser.add_argument("--checkpoint", default="")
     parser.add_argument(
         "--policy-config",
@@ -31,6 +38,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default="")
     parser.add_argument("--minimum-tactile-std", type=float, default=1.0e-4)
     parser.add_argument("--minimum-predictive-r2", type=float, default=0.1)
+    parser.add_argument("--pi-kp", type=float, default=0.4)
+    parser.add_argument("--pi-ki", type=float, default=0.25)
+    parser.add_argument("--pi-integral-limit", type=float, default=2.0)
+    parser.add_argument("--approach-action", type=float, default=1.0)
+    parser.add_argument("--contact-threshold", type=float, default=0.2)
+    parser.add_argument(
+        "--force-filter-alpha",
+        type=float,
+        default=None,
+        help="Override the environment EMA coefficient for controller diagnostics.",
+    )
     AppLauncher.add_app_launcher_args(parser)
     parser.set_defaults(headless=True)
     return parser.parse_args()
@@ -49,6 +67,9 @@ from rl_games.torch_runner import Runner  # noqa: E402
 
 from isaacsimenvs.tasks.simtoolreal.simtoolreal_tacmap_env_cfg import (  # noqa: E402
     SimToolRealFixedGraspNormalForceEnvCfg,
+)
+from isaacsimenvs.tasks.simtoolreal.simtoolreal_fixed_grasp_force_env import (  # noqa: E402
+    pi_force_control,
 )
 
 
@@ -156,6 +177,8 @@ def make_env(feedback_mode: str):
     cfg.scene.num_envs = ARGS.num_envs
     cfg.feedback_mode = feedback_mode
     cfg.enable_vbts = feedback_mode == "tactile"
+    if ARGS.force_filter_alpha is not None:
+        cfg.contact_force_filter_alpha = float(ARGS.force_filter_alpha)
     print(f"[fixed-force] creating {ARGS.num_envs} envs in {feedback_mode} mode", flush=True)
     try:
         env = gym.make(TASK_ID, cfg=cfg)
@@ -283,6 +306,190 @@ def tactile_audit(env) -> dict:
     return result
 
 
+class ForceTrackingAccumulator:
+    """Collect interpretable force-control statistics without averaging bins."""
+
+    _FIELDS = (
+        "target",
+        "force",
+        "error",
+        "force_derivative",
+        "action",
+        "offset",
+    )
+
+    def __init__(self) -> None:
+        self.values = {
+            label: {field: [] for field in self._FIELDS}
+            for label in ("all", "2-3", "3-4", "4-5", "5-6")
+        }
+
+    def record(
+        self,
+        *,
+        force: torch.Tensor,
+        target: torch.Tensor,
+        force_derivative: torch.Tensor,
+        action: torch.Tensor,
+        offset: torch.Tensor,
+        include: torch.Tensor | None = None,
+    ) -> None:
+        if include is None:
+            include = torch.ones_like(force, dtype=torch.bool)
+        tensors = {
+            "target": target,
+            "force": force,
+            "error": torch.abs(force - target),
+            "force_derivative": force_derivative,
+            "action": action,
+            "offset": offset,
+        }
+        for label in self.values:
+            mask = include
+            if label != "all":
+                lower = float(label[0])
+                mask = mask & (target >= lower) & (target < lower + 1.0)
+            if not bool(mask.any()):
+                continue
+            for field, value in tensors.items():
+                self.values[label][field].extend(value[mask].detach().cpu().tolist())
+
+    def summarize(self) -> dict:
+        summary = {}
+        for label, fields in self.values.items():
+            if not fields["force"]:
+                summary[label] = None
+                continue
+            error = np.asarray(fields["error"])
+            derivative = np.asarray(fields["force_derivative"])
+            summary[label] = {
+                "samples": len(fields["force"]),
+                "target_mean_n": float(np.mean(fields["target"])),
+                "measured_force_mean_n": float(np.mean(fields["force"])),
+                "measured_force_std_n": float(np.std(fields["force"])),
+                "measured_force_median_n": float(np.median(fields["force"])),
+                "measured_force_p95_n": float(
+                    np.quantile(fields["force"], 0.95)
+                ),
+                "force_mae_n": float(np.mean(error)),
+                "within_1n_ratio": float(np.mean(error <= 1.0)),
+                "force_derivative_mean_nps": float(np.mean(derivative)),
+                "force_derivative_abs_mean_nps": float(np.mean(np.abs(derivative))),
+                "action_mean": float(np.mean(fields["action"])),
+                "normal_offset_mean_m": float(np.mean(fields["offset"])),
+            }
+        return summary
+
+
+def tracking_passed(summary: dict, over_force_ratio: float) -> bool:
+    bins = [summary[label] for label in ("2-3", "3-4", "4-5", "5-6")]
+    return (
+        all(item is not None and item["force_mae_n"] <= 1.0 for item in bins)
+        and summary["all"] is not None
+        and summary["all"]["within_1n_ratio"] >= 0.8
+        and over_force_ratio < 0.01
+    )
+
+
+def pi_baseline(env) -> dict:
+    inner = env.unwrapped
+    env.reset()
+    integral = torch.zeros(inner.num_envs, device=inner.device)
+    contacted = torch.zeros(inner.num_envs, dtype=torch.bool, device=inner.device)
+    episode_age = torch.zeros(inner.num_envs, dtype=torch.long, device=inner.device)
+    acquisition_steps = []
+    completed_episodes = 0
+    contacted_episodes = 0
+    over_force_steps = 0
+    sample_count = 0
+    all_steps = ForceTrackingAccumulator()
+    after_contact = ForceTrackingAccumulator()
+
+    for _ in range(ARGS.steps):
+        error = (
+            inner._scrape_target_contact_normal_force
+            - inner._scrape_table_normal_force
+        )
+        action, integral = pi_force_control(
+            error,
+            integral,
+            step_dt=float(inner.step_dt),
+            kp=ARGS.pi_kp,
+            ki=ARGS.pi_ki,
+            integral_limit=ARGS.pi_integral_limit,
+        )
+        approach = (~contacted) & (
+            inner._scrape_table_normal_force < float(ARGS.contact_threshold)
+        )
+        action = torch.where(
+            approach,
+            torch.full_like(action, float(ARGS.approach_action)).clamp(-1.0, 1.0),
+            action,
+        )
+        _, _, terminated, truncated, _ = env.step(action.unsqueeze(-1))
+        force = inner._scrape_table_normal_force
+        target = inner._scrape_target_contact_normal_force
+        episode_age.add_(1)
+        newly_contacted = (~contacted) & (force >= float(ARGS.contact_threshold))
+        acquisition_steps.extend(episode_age[newly_contacted].detach().cpu().tolist())
+        contacted |= newly_contacted
+
+        values = {
+            "force": force,
+            "target": target,
+            "force_derivative": inner._force_derivative,
+            "action": action,
+            "offset": inner._normal_offset,
+        }
+        all_steps.record(**values)
+        after_contact.record(**values, include=contacted)
+        over_force_steps += int(
+            (force > float(inner.cfg.max_contact_normal_force)).sum()
+        )
+        sample_count += inner.num_envs
+
+        done = terminated | truncated
+        if bool(done.any()):
+            completed_episodes += int(done.sum())
+            contacted_episodes += int((done & contacted).sum())
+            integral[done] = 0.0
+            contacted[done] = False
+            episode_age[done] = 0
+
+    all_summary = all_steps.summarize()
+    contact_summary = after_contact.summarize()
+    over_force_ratio = over_force_steps / sample_count
+    acquisition_array = np.asarray(acquisition_steps, dtype=np.float64)
+    result = {
+        "passed": tracking_passed(contact_summary, over_force_ratio),
+        "controller": {
+            "kp": ARGS.pi_kp,
+            "ki": ARGS.pi_ki,
+            "integral_limit": ARGS.pi_integral_limit,
+            "approach_action": ARGS.approach_action,
+            "force_filter_alpha": float(inner.cfg.contact_force_filter_alpha),
+        },
+        "all_steps": all_summary,
+        "after_contact": contact_summary,
+        "over_force_ratio": over_force_ratio,
+        "completed_episodes": completed_episodes,
+        "contacted_episode_ratio": (
+            contacted_episodes / completed_episodes
+            if completed_episodes
+            else None
+        ),
+        "contact_acquisition_steps_mean": (
+            float(acquisition_array.mean()) if acquisition_array.size else None
+        ),
+        "contact_acquisition_time_mean_s": (
+            float(acquisition_array.mean() * inner.step_dt)
+            if acquisition_array.size
+            else None
+        ),
+    }
+    return result
+
+
 def evaluate(env) -> dict:
     if not ARGS.checkpoint:
         raise ValueError("--checkpoint is required in evaluate mode")
@@ -293,8 +500,7 @@ def evaluate(env) -> dict:
     player = CheckpointPlayer(env, checkpoint)
     obs, _ = env.reset()
     player.reset()
-    bucket_errors = [[] for _ in range(4)]
-    within = 0
+    tracking = ForceTrackingAccumulator()
     over = 0
     count = 0
     for _ in range(ARGS.steps):
@@ -302,35 +508,36 @@ def evaluate(env) -> dict:
         obs, _, _, _, _ = env.step(action.to(inner.device))
         force = inner._scrape_table_normal_force
         target = inner._scrape_target_contact_normal_force
-        error = torch.abs(force - target)
-        bucket = torch.clamp(target.floor().long() - 2, 0, 3)
-        for index in range(4):
-            values = error[bucket == index]
-            if values.numel():
-                bucket_errors[index].extend(values.detach().cpu().tolist())
-        within += int((error <= 1.0).sum())
+        tracking.record(
+            force=force,
+            target=target,
+            force_derivative=inner._force_derivative,
+            action=action.squeeze(-1),
+            offset=inner._normal_offset,
+        )
         over += int((force > inner.cfg.max_contact_normal_force).sum())
         count += inner.num_envs
-    maes = [float(np.mean(values)) if values else float("nan") for values in bucket_errors]
+    summary = tracking.summarize()
+    over_force_ratio = over / count
     result = {
-        "passed": all(value <= 1.0 for value in maes)
-        and within / count >= 0.8
-        and over / count < 0.01,
-        "target_bin_mae_n": dict(zip(("2-3", "3-4", "4-5", "5-6"), maes)),
-        "within_1n_ratio": within / count,
-        "over_force_ratio": over / count,
+        "passed": tracking_passed(summary, over_force_ratio),
+        "tracking": summary,
+        "within_1n_ratio": summary["all"]["within_1n_ratio"],
+        "over_force_ratio": over_force_ratio,
     }
     return result
 
 
 def main() -> int:
-    feedback = "tactile" if ARGS.mode == "tactile-audit" else "force"
+    feedback = "tactile" if ARGS.mode == "tactile-audit" else ARGS.feedback_mode
     env = make_env(feedback)
     try:
         if ARGS.mode == "smoke":
             result = smoke(env)
         elif ARGS.mode == "tactile-audit":
             result = tactile_audit(env)
+        elif ARGS.mode == "pi-baseline":
+            result = pi_baseline(env)
         else:
             result = evaluate(env)
     finally:

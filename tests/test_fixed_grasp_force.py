@@ -21,6 +21,7 @@ def _load_pure_functions():
                 "fixed_force_observation_lists",
                 "fixed_force_reward_terms",
                 "integrate_normal_action",
+                "pi_force_control",
             }
         )
     ]
@@ -39,6 +40,7 @@ _functions = _load_pure_functions()
 fixed_force_observation_lists = _functions["fixed_force_observation_lists"]
 fixed_force_reward_terms = _functions["fixed_force_reward_terms"]
 integrate_normal_action = _functions["integrate_normal_action"]
+pi_force_control = _functions["pi_force_control"]
 
 
 def test_feedback_modes_have_expected_actor_and_critic_dimensions():
@@ -71,11 +73,15 @@ def test_force_reward_is_maximal_at_target_and_penalizes_action_changes():
         soft_force_limit=12.0,
         max_force=20.0,
         force_weight=1.0,
+        quadratic_error_weight=0.5,
+        quadratic_error_scale=4.0,
         over_force_weight=0.1,
         action_rate_weight=0.01,
     )
     assert reward[0] == 1.0
     assert reward[1] < torch.exp(torch.tensor(-1.0))
+    assert terms["quadratic_force_error_penalty"][0] == 0.0
+    assert terms["quadratic_force_error_penalty"][1] == -0.125
     assert terms["action_rate_penalty"][1] == -0.01
 
 
@@ -88,11 +94,34 @@ def test_soft_over_force_penalty_starts_above_soft_limit():
         soft_force_limit=12.0,
         max_force=20.0,
         force_weight=1.0,
+        quadratic_error_weight=0.5,
+        quadratic_error_scale=4.0,
         over_force_weight=0.1,
         action_rate_weight=0.01,
     )
     assert terms["over_force_penalty"][0] == 0.0
     assert terms["over_force_penalty"][1] < 0.0
+
+
+def test_quadratic_force_error_scale_must_be_positive():
+    try:
+        fixed_force_reward_terms(
+            torch.tensor([4.0]),
+            torch.tensor([4.0]),
+            torch.zeros(1),
+            sigma=2.0,
+            soft_force_limit=12.0,
+            max_force=20.0,
+            force_weight=1.0,
+            quadratic_error_weight=0.5,
+            quadratic_error_scale=0.0,
+            over_force_weight=0.1,
+            action_rate_weight=0.01,
+        )
+    except ValueError as exc:
+        assert "quadratic_error_scale" in str(exc)
+    else:
+        raise AssertionError("non-positive quadratic error scale was accepted")
 
 
 def test_normal_action_integration_scales_and_clamps_velocity():
@@ -106,3 +135,16 @@ def test_normal_action_integration_scales_and_clamps_velocity():
     )
     assert torch.allclose(velocity, torch.tensor([0.005, 0.01, -0.01]))
     assert torch.allclose(next_offset, torch.tensor([0.001, 0.05, -0.01]))
+
+
+def test_pi_force_control_blocks_integral_windup():
+    action, next_integral = pi_force_control(
+        torch.tensor([4.0, -4.0, 0.5]),
+        torch.tensor([0.0, 0.0, 0.0]),
+        step_dt=0.1,
+        kp=0.5,
+        ki=0.25,
+        integral_limit=2.0,
+    )
+    assert torch.allclose(action, torch.tensor([1.0, -1.0, 0.2625]))
+    assert torch.allclose(next_integral, torch.tensor([0.0, 0.0, 0.05]))

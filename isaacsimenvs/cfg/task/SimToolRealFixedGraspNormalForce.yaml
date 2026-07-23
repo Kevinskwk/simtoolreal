@@ -43,6 +43,8 @@ dls_joint_velocity_limit: 0.5
 fixed_grasp_max_drift_m: 0.005
 
 force_reward_weight: 1.0
+quadratic_force_error_penalty_weight: 0.5
+quadratic_force_error_scale_n: 4.0
 over_force_penalty_weight: 0.1
 action_rate_penalty_weight: 0.01
 

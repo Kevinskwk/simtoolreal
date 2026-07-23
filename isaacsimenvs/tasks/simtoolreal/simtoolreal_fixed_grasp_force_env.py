@@ -84,18 +84,31 @@ def fixed_force_reward_terms(
     soft_force_limit: float,
     max_force: float,
     force_weight: float,
+    quadratic_error_weight: float,
+    quadratic_error_scale: float,
     over_force_weight: float,
     action_rate_weight: float,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    if float(quadratic_error_scale) <= 0.0:
+        raise ValueError("quadratic_error_scale must be positive")
     score, _ = contact_force_reward(measured_force, target_force, sigma, max_force)
     soft_over_force = torch.clamp(measured_force - float(soft_force_limit), min=0.0)
     force_span = max(float(max_force) - float(soft_force_limit), 1.0e-6)
     force_rew = float(force_weight) * score
+    quadratic_error_penalty = -float(quadratic_error_weight) * (
+        (measured_force - target_force) / float(quadratic_error_scale)
+    ).square()
     over_force_penalty = -float(over_force_weight) * (soft_over_force / force_span).square()
     action_rate_penalty = -float(action_rate_weight) * action_delta.square()
-    total = force_rew + over_force_penalty + action_rate_penalty
+    total = (
+        force_rew
+        + quadratic_error_penalty
+        + over_force_penalty
+        + action_rate_penalty
+    )
     return total, {
         "force_tracking_rew": force_rew,
+        "quadratic_force_error_penalty": quadratic_error_penalty,
         "over_force_penalty": over_force_penalty,
         "action_rate_penalty": action_rate_penalty,
         "total_reward": total,
@@ -119,6 +132,35 @@ def integrate_normal_action(
         float(offset_max),
     )
     return next_offset, velocity
+
+
+def pi_force_control(
+    force_error: torch.Tensor,
+    integral: torch.Tensor,
+    *,
+    step_dt: float,
+    kp: float,
+    ki: float,
+    integral_limit: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute normalized PI action with conditional anti-windup."""
+    if float(integral_limit) <= 0.0:
+        raise ValueError("integral_limit must be positive")
+    candidate = torch.clamp(
+        integral + force_error * float(step_dt),
+        -float(integral_limit),
+        float(integral_limit),
+    )
+    candidate_action = float(kp) * force_error + float(ki) * candidate
+    drives_further_into_saturation = (
+        ((candidate_action > 1.0) & (force_error > 0.0))
+        | ((candidate_action < -1.0) & (force_error < 0.0))
+    )
+    next_integral = torch.where(drives_further_into_saturation, integral, candidate)
+    action = torch.clamp(
+        float(kp) * force_error + float(ki) * next_integral, -1.0, 1.0
+    )
+    return action, next_integral
 
 
 class SimToolRealFixedGraspNormalForceEnv(SimToolRealTacMapScrapePoseEnv):
@@ -195,6 +237,8 @@ class SimToolRealFixedGraspNormalForceEnv(SimToolRealTacMapScrapePoseEnv):
         self._episode_within_steps = torch.zeros(self.num_envs, device=self.device)
         self._episode_force_steps = torch.zeros(self.num_envs, device=self.device)
         self._fixed_grasp_drift = torch.zeros(self.num_envs, device=self.device)
+        self._previous_filtered_force = torch.zeros(self.num_envs, device=self.device)
+        self._force_derivative = torch.zeros(self.num_envs, device=self.device)
         self._reset_idx(all_env_ids)
 
     def _write_fixed_tool_pose(self, env_ids: torch.Tensor) -> None:
@@ -259,6 +303,8 @@ class SimToolRealFixedGraspNormalForceEnv(SimToolRealTacMapScrapePoseEnv):
         self._action_delta[env_ids] = 0.0
         self._episode_within_steps[env_ids] = 0.0
         self._episode_force_steps[env_ids] = 0.0
+        self._previous_filtered_force[env_ids] = 0.0
+        self._force_derivative[env_ids] = 0.0
         self._reset_contact_force_targets(env_ids)
         self._reset_contact_force_filter(env_ids)
 
@@ -353,6 +399,10 @@ class SimToolRealFixedGraspNormalForceEnv(SimToolRealTacMapScrapePoseEnv):
 
     def _get_rewards(self) -> torch.Tensor:
         force = self._sensor_normal_force()
+        self._force_derivative.copy_(
+            (force - self._previous_filtered_force) / float(self.step_dt)
+        )
+        self._previous_filtered_force.copy_(force)
         target = self._scrape_target_contact_normal_force
         reward, terms = fixed_force_reward_terms(
             force,
@@ -362,6 +412,10 @@ class SimToolRealFixedGraspNormalForceEnv(SimToolRealTacMapScrapePoseEnv):
             soft_force_limit=float(self.cfg.soft_contact_normal_force_limit),
             max_force=float(self.cfg.max_contact_normal_force),
             force_weight=float(self.cfg.force_reward_weight),
+            quadratic_error_weight=float(
+                self.cfg.quadratic_force_error_penalty_weight
+            ),
+            quadratic_error_scale=float(self.cfg.quadratic_force_error_scale_n),
             over_force_weight=float(self.cfg.over_force_penalty_weight),
             action_rate_weight=float(self.cfg.action_rate_penalty_weight),
         )
@@ -386,9 +440,41 @@ class SimToolRealFixedGraspNormalForceEnv(SimToolRealTacMapScrapePoseEnv):
             "within_1n_ratio": within.float().mean(),
             "normal_offset_mean": self._normal_offset.mean(),
             "normal_action_mean": self._previous_normal_action.mean(),
+            "force_derivative_mean": self._force_derivative.mean(),
+            "force_derivative_abs_mean": self._force_derivative.abs().mean(),
             "fixed_grasp_drift_max": self._fixed_grasp_drift.max(),
             "raw_force_mean": self._scrape_table_normal_force_raw.mean(),
         }
+        for lower in range(2, 6):
+            upper = lower + 1
+            mask = (target >= float(lower)) & (target < float(upper))
+            count = int(mask.sum())
+            metrics[f"target_bin_{lower}_{upper}/sample_fraction"] = mask.float().mean()
+            if count == 0:
+                continue
+            bin_force = force[mask]
+            bin_target = target[mask]
+            metrics.update(
+                {
+                    f"target_bin_{lower}_{upper}/target_mean": bin_target.mean(),
+                    f"target_bin_{lower}_{upper}/measured_force_mean": bin_force.mean(),
+                    f"target_bin_{lower}_{upper}/force_error_mae": (
+                        bin_force - bin_target
+                    ).abs().mean(),
+                    f"target_bin_{lower}_{upper}/force_derivative_mean": (
+                        self._force_derivative[mask].mean()
+                    ),
+                    f"target_bin_{lower}_{upper}/force_derivative_abs_mean": (
+                        self._force_derivative[mask].abs().mean()
+                    ),
+                    f"target_bin_{lower}_{upper}/action_mean": (
+                        self._previous_normal_action[mask].mean()
+                    ),
+                    f"target_bin_{lower}_{upper}/offset_mean": (
+                        self._normal_offset[mask].mean()
+                    ),
+                }
+            )
         for name, value in metrics.items():
             self.extras[f"fixed_force/{name}"] = value
         for name, value in terms.items():
@@ -416,4 +502,5 @@ __all__ = [
     "fixed_force_reward_terms",
     "integrate_normal_action",
     "load_fixed_grasp_spec",
+    "pi_force_control",
 ]

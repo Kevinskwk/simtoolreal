@@ -280,6 +280,8 @@ class SimToolRealFixedGraspNormalForceEnvCfg(SimToolRealTacMapScrapePoseEnvCfg):
     fixed_grasp_max_drift_m: float = 0.005
 
     force_reward_weight: float = 1.0
+    quadratic_force_error_penalty_weight: float = 0.5
+    quadratic_force_error_scale_n: float = 4.0
     over_force_penalty_weight: float = 0.1
     action_rate_penalty_weight: float = 0.01
 
