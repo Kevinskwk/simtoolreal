@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--phases",
         nargs="+",
-        choices=("all", "bare-load", "held-dls", "policy-goal"),
+        choices=("all", "bare-load", "bare-dynamics", "held-dls", "policy-goal"),
         default=("all",),
     )
     parser.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT))
@@ -59,6 +59,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pi-kp", type=float, default=8.0e-4)
     parser.add_argument("--pi-ki", type=float, default=2.0e-4)
     parser.add_argument("--force-velocity-limit", type=float, default=0.005)
+    parser.add_argument(
+        "--physics-dt",
+        type=float,
+        default=None,
+        help="Physics timestep; decimation is adjusted to retain 60 Hz control.",
+    )
+    parser.add_argument("--solver-position-iterations", type=int, default=None)
+    parser.add_argument("--solver-velocity-iterations", type=int, default=None)
+    parser.add_argument(
+        "--external-forces-every-iteration",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument(
         "--fixed-grasp-export",
         default="",
@@ -103,6 +116,8 @@ from isaacsimenvs.tasks.simtoolreal.utils.scrape_pose_utils import (  # noqa: E4
 
 OFFSETS_M = np.asarray([0.003, 0.001, 0.0, -0.00025, -0.0005, -0.001, -0.0015, -0.0025])
 LOADS_N = np.asarray([0.0, 2.0, 4.0, 6.0, 10.0])
+STEP_LOADS_N = np.asarray([0.0, 2.0, 6.0, 10.0, 6.0, 2.0, 0.0])
+RAMP_RATES_NPS = (1.0, 5.0, 20.0)
 FORCE_TARGETS_N = np.asarray([2.0, 4.0, 6.0])
 
 
@@ -161,6 +176,24 @@ def measured_interval_force(inner) -> torch.Tensor:
     return force
 
 
+def measured_current_force(inner, normal: torch.Tensor) -> torch.Tensor:
+    sensor = getattr(inner, "_tool_table_contact_sensor", None)
+    if sensor is None or sensor.data is None:
+        raise PhaseFailure("tool-table ContactSensor current data is unavailable")
+    matrix = getattr(sensor.data, "force_matrix_w", None)
+    if matrix is None or matrix.ndim < 3 or matrix.shape[-1] != 3:
+        raise PhaseFailure(
+            "tool-table ContactSensor has no valid pair-filtered force_matrix_w"
+        )
+    force_w = matrix.sum(dim=tuple(range(1, matrix.ndim - 1)))
+    force = (force_w * normal).sum(dim=-1)
+    if force.shape != (inner.num_envs,) or not torch.isfinite(force).all():
+        raise PhaseFailure(
+            f"current normal contact force is invalid: shape={tuple(force.shape)}"
+        )
+    return force
+
+
 def make_cfg() -> SimToolRealTacMapScrapePoseEnvCfg:
     cfg = SimToolRealTacMapScrapePoseEnvCfg()
     cfg.seed = ARGS.seed
@@ -193,7 +226,65 @@ def make_cfg() -> SimToolRealTacMapScrapePoseEnvCfg:
     cfg.tool_table_contact_sensor_force_threshold = 0.0
     cfg.contact_force_filter_alpha = 0.2
     cfg.termination.max_consecutive_successes = 0
+    if ARGS.physics_dt is not None:
+        physics_dt = float(ARGS.physics_dt)
+        if physics_dt <= 0.0:
+            raise ValueError("--physics-dt must be positive")
+        decimation = round((1.0 / 60.0) / physics_dt)
+        if decimation <= 0 or not np.isclose(
+            decimation * physics_dt, 1.0 / 60.0, rtol=0.0, atol=1.0e-9
+        ):
+            raise ValueError("--physics-dt must divide the 1/60 s control period")
+        cfg.sim.dt = physics_dt
+        cfg.decimation = decimation
+        cfg.sim.render_interval = decimation
+        cfg.tool_table_contact_sensor_history_len = decimation
+    if ARGS.solver_position_iterations is not None:
+        iterations = int(ARGS.solver_position_iterations)
+        if iterations <= 0:
+            raise ValueError("--solver-position-iterations must be positive")
+        cfg.sim.physx.min_position_iteration_count = iterations
+        cfg.sim.physx.max_position_iteration_count = iterations
+    if ARGS.solver_velocity_iterations is not None:
+        iterations = int(ARGS.solver_velocity_iterations)
+        if iterations < 0:
+            raise ValueError("--solver-velocity-iterations must be non-negative")
+        cfg.sim.physx.min_velocity_iteration_count = iterations
+        cfg.sim.physx.max_velocity_iteration_count = iterations
+    if ARGS.external_forces_every_iteration is not None:
+        cfg.sim.physx.enable_external_forces_every_iteration = bool(
+            ARGS.external_forces_every_iteration
+        )
     return cfg
+
+
+def bare_tool_state(inner) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    top, normal = table_state(inner)
+    tool_quat = getattr(
+        inner, "_table_quat_wxyz_per_env", inner.table.data.root_quat_w
+    ).clone()
+    z_min = inner._scrape_z_contact_per_env
+    tool_pos = top + normal * (-z_min[:, None] + 0.002)
+    pose = torch.cat((tool_pos, tool_quat), dim=-1)
+    mass = inner.object.data.default_mass.reshape(1, -1).sum(dim=1).to(
+        device=inner.device, dtype=torch.float32
+    )
+    return pose, normal.clone(), mass, torch.zeros(1, 6, device=inner.device)
+
+
+def reset_bare_tool(
+    inner,
+    pose: torch.Tensor,
+    zero_velocity: torch.Tensor,
+    normal: torch.Tensor,
+    *,
+    settle_steps: int = 240,
+) -> float:
+    inner.object.write_root_pose_to_sim(pose)
+    inner.object.write_root_velocity_to_sim(zero_velocity)
+    for _ in range(settle_steps):
+        direct_physics_step(inner, torch.zeros_like(normal))
+    return float((inner.object.data.root_lin_vel_w[0] * normal[0]).sum())
 
 
 def direct_physics_step(inner, applied_force_w: torch.Tensor) -> float:
@@ -212,16 +303,7 @@ def run_bare_load(inner, output_dir: Path) -> dict:
     print("[phase 1/3] bare-load calibration")
     inner._replay_target_lab_order = None
     inner.reset()
-    top, normal = table_state(inner)
-    normal = normal.clone()
-    tool_quat = getattr(inner, "_table_quat_wxyz_per_env", inner.table.data.root_quat_w).clone()
-    z_min = inner._scrape_z_contact_per_env
-    tool_pos = top + normal * (-z_min[:, None] + 0.002)
-    pose = torch.cat((tool_pos, tool_quat), dim=-1)
-    zero_vel = torch.zeros(1, 6, device=inner.device)
-    mass = inner.object.data.default_mass.reshape(1, -1).sum(dim=1).to(
-        device=inner.device, dtype=torch.float32
-    )
+    pose, normal, mass, zero_vel = bare_tool_state(inner)
     gravity = torch.tensor(inner.cfg.sim.gravity, device=inner.device, dtype=mass.dtype)
     rows: list[dict[str, float | int | str]] = []
     summaries = []
@@ -297,6 +379,318 @@ def run_bare_load(inner, output_dir: Path) -> dict:
         "r2": r2,
         "points": summaries,
     }
+
+
+def run_bare_dynamics(inner, output_dir: Path) -> dict:
+    """Validate force transitions on a bare tool under known external loads."""
+    print("[gate] bare-tool dynamic force transitions")
+    inner._replay_target_lab_order = None
+    inner.reset()
+    pose, normal, mass, zero_velocity = bare_tool_state(inner)
+    gravity = torch.tensor(inner.cfg.sim.gravity, device=inner.device)
+    gravity_normal_n = float((mass[:, None] * gravity * normal).sum())
+    dt = float(inner.physics_dt)
+    rows: list[dict[str, float | int | str]] = []
+
+    def sample(
+        *,
+        protocol: str,
+        repetition: int,
+        segment: int,
+        sample_index: int,
+        load_n: float,
+        previous_velocity: float,
+        ramp_rate_nps: float = 0.0,
+        direction: str = "hold",
+        initial_speed_mps: float = 0.0,
+    ) -> float:
+        applied = -float(load_n) * normal
+        inner.object.set_external_force_and_torque(
+            applied[:, None, :],
+            torch.zeros_like(applied)[:, None, :],
+            is_global=True,
+        )
+        inner.robot.set_joint_position_target(inner.robot.data.joint_pos)
+        inner.scene.write_data_to_sim()
+        inner.sim.step(render=False)
+        inner.scene.update(dt=inner.physics_dt)
+        measured = float(measured_current_force(inner, normal)[0])
+        velocity = float(
+            (inner.object.data.root_lin_vel_w[0] * normal[0]).sum()
+        )
+        acceleration = (velocity - previous_velocity) / dt
+        equilibrium = float(load_n) - gravity_normal_n
+        dynamic_expected = equilibrium + float(mass[0]) * acceleration
+        rows.append(
+            {
+                "protocol": protocol,
+                "repetition": repetition,
+                "segment": segment,
+                "sample": sample_index,
+                "time_s": len(rows) * dt,
+                "direction": direction,
+                "ramp_rate_nps": ramp_rate_nps,
+                "initial_speed_mps": initial_speed_mps,
+                "load_n": load_n,
+                "equilibrium_reaction_n": equilibrium,
+                "dynamic_expected_reaction_n": dynamic_expected,
+                "measured_force_n": measured,
+                "force_balance_residual_n": measured - dynamic_expected,
+                "object_normal_velocity_mps": velocity,
+                "object_normal_acceleration_mps2": acceleration,
+            }
+        )
+        return velocity
+
+    step_hold_steps = 120
+    step_repetitions = 3
+    previous_velocity = reset_bare_tool(
+        inner, pose, zero_velocity, normal, settle_steps=240
+    )
+    for repetition in range(step_repetitions):
+        for segment, load in enumerate(STEP_LOADS_N):
+            for index in range(step_hold_steps):
+                previous_velocity = sample(
+                    protocol="step",
+                    repetition=repetition,
+                    segment=segment,
+                    sample_index=index,
+                    load_n=float(load),
+                    previous_velocity=previous_velocity,
+                )
+
+    for rate_index, rate in enumerate(RAMP_RATES_NPS):
+        previous_velocity = reset_bare_tool(
+            inner, pose, zero_velocity, normal, settle_steps=240
+        )
+        ramp_step = float(rate) * dt
+        up = np.arange(0.0, 6.0, ramp_step, dtype=np.float64)
+        loads = np.concatenate((up, np.asarray([6.0]), up[::-1]))
+        for index, load in enumerate(loads):
+            previous_velocity = sample(
+                protocol="ramp",
+                repetition=rate_index,
+                segment=0,
+                sample_index=index,
+                load_n=float(load),
+                previous_velocity=previous_velocity,
+                ramp_rate_nps=float(rate),
+                direction="loading" if index <= len(up) else "unloading",
+            )
+
+    acquisition_summaries = []
+    control_interval_steps = round((1.0 / 60.0) / dt)
+    for speed_index, initial_speed in enumerate((0.0, 0.005, 0.02)):
+        repetitions = []
+        for repetition in range(3):
+            velocity = zero_velocity.clone()
+            velocity[:, :3] = -float(initial_speed) * normal
+            inner.object.write_root_pose_to_sim(pose)
+            inner.object.write_root_velocity_to_sim(velocity)
+            inner.object.set_external_force_and_torque(
+                torch.zeros(1, 1, 3, device=inner.device),
+                torch.zeros(1, 1, 3, device=inner.device),
+                is_global=True,
+            )
+            previous_velocity = -float(initial_speed)
+            row_start = len(rows)
+            for index in range(180):
+                previous_velocity = sample(
+                    protocol="acquisition",
+                    repetition=repetition,
+                    segment=speed_index,
+                    sample_index=index,
+                    load_n=0.0,
+                    previous_velocity=previous_velocity,
+                    direction="impact",
+                    initial_speed_mps=float(initial_speed),
+                )
+            run_rows = rows[row_start:]
+            measured = np.asarray(
+                [float(row["measured_force_n"]) for row in run_rows]
+            )
+            interval_force = np.convolve(
+                measured,
+                np.ones(control_interval_steps) / control_interval_steps,
+                mode="valid",
+            )
+            impulse = float(
+                np.sum(measured + gravity_normal_n) * dt
+                - float(mass[0]) * (previous_velocity + float(initial_speed))
+            )
+            repetitions.append(
+                {
+                    "peak_force_n": float(measured.max()),
+                    "control_interval_peak_force_n": float(interval_force.max()),
+                    "contact_impulse_residual_ns": impulse,
+                    "force_balance_p95_n": float(
+                        np.quantile(
+                            np.abs(
+                                [
+                                    float(row["force_balance_residual_n"])
+                                    for row in run_rows
+                                ]
+                            ),
+                            0.95,
+                        )
+                    ),
+                }
+            )
+        peaks = np.asarray([item["peak_force_n"] for item in repetitions])
+        interval_peaks = np.asarray(
+            [item["control_interval_peak_force_n"] for item in repetitions]
+        )
+        acquisition_summaries.append(
+            {
+                "initial_speed_mps": initial_speed,
+                "peak_force_mean_n": float(peaks.mean()),
+                "peak_force_range_n": float(peaks.max() - peaks.min()),
+                "control_interval_peak_force_mean_n": float(
+                    interval_peaks.mean()
+                ),
+                "maximum_abs_impulse_residual_ns": float(
+                    max(
+                        abs(item["contact_impulse_residual_ns"])
+                        for item in repetitions
+                    )
+                ),
+                "force_balance_p95_max_n": float(
+                    max(item["force_balance_p95_n"] for item in repetitions)
+                ),
+                "repetitions": repetitions,
+            }
+        )
+
+    inner.object.set_external_force_and_torque(
+        torch.zeros(1, 1, 3, device=inner.device),
+        torch.zeros(1, 1, 3, device=inner.device),
+        is_global=True,
+    )
+    write_csv(output_dir / "bare_dynamics.csv", rows)
+
+    step_rows = [row for row in rows if row["protocol"] == "step"]
+    settled_rows = [
+        row for row in step_rows if int(row["sample"]) >= 3 * step_hold_steps // 4
+    ]
+    settled_error = np.asarray(
+        [
+            float(row["measured_force_n"]) - float(row["equilibrium_reaction_n"])
+            for row in settled_rows
+        ]
+    )
+    residual = np.asarray(
+        [float(row["force_balance_residual_n"]) for row in step_rows]
+    )
+    cycle_length = len(STEP_LOADS_N) * step_hold_steps
+    step_force = np.asarray([float(row["measured_force_n"]) for row in step_rows])
+    repeated = step_force.reshape(step_repetitions, cycle_length)
+    repeatability_std = repeated.std(axis=0)
+
+    ramp_summaries = []
+    for rate in RAMP_RATES_NPS:
+        rate_rows = [
+            row
+            for row in rows
+            if row["protocol"] == "ramp"
+            and np.isclose(float(row["ramp_rate_nps"]), rate)
+        ]
+        rate_residual = np.abs(
+            np.asarray(
+                [float(row["force_balance_residual_n"]) for row in rate_rows]
+            )
+        )
+        loading = [row for row in rate_rows if row["direction"] == "loading"]
+        unloading = [row for row in rate_rows if row["direction"] == "unloading"]
+        load_grid = np.linspace(0.5, 5.5, 11)
+        loading_force = np.interp(
+            load_grid,
+            [float(row["load_n"]) for row in loading],
+            [float(row["measured_force_n"]) for row in loading],
+        )
+        unloading_force = np.interp(
+            load_grid,
+            [float(row["load_n"]) for row in reversed(unloading)],
+            [float(row["measured_force_n"]) for row in reversed(unloading)],
+        )
+        ramp_summaries.append(
+            {
+                "rate_nps": rate,
+                "force_balance_mae_n": float(rate_residual.mean()),
+                "force_balance_p95_n": float(np.quantile(rate_residual, 0.95)),
+                "hysteresis_mae_n": float(
+                    np.mean(np.abs(loading_force - unloading_force))
+                ),
+            }
+        )
+
+    maximum_measured = float(
+        max(float(row["measured_force_n"]) for row in rows)
+    )
+    result = {
+        "passed": bool(
+            np.mean(np.abs(settled_error)) <= 0.1
+            and np.quantile(np.abs(residual), 0.95) <= 1.0
+            and np.quantile(repeatability_std, 0.95) <= 0.1
+            and ramp_summaries[0]["hysteresis_mae_n"] <= 0.25
+            and max(
+                item["peak_force_range_n"] for item in acquisition_summaries
+            )
+            <= 1.0
+            and max(
+                item["maximum_abs_impulse_residual_ns"]
+                for item in acquisition_summaries
+            )
+            <= 0.01
+            and maximum_measured <= 20.0
+        ),
+        "tool_mass_kg": float(mass[0]),
+        "gravity_normal_force_n": -gravity_normal_n,
+        "step": {
+            "settled_mae_n": float(np.mean(np.abs(settled_error))),
+            "force_balance_mae_n": float(np.mean(np.abs(residual))),
+            "force_balance_p95_n": float(
+                np.quantile(np.abs(residual), 0.95)
+            ),
+            "repeatability_std_p95_n": float(
+                np.quantile(repeatability_std, 0.95)
+            ),
+            "maximum_measured_force_n": maximum_measured,
+        },
+        "ramps": ramp_summaries,
+        "acquisition": acquisition_summaries,
+        "criteria": {
+            "maximum_settled_mae_n": 0.1,
+            "maximum_force_balance_p95_n": 1.0,
+            "maximum_repeatability_std_p95_n": 0.1,
+            "maximum_slow_ramp_hysteresis_mae_n": 0.25,
+            "maximum_acquisition_peak_range_n": 1.0,
+            "maximum_acquisition_impulse_residual_ns": 0.01,
+            "maximum_measured_force_n": 20.0,
+        },
+    }
+
+    time = np.asarray([float(row["time_s"]) for row in rows])
+    measured = np.asarray([float(row["measured_force_n"]) for row in rows])
+    equilibrium = np.asarray(
+        [float(row["equilibrium_reaction_n"]) for row in rows]
+    )
+    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    axes[0].plot(time, equilibrium, label="quasi-static expected", linewidth=1.0)
+    axes[0].plot(time, measured, label="measured", linewidth=0.8)
+    axes[0].set_ylabel("Normal force (N)")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    axes[1].plot(
+        time,
+        [float(row["force_balance_residual_n"]) for row in rows],
+        linewidth=0.8,
+    )
+    axes[1].set(xlabel="Time (s)", ylabel="Force-balance residual (N)")
+    axes[1].grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_dir / "bare_dynamics.png", dpi=160)
+    plt.close(fig)
+    return result
 
 
 def make_player(inner, checkpoint: Path, config: Path) -> RlPlayer:
@@ -759,7 +1153,12 @@ def main() -> int:
     output_dir = Path(ARGS.output_root).resolve() / run_name
     output_dir.mkdir(parents=True, exist_ok=False)
     requested = list(ARGS.phases)
-    phases = ["bare-load", "held-dls", "policy-goal"] if "all" in requested else requested
+    phases = (
+        ["bare-load", "bare-dynamics", "held-dls", "policy-goal"]
+        if "all" in requested
+        else requested
+    )
+    cfg = make_cfg()
     metadata = {
         "created_at": datetime.now().astimezone().isoformat(),
         "git_commit": git_text("rev-parse", "HEAD"),
@@ -772,12 +1171,20 @@ def main() -> int:
         "policy_coefficient_id": ARGS.policy_coef_id,
         "held_tool_mode": ARGS.held_tool_mode,
         "phases": phases,
-        "physics_hz": 120,
-        "control_hz": 60,
+        "physics_hz": round(1.0 / float(cfg.sim.dt)),
+        "control_hz": round(1.0 / (float(cfg.sim.dt) * int(cfg.decimation))),
+        "solver_position_iterations": int(
+            cfg.sim.physx.max_position_iteration_count
+        ),
+        "solver_velocity_iterations": int(
+            cfg.sim.physx.max_velocity_iteration_count
+        ),
+        "external_forces_every_iteration": bool(
+            cfg.sim.physx.enable_external_forces_every_iteration
+        ),
     }
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
 
-    cfg = make_cfg()
     env = gym.make("Isaacsimenvs-SimToolReal-TacMap-Scrape-Direct-v0", cfg=cfg)
     inner = env.unwrapped
     player = None
@@ -787,6 +1194,9 @@ def main() -> int:
         if "bare-load" in phases:
             active_phase = "bare-load"
             summary["bare-load"] = run_bare_load(inner, output_dir)
+        if "bare-dynamics" in phases:
+            active_phase = "bare-dynamics"
+            summary["bare-dynamics"] = run_bare_dynamics(inner, output_dir)
         if any(phase in phases for phase in ("held-dls", "policy-goal")):
             player = make_player(inner, checkpoint, policy_config)
         if "held-dls" in phases:
