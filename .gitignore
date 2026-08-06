@@ -232,3 +232,11 @@ videos/
 outputs/
 evals_isaacsim/
 evals/
+
+# Generated experiment media (keep plotting source tracked)
+/artifacts/**/*.png
+/artifacts/**/*.pdf
+
+# Machine-specific environment snapshots
+/docs/sharpa_conda_list.txt
+/docs/sharpa_pip_freeze.txt

@@ -44,11 +44,18 @@ Verify:
 
 ```bash
 .venv_isaacsim/bin/python -c "
-import torch, isaaclab, isaacsimenvs
+import torch, isaaclab, isaacsim
 print('torch:', torch.__version__, 'cuda:', torch.cuda.is_available())
 print('isaaclab:', isaaclab.__file__)
+print('isaacsim:', isaacsim.__file__)
 "
 ```
+
+Do not include `isaacsimenvs` in this top-level import check. Importing
+`isaacsimenvs` registers the local Gym tasks, which imports `isaaclab.envs`;
+that Isaac Lab submodule is only available after Kit is initialized through
+`AppLauncher`. Use `isaacsimenvs/tests/test_gym_register.py` below for the
+local task-registration check.
 
 ## Running
 
