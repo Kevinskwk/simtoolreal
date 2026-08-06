@@ -38,8 +38,16 @@ class SimToolRealTacMapEnv(SimToolRealEnv):
         )
         self._prev_raw_contacts = torch.zeros_like(self.last_contacts)
         history_len = int(getattr(self.cfg, "tacmap_history_len", 1))
+        features_per_sensor = (
+            5 if bool(getattr(self.cfg, "tacmap_policy_include_depth", True)) else 3
+        )
         self._tacmap_policy_obs_history = torch.zeros(
-            (self.num_envs, history_len, num_sensors * 5),
+            (self.num_envs, history_len, num_sensors * features_per_sensor),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self._last_tacmap_policy_obs_frame = torch.zeros(
+            (self.num_envs, num_sensors * features_per_sensor),
             dtype=torch.float32,
             device=self.device,
         )
@@ -84,6 +92,8 @@ class SimToolRealTacMapEnv(SimToolRealEnv):
             self._prev_raw_contacts[env_ids] = 0
         if hasattr(self, "_tacmap_policy_obs_history") and env_ids.numel() > 0:
             self._tacmap_policy_obs_history[env_ids] = 0
+        if hasattr(self, "_last_tacmap_policy_obs_frame") and env_ids.numel() > 0:
+            self._last_tacmap_policy_obs_frame[env_ids] = 0
 
     def _update_tacmap_buffers(self) -> None:
         if not getattr(self.cfg, "enable_vbts", False) or not self._vbts_sensor:
@@ -219,10 +229,22 @@ class SimToolRealTacMapEnv(SimToolRealEnv):
             contact_depth_max[:] = 0.0
             contact_cx[:] = 0.0
             contact_cy[:] = 0.0
-        return torch.stack(
-            (sensed_contacts, contact_depth_mean, contact_depth_max, contact_cx, contact_cy),
-            dim=-1,
-        ).reshape(self.num_envs, -1)
+        features = [sensed_contacts]
+        if bool(getattr(self.cfg, "tacmap_policy_include_depth", True)):
+            features.extend((contact_depth_mean, contact_depth_max))
+        features.extend((contact_cx, contact_cy))
+        frame = torch.stack(features, dim=-1).reshape(self.num_envs, -1)
+        if not hasattr(self, "_last_tacmap_policy_obs_frame"):
+            self._last_tacmap_policy_obs_frame = frame.clone()
+        else:
+            self._last_tacmap_policy_obs_frame.copy_(frame)
+        return frame
+
+    def get_last_tacmap_policy_frame(self) -> torch.Tensor:
+        """Return the compact frame most recently assembled for observations."""
+        if not hasattr(self, "_last_tacmap_policy_obs_frame"):
+            raise RuntimeError("TacMap compact observation frame is unavailable")
+        return self._last_tacmap_policy_obs_frame
 
     def get_tacmap_policy_obs(self) -> torch.Tensor:
         frame = self._get_tacmap_policy_obs_frame()
