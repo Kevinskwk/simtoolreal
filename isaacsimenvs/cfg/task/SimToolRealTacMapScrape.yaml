@@ -35,10 +35,18 @@ contact_force_sigma_start: 4.0
 contact_force_sigma_target: 1.0
 contact_force_sigma_increment: 0.9
 contact_force_curriculum_success_threshold: 0.8
-tool_table_contact_sensor_update_period: 0.016666666666666666
-tool_table_contact_sensor_history_len: 1
+contact_force_curriculum_min_eligible_count: 64
+contact_force_use_control_interval_average: true
+tool_table_contact_sensor_update_period: 0.0
+tool_table_contact_sensor_history_len: 2
 tool_table_contact_sensor_force_threshold: 0.1
 contact_force_filter_alpha: 0.2
+contact_force_onset_threshold_n: 0.1
+contact_force_onset_grace_steps: 3
+contact_force_reward_ramp_steps: 6
+contact_force_huber_delta_n: 1.0
+contact_force_grasp_min_fingertips: 2
+contact_force_grasp_max_fingertip_distance_m: 0.12
 
 scene:
   num_envs: 12288

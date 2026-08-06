@@ -30,7 +30,9 @@ class SimToolRealTacMapEnvCfg(SimToolRealEnvCfg):
     resolution_step: int = 20
     vbts_update_period: float = 1.0 / 60.0
     vbts_target_prim_expr: str = "/World/envs/env_.*/Object/.*/visuals"
-    vbts_target_rigid_expr: str = "/World/envs/env_.*/Object/.*"
+    # Track the actual rigid body only. A broad `/Object/.*` view also asks
+    # PhysX to resolve non-physics scopes such as `/Object/Looks`.
+    vbts_target_rigid_expr: str = "/World/envs/env_.*/Object/object_root"
 
     points_npy_4f: str = str(_TACMAP_ROOT / "tactileSensor_map_4F_point_origin.npy")
     normals_npy_4f: str = str(_TACMAP_ROOT / "tactileSensor_map_4F_normal_origin.npy")
@@ -175,6 +177,9 @@ class SimToolRealTacMapContactEnvCfg(SimToolRealTacMapEnvCfg):
     contact_sensor_noise: float = 0.01
     tacmap_history_len: int = 5
     disable_tactile_ids: list[int] = []
+    # Current checkpoints use contact/depth-mean/depth-max/centroid-x/centroid-y.
+    # Disable depth only when restoring legacy three-feature tactile policies.
+    tacmap_policy_include_depth: bool = True
 
     obs: ObsCfg = ObsCfg(
         obs_list=_BASE_OBS.obs_list + ("tacmap",),
@@ -185,7 +190,12 @@ class SimToolRealTacMapContactEnvCfg(SimToolRealTacMapEnvCfg):
     def compute_tacmap_obs_size(self) -> int:
         if self.tacmap_history_len <= 0:
             raise ValueError("tacmap_history_len must be positive.")
-        return len(self.vbts_sensor) * 5 * int(self.tacmap_history_len)
+        features_per_sensor = 5 if self.tacmap_policy_include_depth else 3
+        return (
+            len(self.vbts_sensor)
+            * features_per_sensor
+            * int(self.tacmap_history_len)
+        )
 
 
 @configclass
@@ -224,7 +234,8 @@ class SimToolRealTacMapScrapePoseEnvCfg(SimToolRealTacMapContactEnvCfg):
 
     # Optional force term. It is multiplied by the edge-contact geometry score.
     # The reward scale is constant; the force tolerance tightens only when the
-    # force-tracking pass rate exceeds the configured threshold.
+    # force-tracking pass rate among eligible environments exceeds the
+    # configured threshold with enough samples to make the estimate reliable.
     enable_tool_table_contact_force_reward: bool = True
     contact_force_reward_relative_weight: float = 0.5
     # If target_contact_normal_force is set, it pins a fixed target for backward
@@ -236,12 +247,22 @@ class SimToolRealTacMapScrapePoseEnvCfg(SimToolRealTacMapContactEnvCfg):
     contact_force_sigma_target: float = 2.0
     contact_force_sigma_increment: float = 0.9
     contact_force_curriculum_success_threshold: float = 0.8
-    tool_table_contact_sensor_update_period: float = 1.0 / 60.0
-    tool_table_contact_sensor_history_len: int = 1
+    contact_force_curriculum_min_eligible_count: int = 64
+    # Scrape force is averaged over all physics samples in one policy interval.
+    # These settings are validated against decimation at environment startup.
+    contact_force_use_control_interval_average: bool = True
+    tool_table_contact_sensor_update_period: float = 0.0
+    tool_table_contact_sensor_history_len: int = 2
     tool_table_contact_sensor_force_threshold: float = 0.1
-    # EMA coefficient for the current tool-table force sample. Set to 1.0 to
-    # disable temporal filtering.
+    # EMA is applied after control-interval averaging, and initialized only
+    # after persistent contact clears the onset grace period.
     contact_force_filter_alpha: float = 0.2
+    contact_force_onset_threshold_n: float = 0.1
+    contact_force_onset_grace_steps: int = 3
+    contact_force_reward_ramp_steps: int = 6
+    contact_force_huber_delta_n: float = 1.0
+    contact_force_grasp_min_fingertips: int = 2
+    contact_force_grasp_max_fingertip_distance_m: float = 0.12
     tool_table_contact_sensor_prim_path: str = "/World/envs/env_.*/Object/object_root"
     tool_table_contact_sensor_filter_paths: list[str] = ["/World/envs/env_.*/Table/box"]
 
@@ -268,6 +289,9 @@ class SimToolRealFixedGraspNormalForceEnvCfg(SimToolRealTacMapScrapePoseEnvCfg):
     soft_contact_normal_force_limit: float = 12.0
     force_success_tolerance_n: float = 1.0
     contact_force_filter_alpha: float = 0.2
+    contact_force_use_control_interval_average: bool = False
+    contact_force_onset_grace_steps: int = 0
+    contact_force_reward_ramp_steps: int = 1
 
     normal_velocity_limit_mps: float = 0.005
     normal_offset_min_m: float = -0.01

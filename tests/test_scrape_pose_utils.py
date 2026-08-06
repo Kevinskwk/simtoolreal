@@ -19,6 +19,8 @@ sample_edge_contact_goal_pose = _utils.sample_edge_contact_goal_pose
 load_urdf_collision_bounds = _utils.load_urdf_collision_bounds
 edge_contact_points_w = _utils.edge_contact_points_w
 contact_force_reward = _utils.contact_force_reward
+conditional_success_rate = _utils.conditional_success_rate
+contact_force_onset_gate = _utils.contact_force_onset_gate
 edge_contact_reward = _utils.edge_contact_reward
 table_top_state = _utils.table_top_state
 
@@ -191,3 +193,84 @@ def test_contact_force_reward_supports_per_env_targets():
     assert reward[0].item() > reward[1].item()
     assert torch.all(over_force == 0.0)
 
+
+def test_contact_force_reward_huber_is_robust_to_large_errors():
+    force = torch.tensor([4.0, 8.0])
+    l1_reward, _ = contact_force_reward(
+        force, target_force=4.0, force_sigma=2.0, max_force=20.0
+    )
+    huber_reward, _ = contact_force_reward(
+        force,
+        target_force=4.0,
+        force_sigma=2.0,
+        max_force=20.0,
+        huber_delta_n=1.0,
+    )
+
+    assert l1_reward[0].item() == huber_reward[0].item() == 1.0
+    assert huber_reward[1].item() > l1_reward[1].item()
+
+
+def test_contact_force_onset_gate_requires_persistence_and_resets():
+    age = torch.zeros(2, dtype=torch.long)
+    ramps = []
+    for force in (
+        torch.tensor([0.0, 1.0]),
+        torch.tensor([1.0, 1.0]),
+        torch.tensor([1.0, 1.0]),
+        torch.tensor([1.0, 0.0]),
+        torch.tensor([1.0, 1.0]),
+        torch.tensor([1.0, 1.0]),
+    ):
+        age, ramp, _ = contact_force_onset_gate(
+            force,
+            age,
+            contact_threshold_n=0.1,
+            grace_steps=2,
+            ramp_steps=2,
+        )
+        ramps.append(ramp.clone())
+
+    assert torch.equal(age, torch.tensor([5, 2]))
+    assert torch.allclose(ramps[0], torch.tensor([0.0, 0.0]))
+    assert torch.allclose(ramps[2], torch.tensor([0.0, 0.5]))
+    assert torch.allclose(ramps[3], torch.tensor([0.5, 0.0]))
+    assert torch.allclose(ramps[-1], torch.tensor([1.0, 0.0]))
+
+
+def test_conditional_success_rate_uses_only_eligible_samples():
+    eligible = torch.tensor([True, True, False, False, True])
+    success = torch.tensor([True, False, False, False, True])
+
+    rate, count, has_support = conditional_success_rate(
+        success, eligible, min_eligible_count=3
+    )
+
+    assert count.item() == 3
+    assert torch.isclose(rate, torch.tensor(2.0 / 3.0))
+    assert has_support.item()
+
+
+def test_conditional_success_rate_reports_insufficient_support_without_hiding_rate():
+    eligible = torch.tensor([True, False, False])
+    success = torch.tensor([True, False, False])
+
+    rate, count, has_support = conditional_success_rate(
+        success, eligible, min_eligible_count=2
+    )
+
+    assert count.item() == 1
+    assert rate.item() == 1.0
+    assert not has_support.item()
+
+
+def test_conditional_success_rate_rejects_success_outside_eligibility():
+    eligible = torch.tensor([False, True])
+    success = torch.tensor([True, False])
+
+    try:
+        conditional_success_rate(success, eligible, min_eligible_count=1)
+    except ValueError as exc:
+        assert "not eligible" in str(exc)
+    else:
+        raise AssertionError("Expected success outside eligibility to fail.")

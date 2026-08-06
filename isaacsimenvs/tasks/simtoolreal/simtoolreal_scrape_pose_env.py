@@ -8,10 +8,13 @@ import torch
 
 from .simtoolreal_tacmap_env import SimToolRealTacMapEnv
 from .simtoolreal_tacmap_env_cfg import SimToolRealTacMapScrapePoseEnvCfg
+from .utils.contact_force_controllability import interval_normal_force
 from .utils.logging_utils import log_step_metrics
 from .utils.obs_utils import compute_intermediate_values
 from .utils.reward_utils import compute_rewards
 from .utils.scrape_pose_utils import (
+    conditional_success_rate,
+    contact_force_onset_gate,
     contact_force_reward,
     edge_contact_points_w,
     edge_contact_reward,
@@ -43,8 +46,23 @@ class SimToolRealTacMapScrapePoseEnv(SimToolRealTacMapEnv):
         self._scrape_table_normal_force_raw = torch.zeros(
             self.num_envs, device=self.device
         )
+        self._scrape_table_normal_force_interval = torch.zeros(
+            self.num_envs, device=self.device
+        )
         self._scrape_table_normal_force = torch.zeros(self.num_envs, device=self.device)
         self._contact_force_filter_initialized = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self._contact_force_age_steps = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
+        self._contact_force_reward_ramp = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        self._contact_force_in_contact = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self._contact_force_held_tool = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
         self._scrape_target_contact_normal_force = torch.zeros(
@@ -162,6 +180,54 @@ class SimToolRealTacMapScrapePoseEnv(SimToolRealTacMapEnv):
                 "contact_force_filter_alpha must be in (0, 1], got "
                 f"{filter_alpha}."
             )
+        onset_threshold = float(self.cfg.contact_force_onset_threshold_n)
+        grace_steps = int(self.cfg.contact_force_onset_grace_steps)
+        ramp_steps = int(self.cfg.contact_force_reward_ramp_steps)
+        huber_delta = float(self.cfg.contact_force_huber_delta_n)
+        grasp_min_fingertips = int(self.cfg.contact_force_grasp_min_fingertips)
+        grasp_max_distance = float(
+            self.cfg.contact_force_grasp_max_fingertip_distance_m
+        )
+        curriculum_min_eligible = int(
+            self.cfg.contact_force_curriculum_min_eligible_count
+        )
+        if onset_threshold <= 0.0:
+            raise ValueError("contact_force_onset_threshold_n must be positive.")
+        if grace_steps < 0:
+            raise ValueError("contact_force_onset_grace_steps must be non-negative.")
+        if ramp_steps <= 0:
+            raise ValueError("contact_force_reward_ramp_steps must be positive.")
+        if huber_delta <= 0.0:
+            raise ValueError("contact_force_huber_delta_n must be positive.")
+        if grasp_min_fingertips <= 0 or grasp_min_fingertips > 5:
+            raise ValueError(
+                "contact_force_grasp_min_fingertips must be in [1, 5], got "
+                f"{grasp_min_fingertips}."
+            )
+        if grasp_max_distance <= 0.0:
+            raise ValueError(
+                "contact_force_grasp_max_fingertip_distance_m must be positive."
+            )
+        if curriculum_min_eligible <= 0:
+            raise ValueError(
+                "contact_force_curriculum_min_eligible_count must be positive."
+            )
+        if bool(self.cfg.contact_force_use_control_interval_average):
+            sensor_period = float(self.cfg.tool_table_contact_sensor_update_period)
+            history_len = int(self.cfg.tool_table_contact_sensor_history_len)
+            required = int(self.cfg.decimation)
+            if sensor_period != 0.0:
+                raise ValueError(
+                    "Control-interval force averaging requires "
+                    "tool_table_contact_sensor_update_period=0.0, got "
+                    f"{sensor_period}."
+                )
+            if history_len < required:
+                raise ValueError(
+                    "Control-interval force averaging requires sensor history for "
+                    f"every physics step: history_len={history_len}, "
+                    f"decimation={required}."
+                )
 
     def _contact_force_target_range(self) -> tuple[float, float]:
         fixed_target = getattr(self.cfg, "target_contact_normal_force", None)
@@ -205,8 +271,13 @@ class SimToolRealTacMapScrapePoseEnv(SimToolRealTacMapEnv):
 
     def _reset_contact_force_filter(self, env_ids: torch.Tensor) -> None:
         self._scrape_table_normal_force_raw[env_ids] = 0.0
+        self._scrape_table_normal_force_interval[env_ids] = 0.0
         self._scrape_table_normal_force[env_ids] = 0.0
         self._contact_force_filter_initialized[env_ids] = False
+        self._contact_force_age_steps[env_ids] = 0
+        self._contact_force_reward_ramp[env_ids] = 0.0
+        self._contact_force_in_contact[env_ids] = False
+        self._contact_force_held_tool[env_ids] = False
 
     def _cache_scrape_tool_bounds(self) -> None:
         bounds = [load_urdf_collision_bounds(path) for path in self._object_urdf_paths]
@@ -307,25 +378,25 @@ class SimToolRealTacMapScrapePoseEnv(SimToolRealTacMapEnv):
         data = getattr(sensor, "data", None)
         if data is None:
             raise RuntimeError("tool-table ContactSensor has no data object.")
-        force = getattr(data, "force_matrix_w", None)
-        if force is None:
+        force_matrix = getattr(data, "force_matrix_w", None)
+        if force_matrix is None:
             raise RuntimeError(
                 "tool-table ContactSensor has no force_matrix_w. Pair-filtered force "
                 "data is required; refusing to fall back to unfiltered net_forces_w."
             )
-        if force.ndim < 3 or force.shape[-1] != 3:
+        if force_matrix.ndim < 3 or force_matrix.shape[-1] != 3:
             raise RuntimeError(
                 "tool-table ContactSensor force_matrix_w has invalid shape "
-                f"{tuple(force.shape)}; expected (..., 3)."
+                f"{tuple(force_matrix.shape)}; expected (..., 3)."
             )
-        if force.shape[0] != self.num_envs or any(
-            dim == 0 for dim in force.shape[1:-1]
+        if force_matrix.shape[0] != self.num_envs or any(
+            dim == 0 for dim in force_matrix.shape[1:-1]
         ):
             raise RuntimeError(
                 "tool-table ContactSensor force_matrix_w is not populated for all envs: "
-                f"shape={tuple(force.shape)}, num_envs={self.num_envs}."
+                f"shape={tuple(force_matrix.shape)}, num_envs={self.num_envs}."
             )
-        vec = force.sum(dim=tuple(range(1, force.ndim - 1)))
+        vec = force_matrix.sum(dim=tuple(range(1, force_matrix.ndim - 1)))
         if vec.shape != (self.num_envs, 3):
             raise RuntimeError(
                 "tool-table ContactSensor force reduction produced invalid shape "
@@ -339,19 +410,86 @@ class SimToolRealTacMapScrapePoseEnv(SimToolRealTacMapEnv):
             self, "_table_quat_wxyz_per_env", self.table.data.root_quat_w
         )
         _, table_normal = table_top_state(self.table.data.root_pos_w, table_quat)
-        raw_force = torch.abs((vec * table_normal).sum(dim=-1))
+        instantaneous_force = torch.abs((vec * table_normal).sum(dim=-1))
+        interval_force = instantaneous_force
+        use_interval_average = bool(
+            self.cfg.contact_force_use_control_interval_average
+        )
+        if use_interval_average:
+            history = getattr(data, "force_matrix_w_history", None)
+            if history is None:
+                raise RuntimeError(
+                    "Control-interval force averaging is enabled, but the pair-filtered "
+                    "force_matrix_w_history is unavailable."
+                )
+            required = int(self.cfg.decimation)
+            if (
+                history.ndim < 4
+                or history.shape[-1] != 3
+                or history.shape[0] != self.num_envs
+                or history.shape[1] < required
+                or any(dim == 0 for dim in history.shape[2:-1])
+            ):
+                raise RuntimeError(
+                    "tool-table ContactSensor force_matrix_w_history has invalid shape "
+                    f"{tuple(history.shape)}; expected "
+                    f"({self.num_envs}, >= {required}, ..., 3)."
+                )
+            if not torch.isfinite(history).all():
+                raise RuntimeError(
+                    "tool-table ContactSensor force history contains NaN or Inf."
+                )
+            interval_force = torch.abs(
+                interval_normal_force(history[:, :required], table_normal)
+            )
+            if interval_force.shape != (self.num_envs,):
+                raise RuntimeError(
+                    "Control-interval normal force has invalid shape "
+                    f"{tuple(interval_force.shape)}; expected ({self.num_envs},)."
+                )
+
+        contact_age, reward_ramp, in_contact = contact_force_onset_gate(
+            interval_force,
+            self._contact_force_age_steps,
+            contact_threshold_n=float(self.cfg.contact_force_onset_threshold_n),
+            grace_steps=int(self.cfg.contact_force_onset_grace_steps),
+            ramp_steps=int(self.cfg.contact_force_reward_ramp_steps),
+        )
         alpha = float(self.cfg.contact_force_filter_alpha)
-        filtered_force = torch.lerp(
-            self._scrape_table_normal_force, raw_force, alpha
+        filtered_candidate = torch.lerp(
+            self._scrape_table_normal_force, interval_force, alpha
         )
-        filtered_force = torch.where(
-            self._contact_force_filter_initialized, filtered_force, raw_force
+        filtered_candidate = torch.where(
+            self._contact_force_filter_initialized,
+            filtered_candidate,
+            interval_force,
         )
+        if use_interval_average:
+            stable_contact = reward_ramp > 0.0
+            filtered_force = torch.where(
+                stable_contact, filtered_candidate, interval_force
+            )
+            filter_initialized = torch.where(
+                in_contact,
+                self._contact_force_filter_initialized | stable_contact,
+                torch.zeros_like(in_contact),
+            )
+        else:
+            filtered_force = torch.where(
+                self._contact_force_filter_initialized,
+                filtered_candidate,
+                interval_force,
+            )
+            filter_initialized = torch.ones_like(in_contact)
         if not torch.isfinite(filtered_force).all():
             raise RuntimeError("Filtered tool-table normal force contains NaN or Inf.")
-        self._scrape_table_normal_force_raw.copy_(raw_force)
+        self._scrape_table_normal_force_raw.copy_(instantaneous_force)
+        self._scrape_table_normal_force_interval.copy_(interval_force)
         self._scrape_table_normal_force.copy_(filtered_force)
-        self._contact_force_filter_initialized.fill_(True)
+        self._contact_force_filter_initialized.copy_(filter_initialized)
+        self._contact_force_age_steps.copy_(contact_age)
+        self._contact_force_reward_ramp.copy_(reward_ramp)
+        self._contact_force_in_contact.copy_(in_contact)
         return filtered_force
 
     def _edge_contact_sigma(self) -> float:
@@ -405,6 +543,7 @@ class SimToolRealTacMapScrapePoseEnv(SimToolRealTacMapEnv):
         edge_success_mean: float,
         force_success_mean: float,
         force_enabled: bool,
+        force_has_minimum_support: bool,
     ) -> None:
         self._edge_contact_curriculum_success_mean = float(edge_success_mean)
         self._contact_force_curriculum_success_mean = float(force_success_mean)
@@ -417,7 +556,7 @@ class SimToolRealTacMapScrapePoseEnv(SimToolRealTacMapEnv):
             target=float(self.cfg.edge_contact_reward_sigma_target_m),
             increment=float(self.cfg.edge_contact_reward_sigma_increment),
         )
-        if force_enabled:
+        if force_enabled and force_has_minimum_support:
             self._maybe_tighten_contact_curriculum(
                 current_attr="_current_contact_force_sigma",
                 last_update_attr="_last_contact_force_curriculum_update",
@@ -433,20 +572,45 @@ class SimToolRealTacMapScrapePoseEnv(SimToolRealTacMapEnv):
             self.cfg.contact_force_reward_relative_weight
         )
 
+    def _held_tool_force_mask(self) -> torch.Tensor:
+        max_distance = float(
+            self.cfg.contact_force_grasp_max_fingertip_distance_m
+        )
+        min_fingertips = int(self.cfg.contact_force_grasp_min_fingertips)
+        nearby_fingertips = (
+            self._curr_fingertip_distances < max_distance
+        ).sum(dim=-1)
+        held_tool = self._lifted_object & (nearby_fingertips >= min_fingertips)
+        if held_tool.shape != (self.num_envs,):
+            raise RuntimeError(
+                "Held-tool force mask has invalid shape "
+                f"{tuple(held_tool.shape)}; expected ({self.num_envs},)."
+            )
+        self._contact_force_held_tool.copy_(held_tool)
+        return held_tool
+
     def _compute_contact_force_reward(
         self, edge_score: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
         normal_force = self._sensor_normal_force()
+        held_tool = self._held_tool_force_mask()
         force_score, over_force = contact_force_reward(
             normal_force,
             self._scrape_target_contact_normal_force,
             self._contact_force_sigma(),
             float(self.cfg.max_contact_normal_force),
+            huber_delta_n=float(self.cfg.contact_force_huber_delta_n),
         )
         weight = self._force_reward_weight() if bool(
             getattr(self.cfg, "enable_tool_table_contact_force_reward", False)
         ) else 0.0
-        reward = force_score * edge_score.detach() * weight
+        reward = (
+            force_score
+            * edge_score.detach()
+            * self._contact_force_reward_ramp
+            * held_tool.float()
+            * weight
+        )
         return reward, normal_force, over_force, weight
 
     def _edge_contact_reward_weight(self) -> float:
@@ -502,15 +666,38 @@ class SimToolRealTacMapScrapePoseEnv(SimToolRealTacMapEnv):
             getattr(self.cfg, "enable_tool_table_contact_force_reward", False)
         )
         edge_success = edge_error <= edge_sigma
-        force_success = (force_error <= force_sigma) & (over_force <= 0.0)
+        force_eligible = (
+            (self._contact_force_reward_ramp >= 1.0)
+            & self._contact_force_in_contact
+            & self._contact_force_held_tool
+            & edge_success
+        )
+        force_success = (
+            force_eligible
+            & (force_error <= force_sigma)
+            & (over_force <= 0.0)
+        )
         if not force_enabled:
             force_success = torch.zeros_like(force_success)
+            force_eligible = torch.zeros_like(force_eligible)
         edge_success_mean = float(edge_success.float().mean().item())
-        force_success_mean = float(force_success.float().mean().item())
+        (
+            force_success_rate,
+            force_eligible_count,
+            force_has_minimum_support,
+        ) = conditional_success_rate(
+            force_success,
+            force_eligible,
+            min_eligible_count=int(
+                self.cfg.contact_force_curriculum_min_eligible_count
+            ),
+        )
+        force_success_mean = float(force_success_rate.item())
         self._update_contact_reward_curricula(
             edge_success_mean=edge_success_mean,
             force_success_mean=force_success_mean,
             force_enabled=force_enabled,
+            force_has_minimum_support=bool(force_has_minimum_support.item()),
         )
 
         self.extras["scrape_pose/edge_contact_rew_mean"] = edge_rew.mean()
@@ -523,12 +710,61 @@ class SimToolRealTacMapScrapePoseEnv(SimToolRealTacMapEnv):
         self.extras["scrape_pose/contact_force_raw_mean"] = (
             self._scrape_table_normal_force_raw.mean()
         )
+        self.extras["scrape_pose/contact_force_interval_mean"] = (
+            self._scrape_table_normal_force_interval.mean()
+        )
         self.extras["scrape_pose/contact_force_mean"] = normal_force.mean()
         self.extras["scrape_pose/contact_force_filter_abs_delta_mean"] = torch.abs(
-            self._scrape_table_normal_force_raw - normal_force
+            self._scrape_table_normal_force_interval - normal_force
         ).mean()
         self.extras["scrape_pose/contact_force_filter_alpha"] = float(
             self.cfg.contact_force_filter_alpha
+        )
+        self.extras["scrape_pose/contact_force_contact_ratio"] = (
+            self._contact_force_in_contact.float().mean()
+        )
+        self.extras["scrape_pose/contact_force_held_tool_ratio"] = (
+            self._contact_force_held_tool.float().mean()
+        )
+        self.extras["scrape_pose/contact_force_age_steps_mean"] = (
+            self._contact_force_age_steps.float().mean()
+        )
+        self.extras["scrape_pose/contact_force_reward_ramp_mean"] = (
+            self._contact_force_reward_ramp.mean()
+        )
+        self.extras["scrape_pose/contact_force_reward_eligible_ratio"] = (
+            force_eligible.float().mean()
+        )
+        self.extras["scrape_pose/contact_force_eligible_error_mean"] = (
+            (force_error * force_eligible.float()).sum()
+            / force_eligible_count.clamp_min(1)
+        )
+        self.extras["scrape_pose/contact_force_curriculum_eligible_count"] = (
+            force_eligible_count
+        )
+        self.extras["scrape_pose/contact_force_curriculum_has_minimum_support"] = (
+            force_has_minimum_support.float()
+        )
+        self.extras["scrape_pose/contact_force_curriculum_min_eligible_count"] = int(
+            self.cfg.contact_force_curriculum_min_eligible_count
+        )
+        self.extras["scrape_pose/contact_force_onset_grace_steps"] = int(
+            self.cfg.contact_force_onset_grace_steps
+        )
+        self.extras["scrape_pose/contact_force_reward_ramp_steps"] = int(
+            self.cfg.contact_force_reward_ramp_steps
+        )
+        self.extras["scrape_pose/contact_force_huber_delta_n"] = float(
+            self.cfg.contact_force_huber_delta_n
+        )
+        self.extras["scrape_pose/contact_force_grasp_min_fingertips"] = int(
+            self.cfg.contact_force_grasp_min_fingertips
+        )
+        self.extras["scrape_pose/contact_force_grasp_max_fingertip_distance_m"] = (
+            float(self.cfg.contact_force_grasp_max_fingertip_distance_m)
+        )
+        self.extras["scrape_pose/contact_force_interval_average_enabled"] = float(
+            bool(self.cfg.contact_force_use_control_interval_average)
         )
         self.extras["scrape_pose/contact_force_target_mean"] = target_force.mean()
         self.extras["scrape_pose/contact_force_target_min"] = target_force.min()

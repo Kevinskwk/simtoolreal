@@ -206,15 +206,93 @@ def contact_force_reward(
     target_force: float | torch.Tensor,
     force_sigma: float,
     max_force: float,
+    *,
+    huber_delta_n: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reward normal contact force near scalar or per-env targets."""
     target = torch.as_tensor(
         target_force, device=normal_force.device, dtype=normal_force.dtype
     )
     force_error = torch.abs(normal_force - target)
-    reward = torch.exp(-force_error / max(float(force_sigma), 1.0e-6))
+    robust_error = force_error
+    if huber_delta_n is not None:
+        delta = float(huber_delta_n)
+        if delta <= 0.0:
+            raise ValueError(f"huber_delta_n must be positive, got {delta}.")
+        robust_error = torch.where(
+            force_error <= delta,
+            0.5 * force_error.square() / delta,
+            force_error - 0.5 * delta,
+        )
+    reward = torch.exp(-robust_error / max(float(force_sigma), 1.0e-6))
     over_force = torch.clamp(normal_force - float(max_force), min=0.0)
     return reward, over_force
+
+
+def conditional_success_rate(
+    success: torch.Tensor,
+    eligible: torch.Tensor,
+    *,
+    min_eligible_count: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return success rate over eligible samples and whether support is sufficient."""
+    if success.shape != eligible.shape:
+        raise ValueError(
+            "success and eligible must have matching shapes, got "
+            f"{tuple(success.shape)} and {tuple(eligible.shape)}."
+        )
+    if success.dtype != torch.bool or eligible.dtype != torch.bool:
+        raise ValueError("success and eligible must be boolean tensors.")
+    if min_eligible_count <= 0:
+        raise ValueError("min_eligible_count must be positive.")
+    if bool((success & ~eligible).any()):
+        raise ValueError("success contains samples that are not eligible.")
+
+    eligible_count = eligible.sum()
+    success_count = success.sum()
+    success_rate = success_count.to(torch.float32) / eligible_count.clamp_min(1)
+    has_minimum_support = eligible_count >= int(min_eligible_count)
+    return success_rate, eligible_count, has_minimum_support
+
+
+def contact_force_onset_gate(
+    normal_force: torch.Tensor,
+    previous_contact_age: torch.Tensor,
+    *,
+    contact_threshold_n: float,
+    grace_steps: int,
+    ramp_steps: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Track consecutive contact and return age, reward ramp, and contact mask."""
+    if normal_force.shape != previous_contact_age.shape:
+        raise ValueError(
+            "normal_force and previous_contact_age must have matching shapes, got "
+            f"{tuple(normal_force.shape)} and {tuple(previous_contact_age.shape)}."
+        )
+    if previous_contact_age.dtype not in (torch.int32, torch.int64):
+        raise ValueError("previous_contact_age must use an integer dtype.")
+    if contact_threshold_n <= 0.0:
+        raise ValueError("contact_threshold_n must be positive.")
+    if grace_steps < 0:
+        raise ValueError("grace_steps must be non-negative.")
+    if ramp_steps <= 0:
+        raise ValueError("ramp_steps must be positive.")
+    if not torch.isfinite(normal_force).all():
+        raise ValueError("normal_force contains NaN or Inf.")
+
+    in_contact = normal_force >= float(contact_threshold_n)
+    contact_age = torch.where(
+        in_contact,
+        previous_contact_age + 1,
+        torch.zeros_like(previous_contact_age),
+    )
+    reward_ramp = torch.clamp(
+        (contact_age.to(normal_force.dtype) - float(grace_steps))
+        / float(ramp_steps),
+        min=0.0,
+        max=1.0,
+    )
+    return contact_age, reward_ramp, in_contact
 
 
 def edge_contact_reward(
@@ -241,5 +319,7 @@ __all__ = [
     "sample_edge_contact_goal_pose",
     "edge_contact_points_w",
     "contact_force_reward",
+    "conditional_success_rate",
+    "contact_force_onset_gate",
     "edge_contact_reward",
 ]
