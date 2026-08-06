@@ -24,10 +24,12 @@ class RlPlayer:
         checkpoint_path: Optional[str],
         device: str,
         num_envs: int = 1,
+        coefficient_id: float = 50.0,
     ) -> None:
         self.num_observations = num_observations
         self.num_actions = num_actions
         self.device = device
+        self.coefficient_id = float(coefficient_id)
 
         # Must create observation and action space
         self.observation_space = spaces.Box(
@@ -40,6 +42,24 @@ class RlPlayer:
         self.set_env_state = lambda *args, **kwargs: None
 
         self.cfg = read_cfg(config_path=config_path, device=self.device)
+        if checkpoint_path is not None:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            if 0 in checkpoint:
+                checkpoint = checkpoint[0]
+            model = checkpoint.get("model")
+            if not isinstance(model, dict):
+                raise RuntimeError(f"Checkpoint has no model state dict: {checkpoint_path}")
+            group_counts = {
+                int(value.shape[0])
+                for key, value in model.items()
+                if key.endswith(("extra_params", "sigma")) and value.ndim >= 2
+            }
+            if len(group_counts) != 1:
+                raise RuntimeError(
+                    "Could not infer one exploration-coefficient group count from "
+                    f"checkpoint tensors; found {sorted(group_counts)}"
+                )
+            self.cfg["train"]["params"]["config"]["expl_coef_num_ids"] = group_counts.pop()
         # self._run_sanity_checks()
         self.player = self.create_rl_player(checkpoint_path=checkpoint_path)
 
@@ -96,7 +116,7 @@ class RlPlayer:
 
         # SAPG HACK: Need to idx to end of observation
         obs = torch.cat(
-            [obs, 50.0 + torch.zeros((batch_size, 1), device=self.device)], dim=1
+            [obs, self.coefficient_id + torch.zeros((batch_size, 1), device=self.device)], dim=1
         )
 
         normalized_action = self.player.get_action(
