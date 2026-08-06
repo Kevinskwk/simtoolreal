@@ -15,6 +15,10 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
 
     def __init__(self, base_name, params):
         a2c_common.ContinuousA2CBase.__init__(self, base_name, params)
+        self.frozen_acquisition_cfg = self.config.get("frozen_acquisition", {})
+        self.frozen_acquisition_enabled = bool(
+            self.frozen_acquisition_cfg.get("enabled", False)
+        )
         
         if self.intr_reward_coef_embd is not None and not (self.expl_type.startswith('mixed_expl') and 'disjoint' in self.expl_type):
             input_shape = (self.obs_shape[0] + self.intr_reward_coef_embd.shape[1],)
@@ -36,6 +40,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         
         self.model = self.network.build(build_config)
         self.model.to(self.ppo_device)
+        self._init_frozen_acquisition_model(build_config)
         self.states = None
         self.init_rnn_from_model(self.model)
         self.last_lr = float(self.last_lr)
@@ -77,6 +82,111 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
 
         self.has_value_loss = self.use_experimental_cv or not self.has_central_value
         self.algo_observer.after_init(self)
+
+    def _init_frozen_acquisition_model(self, train_build_config):
+        self.frozen_acquisition_model = None
+        self.frozen_acquisition_rnn_states = None
+        if not self.frozen_acquisition_enabled:
+            return
+        cfg = self.frozen_acquisition_cfg
+        checkpoint_path = cfg.get("checkpoint", "")
+        observation_dim = int(cfg.get("observation_dim", 0))
+        phase_offset = int(cfg.get("phase_offset", -1))
+        if not checkpoint_path or observation_dim <= 0:
+            raise ValueError("Frozen acquisition requires checkpoint and positive observation_dim")
+        if phase_offset < observation_dim or phase_offset + 3 > self.obs_shape[0]:
+            raise ValueError(
+                f"Invalid frozen acquisition phase_offset={phase_offset}, "
+                f"observation_dim={observation_dim}, actor_obs_dim={self.obs_shape[0]}"
+            )
+        checkpoint = torch_ext.load_checkpoint(checkpoint_path)
+        if isinstance(checkpoint, dict) and self.global_rank in checkpoint:
+            weights = checkpoint[self.global_rank]
+        elif isinstance(checkpoint, dict) and 0 in checkpoint:
+            weights = checkpoint[0]
+        else:
+            weights = checkpoint
+        if not isinstance(weights, dict) or "model" not in weights:
+            raise RuntimeError(f"Frozen acquisition checkpoint has no model: {checkpoint_path}")
+        source_model = weights["model"]
+        group_counts = {
+            int(value.shape[0]) for key, value in source_model.items()
+            if key.endswith(("extra_params", "sigma")) and value.ndim >= 2
+        }
+        if len(group_counts) != 1:
+            raise RuntimeError(
+                "Frozen acquisition checkpoint must define one SAPG group count; "
+                f"found {sorted(group_counts)}"
+            )
+        group_count = group_counts.pop()
+        embed_dim = int(self.intr_reward_coef_embd.shape[1]) if self.intr_reward_coef_embd is not None else 0
+        frozen_build_config = dict(train_build_config)
+        frozen_build_config["input_shape"] = (observation_dim + embed_dim,)
+        if self.expl_type.startswith("mixed_expl"):
+            frozen_build_config["coef_ids"] = torch.linspace(
+                50.0, 0.0, group_count, device=self.ppo_device
+            )
+            frozen_build_config["coef_id_idx"] = observation_dim
+        self.frozen_acquisition_model = self.network.build(frozen_build_config)
+        self.frozen_acquisition_model.to(self.ppo_device)
+        self.frozen_acquisition_model.load_state_dict(source_model, strict=True)
+        self.frozen_acquisition_model.eval()
+        for parameter in self.frozen_acquisition_model.parameters():
+            parameter.requires_grad_(False)
+        print(f"=> loaded frozen acquisition model from '{checkpoint_path}'")
+
+    def init_tensors(self):
+        super().init_tensors()
+        if self.frozen_acquisition_enabled:
+            self.frozen_acquisition_rnn_states = [
+                state.to(self.ppo_device)
+                for state in self.frozen_acquisition_model.get_default_rnn_state()
+            ]
+
+    def _frozen_acquisition_obs(self, obs):
+        observation_dim = int(self.frozen_acquisition_cfg["observation_dim"])
+        base = obs["obs"][:, :observation_dim]
+        if self.intr_reward_coef_embd is None:
+            return base
+        embed_dim = int(self.intr_reward_coef_embd.shape[1])
+        coefficient = torch.zeros(base.shape[0], embed_dim, device=base.device, dtype=base.dtype)
+        coefficient[:, 0] = float(self.frozen_acquisition_cfg.get("coefficient_id", 50.0))
+        return torch.cat((base, coefficient), dim=-1)
+
+    def select_rollout_actions(self, obs, res_dict):
+        if not self.frozen_acquisition_enabled:
+            return res_dict, None
+        phase_offset = int(self.frozen_acquisition_cfg["phase_offset"])
+        phase = obs["obs"][:, phase_offset : phase_offset + 3]
+        if phase.shape[1] != 3 or not torch.isfinite(phase).all():
+            raise RuntimeError("Frozen acquisition phase observation is invalid")
+        if not torch.allclose(phase.sum(dim=-1), torch.ones_like(phase[:, 0]), atol=1e-4):
+            raise RuntimeError("Frozen acquisition phase observation is not one-hot")
+        learning_mask = phase[:, 0] < 0.5
+        frozen_input = {
+            "is_train": False,
+            "prev_actions": None,
+            "obs": self._frozen_acquisition_obs(obs),
+            "rnn_states": self.frozen_acquisition_rnn_states,
+        }
+        with torch.no_grad():
+            frozen = self.frozen_acquisition_model(frozen_input)
+        acquisition = ~learning_mask
+        res_dict["actions"] = torch.where(acquisition.unsqueeze(-1), frozen["mus"], res_dict["actions"])
+        if self.is_rnn:
+            for state in res_dict["rnn_states"]:
+                state[:, acquisition, :] = 0.0
+            self.frozen_acquisition_rnn_states = frozen["rnn_states"]
+            for state in self.frozen_acquisition_rnn_states:
+                state[:, learning_mask, :] = 0.0
+        return res_dict, learning_mask.float()
+
+    def reset_frozen_acquisition_states(self, done_indices):
+        if not self.frozen_acquisition_enabled or done_indices.numel() == 0:
+            return
+        done_indices = done_indices.reshape(-1)
+        for state in self.frozen_acquisition_rnn_states:
+            state[:, done_indices, :] = 0.0
 
     def update_epoch(self):
         self.epoch_num += 1
@@ -130,6 +240,14 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
 
             if self.zero_rnn_on_done:
                 batch_dict['dones'] = input_dict['dones']            
+
+        if self.frozen_acquisition_enabled and self.normalize_input and rnn_masks is not None:
+            eligible = rnn_masks.bool()
+            running = self.model.running_mean_std
+            if int(eligible.sum().item()) >= 2:
+                running.train()
+                running(obs_batch[eligible, : self.model.extra_info_start_idx])
+            running.eval()
 
         with torch.cuda.amp.autocast(enabled=self.mixed_precision):
             res_dict = self.model(batch_dict)

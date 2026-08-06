@@ -551,6 +551,10 @@ class A2CBase(BaseAlgorithm):
             'use_action_masks' : self.use_action_masks
         }
         self.experience_buffer = ExperienceBuffer(self.env_info, algo_info, self.ppo_device, self.intr_reward_coef_embd.shape[-1] if self.intr_reward_coef_embd is not None else None)
+        if getattr(self, "frozen_acquisition_enabled", False):
+            self.experience_buffer.tensor_dict["learning_masks"] = torch.zeros(
+                self.horizon_length, batch_size, dtype=torch.float32, device=self.ppo_device
+            )
 
         val_shape = (self.horizon_length, batch_size, self.value_size)
         current_rewards_shape = (batch_size, self.value_size)
@@ -920,10 +924,18 @@ class A2CBase(BaseAlgorithm):
             else:
                 res_dict = self.get_action_values(self.obs, self.rnn_states)
 
+            learning_mask = None
+            if getattr(self, "frozen_acquisition_enabled", False):
+                res_dict, learning_mask = self.select_rollout_actions(self.obs, res_dict)
+
             if self.is_rnn:
                 self.rnn_states = res_dict['rnn_states']
             self.experience_buffer.update_data('obses', n, self.obs['obs'])
-            self.experience_buffer.update_data('dones', n, self.dones.byte())
+            rollout_dones = self.dones.byte()
+            if learning_mask is not None:
+                rollout_dones = torch.maximum(rollout_dones, (learning_mask == 0).byte())
+                self.experience_buffer.update_data("learning_masks", n, learning_mask)
+            self.experience_buffer.update_data('dones', n, rollout_dones)
 
             for k in update_list:
                 self.experience_buffer.update_data(k, n, res_dict[k])
@@ -950,6 +962,9 @@ class A2CBase(BaseAlgorithm):
             self.current_lengths += 1
             all_done_indices = self.dones.nonzero(as_tuple=False)
             env_done_indices = all_done_indices[::self.num_agents]
+
+            if getattr(self, "frozen_acquisition_enabled", False):
+                self.reset_frozen_acquisition_states(all_done_indices)
 
             if self.is_rnn and len(all_done_indices) > 0:
                 if self.zero_rnn_on_done:
@@ -984,7 +999,14 @@ class A2CBase(BaseAlgorithm):
         else:
             mb_total_rewards = mb_rewards
         
-        mb_advs = self.discount_values(fdones, last_values, mb_fdones, mb_values, mb_total_rewards)
+        if getattr(self, "frozen_acquisition_enabled", False):
+            mb_learning_masks = self.experience_buffer.tensor_dict["learning_masks"]
+            mb_advs = self.discount_values_masks(
+                fdones, last_values, mb_fdones, mb_values, mb_total_rewards,
+                mb_learning_masks,
+            )
+        else:
+            mb_advs = self.discount_values(fdones, last_values, mb_fdones, mb_values, mb_total_rewards)
         mb_returns = mb_advs + mb_values
         batch_dict = self.experience_buffer.get_transformed_list(swap_and_flatten01, self.tensor_list)
 
@@ -1011,6 +1033,7 @@ class A2CBase(BaseAlgorithm):
             'last_rnn_states' : self.rnn_states,
             'mb_intr_rewards' : mb_intr_rewards if self.intr_reward_model is not None else None,
             'mb_extr_rewards' : mb_rewards,
+            'learning_masks' : self.experience_buffer.tensor_dict.get('learning_masks', None),
         }
         return batch_dict, extras
     
@@ -1133,6 +1156,8 @@ class DiscreteA2CBase(A2CBase):
         if self.use_action_masks:
             self.update_list += ['action_masks']
         self.tensor_list = self.update_list + ['obses', 'states', 'dones']
+        if getattr(self, "frozen_acquisition_enabled", False):
+            self.tensor_list.append("learning_masks")
 
     def train_epoch(self):
         super().train_epoch()
@@ -1148,6 +1173,9 @@ class DiscreteA2CBase(A2CBase):
         play_time_end = time.time()
         update_time_start = time.time()
         rnn_masks = batch_dict.get('rnn_masks', None)
+        learning_masks = batch_dict.get("learning_masks", None)
+        if learning_masks is not None:
+            rnn_masks = learning_masks if rnn_masks is None else rnn_masks * learning_masks
 
         self.curr_frames = batch_dict.pop('played_frames')
         self.prepare_dataset(batch_dict)
@@ -1190,6 +1218,9 @@ class DiscreteA2CBase(A2CBase):
 
     def prepare_dataset(self, batch_dict):
         rnn_masks = batch_dict.get('rnn_masks', None)
+        learning_masks = batch_dict.get("learning_masks", None)
+        if learning_masks is not None:
+            rnn_masks = learning_masks if rnn_masks is None else rnn_masks * learning_masks
         returns = batch_dict['returns']
         values = batch_dict['values']
         actions = batch_dict['actions']
@@ -1208,7 +1239,12 @@ class DiscreteA2CBase(A2CBase):
         
         advantages = torch.sum(advantages, axis=1)
 
-        if self.normalize_advantage:
+        insufficient_mask_support = (
+            rnn_masks is not None and int(rnn_masks.sum().item()) < 2
+        )
+        if insufficient_mask_support:
+            advantages.zero_()
+        if self.normalize_advantage and not insufficient_mask_support:
             if self.is_rnn:
                 if self.normalize_rms_advantage:
                     advantages = self.advantage_mean_std(advantages, mask=rnn_masks)
@@ -1406,6 +1442,8 @@ class ContinuousA2CBase(A2CBase):
         A2CBase.init_tensors(self)
         self.update_list = ['actions', 'neglogpacs', 'values', 'mus', 'sigmas']
         self.tensor_list = self.update_list + ['obses', 'states', 'dones']
+        if getattr(self, "frozen_acquisition_enabled", False):
+            self.tensor_list.append("learning_masks")
 
     def train_epoch(self):
         super().train_epoch()
@@ -1425,6 +1463,9 @@ class ContinuousA2CBase(A2CBase):
         play_time_end = time.time()
         update_time_start = time.time()
         rnn_masks = batch_dict.get('rnn_masks', None)
+        learning_masks = batch_dict.get("learning_masks", None)
+        if learning_masks is not None:
+            rnn_masks = learning_masks if rnn_masks is None else rnn_masks * learning_masks
 
         self.set_train()
         self.curr_frames = batch_dict.pop('played_frames')
@@ -1517,19 +1558,37 @@ class ContinuousA2CBase(A2CBase):
         sigmas = batch_dict['sigmas']
         rnn_states = batch_dict.get('rnn_states', None)
         rnn_masks = batch_dict.get('rnn_masks', None)
+        learning_masks = batch_dict.get("learning_masks", None)
+        if learning_masks is not None:
+            rnn_masks = learning_masks if rnn_masks is None else rnn_masks * learning_masks
 
         advantages = returns - values
 
         if self.normalize_value:
-            if train_value_mean_std:
-                self.value_mean_std.train()
-            values = self.value_mean_std(values)
-            returns = self.value_mean_std(returns)
-            self.value_mean_std.eval()
+            if learning_masks is None:
+                if train_value_mean_std:
+                    self.value_mean_std.train()
+                values = self.value_mean_std(values)
+                returns = self.value_mean_std(returns)
+                self.value_mean_std.eval()
+            else:
+                eligible = learning_masks.bool()
+                if train_value_mean_std and int(eligible.sum().item()) >= 2:
+                    self.value_mean_std.train()
+                    self.value_mean_std(values[eligible])
+                    self.value_mean_std(returns[eligible])
+                self.value_mean_std.eval()
+                values = self.value_mean_std(values)
+                returns = self.value_mean_std(returns)
 
         advantages = torch.sum(advantages, axis=1)
 
-        if self.normalize_advantage:
+        insufficient_mask_support = (
+            rnn_masks is not None and int(rnn_masks.sum().item()) < 2
+        )
+        if insufficient_mask_support:
+            advantages.zero_()
+        if self.normalize_advantage and not insufficient_mask_support:
             if self.is_rnn:
                 if self.normalize_rms_advantage:
                     advantages = self.advantage_mean_std(advantages, mask=rnn_masks)

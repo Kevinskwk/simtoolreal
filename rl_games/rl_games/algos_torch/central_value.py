@@ -254,6 +254,14 @@ class CentralValueTrain(nn.Module):
         if self.is_rnn:
             batch_dict['rnn_states'] = batch['rnn_states']
 
+        if rnn_masks_batch is not None and hasattr(self.model, "running_mean_std"):
+            eligible = rnn_masks_batch.bool()
+            running = self.model.running_mean_std
+            if int(eligible.sum().item()) >= 2:
+                running.train()
+                cutoff = getattr(self.model, "extra_info_start_idx", None)
+                running(obs_batch[eligible, :cutoff] if cutoff is not None else obs_batch[eligible])
+            running.eval()
         res_dict = self.model(batch_dict)
         values = res_dict['values']
         loss = common_losses.critic_loss(self.model, value_preds_batch, values, self.e_clip, returns_batch, self.clip_value)

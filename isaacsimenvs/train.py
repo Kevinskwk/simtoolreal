@@ -63,6 +63,11 @@ def main() -> None:
         help="resume restores optimizer/rollout/env state; weights starts fresh from model weights; "
         "expand_obs loads old smaller-observation weights into a larger observation model.",
     )
+    parser.add_argument(
+        "--acquisition_checkpoint",
+        default=None,
+        help="Frozen vanilla checkpoint used only during stable-scrape grasp acquisition.",
+    )
     parser.add_argument("--rl_device", default="cuda:0")
     parser.add_argument("--sim_device", default="cuda:0")
     # --- Video ---
@@ -151,7 +156,6 @@ def main() -> None:
         )
 
         if args_cli.capture_video:
-            from pathlib import Path
 
             video_folder = str(Path(hydra_run_dir) / "videos")
             env = gym.wrappers.RecordVideo(
@@ -163,7 +167,6 @@ def main() -> None:
             )
 
         if args_cli.capture_viewer:
-            from pathlib import Path
 
             from isaacsimenvs.tasks.simtoolreal.pose_viewer import SimToolRealPoseViewerWrapper
 
@@ -218,6 +221,29 @@ def main() -> None:
         agent_cfg["params"]["config"]["train_dir"] = hydra_run_dir
         agent_cfg["params"]["config"]["device"] = args_cli.rl_device
         agent_cfg["params"]["config"]["device_name"] = args_cli.rl_device
+
+        if args_cli.acquisition_checkpoint is not None:
+            inner = env.unwrapped
+            acquisition_obs_dim = getattr(
+                inner.cfg, "frozen_acquisition_obs_dim", None
+            )
+            if acquisition_obs_dim is None:
+                raise ValueError(
+                    "--acquisition_checkpoint is only valid for a task that defines "
+                    "frozen_acquisition_obs_dim"
+                )
+            actor_obs_dim = int(inner.cfg.observation_space)
+            if tuple(inner.cfg.obs.obs_list[-2:]) != (
+                "stable_target_tangent_velocity", "stable_phase"
+            ):
+                raise RuntimeError("Stable phase fields must be the actor observation suffix")
+            agent_cfg["params"]["config"]["frozen_acquisition"] = {
+                "enabled": True,
+                "checkpoint": str(Path(args_cli.acquisition_checkpoint).expanduser().resolve()),
+                "observation_dim": int(acquisition_obs_dim),
+                "phase_offset": actor_obs_dim - 3,
+                "coefficient_id": 50.0,
+            }
 
         runner.load(agent_cfg)
         runner.reset()
