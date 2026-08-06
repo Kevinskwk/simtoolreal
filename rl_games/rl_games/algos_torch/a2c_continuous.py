@@ -213,6 +213,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
                 "on_policy_contrib" : contrib_on.item(),
                 "off_policy_grads" : grads_off.detach().cpu(),
                 "on_policy_grads" : grads_on.detach().cpu(),
+                "amp_step_skipped" : self.last_amp_step_skipped,
             }
         else:
             extras = {
@@ -220,6 +221,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
                 "off_policy_contrib" : 0,
                 "on_policy_grads" : all_grads.detach().cpu(),
                 "off_policy_grads" : torch.zeros_like(all_grads).cpu(),
+                "amp_step_skipped" : self.last_amp_step_skipped,
             }     
         if self.expl_type.startswith('mixed_expl'):
             bl_ids = self.intr_reward_coef_embd[::self.intr_coef_block_size, 0].reshape(-1,1)
@@ -270,4 +272,3 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             dist.all_reduce(all_grads, op=dist.ReduceOp.SUM)
         
         return all_grads
-

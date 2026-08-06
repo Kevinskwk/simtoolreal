@@ -90,6 +90,7 @@ params:
     grad_norm: 1.0
     entropy_coef: 0.0
     truncate_grads: True
+    max_consecutive_amp_overflows: 16
     e_clip: 0.1
     minibatch_size: 98304
     mini_epochs: 2

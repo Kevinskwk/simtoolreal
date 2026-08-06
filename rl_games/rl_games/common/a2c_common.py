@@ -358,6 +358,7 @@ class A2CBase(BaseAlgorithm):
         
 
     def trancate_gradients_and_step(self):
+        self.last_amp_step_skipped = False
         if self.multi_gpu:
             # batch allreduce ops: see https://github.com/entity-neural-network/incubator/pull/220
             all_grads_list = []
@@ -376,20 +377,54 @@ class A2CBase(BaseAlgorithm):
                     offset += param.numel()
         else:
             all_grads = None
-        
-        if self.truncate_grads:
-            self.scaler.unscale_(self.optimizer)
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm)
 
-        # Capture gradients after AMP unscaling and clipping. The pre-unscale
-        # tensors can overflow even when GradScaler correctly skips the update.
-        all_grads = torch.cat(
-            [
-                param.grad.detach().reshape(-1)
-                for param in self.model.parameters()
-                if param.grad is not None
-            ]
-        )
+        # Unscale before checking or recording gradients. This is a no-op when
+        # GradScaler is disabled, and it also records whether AMP overflowed.
+        self.scaler.unscale_(self.optimizer)
+        grad_tensors = [
+            param.grad.detach()
+            for param in self.model.parameters()
+            if param.grad is not None
+        ]
+        if not grad_tensors:
+            raise RuntimeError("Optimizer step has no gradients.")
+
+        grads_are_finite = all(bool(torch.isfinite(grad).all()) for grad in grad_tensors)
+        if not grads_are_finite:
+            if not self.scaler.is_enabled():
+                raise RuntimeError("Optimizer gradients contain NaN or Inf in FP32 training.")
+
+            # GradScaler records the overflow during unscale_ and will skip this
+            # optimizer step. Do not run clip_grad_norm_ on Inf gradients: its
+            # zero clipping coefficient turns Inf entries into NaNs.
+            self.last_amp_step_skipped = True
+            self.consecutive_amp_overflows = (
+                getattr(self, "consecutive_amp_overflows", 0) + 1
+            )
+            max_overflows = int(self.config.get("max_consecutive_amp_overflows", 16))
+            if self.consecutive_amp_overflows > max_overflows:
+                raise RuntimeError(
+                    "AMP gradients overflowed for "
+                    f"{self.consecutive_amp_overflows} consecutive minibatches; "
+                    f"limit is {max_overflows}."
+                )
+            print(
+                "[WARNING] AMP gradient overflow: skipping optimizer step "
+                f"({self.consecutive_amp_overflows}/{max_overflows}); "
+                f"scale={self.scaler.get_scale():.1f}"
+            )
+            all_grads = torch.cat(
+                [torch.zeros_like(grad).reshape(-1) for grad in grad_tensors]
+            )
+        else:
+            self.consecutive_amp_overflows = 0
+            if self.truncate_grads:
+                nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.grad_norm, error_if_nonfinite=True
+                )
+            all_grads = torch.cat([grad.reshape(-1) for grad in grad_tensors])
+            if not bool(torch.isfinite(all_grads).all()):
+                raise RuntimeError("Optimizer gradients became NaN or Inf after clipping.")
 
         self.scaler.step(self.optimizer)
         self.scaler.update()
@@ -1413,6 +1448,7 @@ class ContinuousA2CBase(A2CBase):
             'off_policy_contrib' : [],
             'on_policy_grads' : [],
             'off_policy_grads' : [],
+            'amp_step_skipped' : [],
             'entropies' : [],
             'mb_intr_rewards' : ps_extras['mb_intr_rewards'],
             'mb_extr_rewards' :ps_extras['rewards']
@@ -1426,6 +1462,7 @@ class ContinuousA2CBase(A2CBase):
                 extra_infos['on_policy_grads'].append(extras['on_policy_grads'])
                 extra_infos['off_policy_contrib'].append(extras['off_policy_contrib'])
                 extra_infos['off_policy_grads'].append(extras['off_policy_grads'])
+                extra_infos['amp_step_skipped'].append(extras['amp_step_skipped'])
                 if 'entropies' in extras:
                     extra_infos['entropies'].append(extras['entropies'])
                 a_losses.append(a_loss)
@@ -1588,6 +1625,22 @@ class ContinuousA2CBase(A2CBase):
                 if len(b_losses) > 0:
                     self.writer.add_scalar('losses/bounds_loss', torch_ext.mean_list(b_losses).item(), frame)
 
+                self.writer.add_scalar(
+                    'auxiliary_stats/amp_skipped_update_fraction',
+                    np.mean(extra_infos['amp_step_skipped']),
+                    frame,
+                )
+                self.writer.add_scalar(
+                    'auxiliary_stats/amp_loss_scale',
+                    self.scaler.get_scale(),
+                    frame,
+                )
+                self.writer.add_scalar(
+                    'auxiliary_stats/consecutive_amp_overflows',
+                    getattr(self, "consecutive_amp_overflows", 0),
+                    frame,
+                )
+
                 if self.has_soft_aug:
                     self.writer.add_scalar('losses/aug_loss', np.mean(aug_losses), frame)
 
@@ -1654,7 +1707,6 @@ class ContinuousA2CBase(A2CBase):
                         relative_grad_norm,
                         frame,
                     )
-                    
                     if extra_infos['mb_intr_rewards'] is not None:
                         if hasattr(self, 'intr_coef_block_size'):
                             for bl in range(self.num_actors // self.intr_coef_block_size):
