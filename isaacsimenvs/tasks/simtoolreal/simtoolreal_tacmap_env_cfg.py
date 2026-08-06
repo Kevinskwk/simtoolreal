@@ -237,6 +237,7 @@ class SimToolRealTacMapScrapePoseEnvCfg(SimToolRealTacMapContactEnvCfg):
     # force-tracking pass rate among eligible environments exceeds the
     # configured threshold with enough samples to make the estimate reliable.
     enable_tool_table_contact_force_reward: bool = True
+    enable_tool_table_contact_sensor: bool = False
     contact_force_reward_relative_weight: float = 0.5
     # If target_contact_normal_force is set, it pins a fixed target for backward
     # compatibility. Otherwise each env samples from target_contact_normal_force_range.
@@ -265,6 +266,66 @@ class SimToolRealTacMapScrapePoseEnvCfg(SimToolRealTacMapContactEnvCfg):
     contact_force_grasp_max_fingertip_distance_m: float = 0.12
     tool_table_contact_sensor_prim_path: str = "/World/envs/env_.*/Object/object_root"
     tool_table_contact_sensor_filter_paths: list[str] = ["/World/envs/env_.*/Table/box"]
+
+
+@configclass
+class SimToolRealStableScrapeEnvCfg(SimToolRealTacMapScrapePoseEnvCfg):
+    """Frozen-acquisition, moving-reference stable scraping task."""
+
+    use_tacmap: bool = False
+    enable_vbts: bool = False
+    include_tacmap_in_policy: bool = False
+    enable_tool_table_contact_force_reward: bool = False
+    enable_tool_table_contact_sensor: bool = True
+
+    # The vanilla observation tuple is an exact prefix for the frozen actor.
+    frozen_acquisition_obs_dim: int = 140
+    obs: ObsCfg = ObsCfg(
+        obs_list=_BASE_OBS.obs_list
+        + ("stable_target_tangent_velocity", "stable_phase"),
+        state_list=_BASE_OBS.state_list
+        + (
+            "scrape_tool_table_normal_force", "scrape_edge_contact_error",
+            "scrape_table_height", "scrape_table_normal", "stable_pose_error",
+            "stable_support_count", "stable_contact_persistence",
+            "stable_relative_linear_speed", "stable_relative_angular_speed",
+            "stable_over_force", "stable_target_tangent_velocity", "stable_phase",
+        ),
+        clamp_abs_observations=_BASE_OBS.clamp_abs_observations,
+    )
+
+    acquisition_hover_height_m: float = 0.12
+    acquisition_timeout_steps: int = 600
+    acquisition_min_fingertips: int = 2
+    acquisition_max_fingertip_distance_m: float = 0.12
+    acquisition_min_edge_clearance_m: float = 0.03
+    acquisition_max_table_force_n: float = 0.1
+    acquisition_position_drift_m: float = 0.005
+    acquisition_rotation_drift_deg: float = 2.0
+    acquisition_stability_steps: int = 15
+    approach_edge_tolerance_m: float = 0.01
+    approach_contact_steps: int = 15
+    grasp_loss_grace_steps: int = 5
+    scrape_path_half_length_m: float = 0.04
+    scrape_path_speed_mps: float = 0.02
+    edge_contact_xy_range_m: tuple[float, float] = (0.04, 0.04)
+
+    pose_reward_weight: float = 5.0
+    edge_contact_reward_max_weight: float = 5.0
+    contact_presence_reward_weight: float = 1.0
+    support_reward_weight: float = 1.0
+    slip_penalty_weight: float = 1.0
+    spin_penalty_weight: float = 0.1
+    action_rate_penalty_weight: float = 0.01
+    tool_acceleration_penalty_weight: float = 0.01
+    over_force_penalty_weight: float = 0.1
+    soft_contact_normal_force_limit: float = 12.0
+    hard_contact_normal_force_limit: float = 20.0
+    pose_tracking_sigma_start_m: float = 0.03
+    pose_tracking_sigma_target_m: float = 0.005
+    stable_curriculum_increment: float = 0.9
+    stable_curriculum_success_threshold: float = 0.8
+    stable_curriculum_min_eligible_count: int = 64
 
 
 @configclass

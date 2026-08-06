@@ -1824,7 +1824,7 @@ def setup_scene(env) -> None:
     ))
     activate_tool_table_contact_sensors = bool(
         getattr(env.cfg, "enable_tool_table_contact_force_reward", False)
-    )
+    ) or bool(getattr(env.cfg, "enable_tool_table_contact_sensor", False))
     env.table = RigidObject(
         build_rigid_object_cfg(
             "/World/envs/env_.*/Table",

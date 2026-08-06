@@ -1,0 +1,62 @@
+# Stable-contact scraping V1: vanilla frozen acquisition, no tactile actor input.
+use_tacmap: false
+enable_vbts: false
+include_tacmap_in_policy: false
+enable_tool_table_contact_force_reward: false
+enable_tool_table_contact_sensor: true
+
+table_pitch_roll_range_deg: 8.0
+edge_contact_xy_range_m: [0.04, 0.04]
+edge_contact_yaw_range_deg: 90.0
+edge_tilt_range_deg: [5.0, 45.0]
+edge_contact_reward_max_weight: 5.0
+edge_contact_reward_sigma_start_m: 0.03
+edge_contact_reward_sigma_target_m: 0.005
+
+contact_force_use_control_interval_average: true
+tool_table_contact_sensor_update_period: 0.0
+tool_table_contact_sensor_history_len: 2
+contact_force_filter_alpha: 0.2
+contact_force_onset_threshold_n: 0.1
+contact_force_onset_grace_steps: 3
+contact_force_reward_ramp_steps: 6
+soft_contact_normal_force_limit: 12.0
+hard_contact_normal_force_limit: 20.0
+
+acquisition_hover_height_m: 0.12
+acquisition_timeout_steps: 600
+acquisition_stability_steps: 15
+approach_edge_tolerance_m: 0.01
+approach_contact_steps: 15
+grasp_loss_grace_steps: 5
+scrape_path_half_length_m: 0.04
+scrape_path_speed_mps: 0.02
+
+episode_length_s: 20.0
+scene:
+  num_envs: 12288
+reset:
+  table_reset_z: 0.38
+  table_reset_z_range: 0.01
+  table_reset_pitch_roll_range_deg: 8.0
+domain_randomization:
+  use_obs_delay: false
+termination:
+  episode_length: 1200
+  max_consecutive_successes: 0
+
+obs:
+  state_list: [joint_pos, joint_vel, prev_action_targets, palm_pos, palm_rot, palm_vel,
+               object_rot, object_vel, fingertip_pos_rel_palm, keypoints_rel_palm,
+               keypoints_rel_goal, object_scales, closest_keypoint_max_dist,
+               closest_fingertip_dist, lifted_object, progress, successes, reward,
+               scrape_tool_table_normal_force, scrape_edge_contact_error,
+               scrape_table_height, scrape_table_normal, stable_pose_error,
+               stable_support_count, stable_contact_persistence,
+               stable_relative_linear_speed, stable_relative_angular_speed,
+               stable_over_force, stable_target_tangent_velocity, stable_phase]
+  obs_list: [joint_pos, joint_vel, prev_action_targets, palm_pos, palm_rot,
+             object_rot, fingertip_pos_rel_palm, keypoints_rel_palm,
+             keypoints_rel_goal, object_scales, stable_target_tangent_velocity,
+             stable_phase]
+  clamp_abs_observations: 10.0

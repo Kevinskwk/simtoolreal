@@ -89,9 +89,10 @@ class SimToolRealTacMapScrapePoseEnv(SimToolRealTacMapEnv):
         self._tool_table_contact_sensor = None
         self._tool_table_contact_sensor_failed = False
         self._tool_table_contact_sensor_error = ""
-        if not bool(
-            getattr(self.cfg, "enable_tool_table_contact_force_reward", False)
-        ):
+        sensor_enabled = bool(
+            getattr(self.cfg, "enable_tool_table_contact_sensor", False)
+        ) or bool(getattr(self.cfg, "enable_tool_table_contact_force_reward", False))
+        if not sensor_enabled:
             return
         try:
             from isaaclab.sensors import ContactSensor, ContactSensorCfg
@@ -120,8 +121,8 @@ class SimToolRealTacMapScrapePoseEnv(SimToolRealTacMapEnv):
             self._tool_table_contact_sensor_failed = True
             self._tool_table_contact_sensor_error = repr(exc)
             raise RuntimeError(
-                "enable_tool_table_contact_force_reward=true, but the "
-                f"tool-table ContactSensor could not be created: {exc!r}"
+                "tool-table contact sensing is enabled, but the "
+                f"ContactSensor could not be created: {exc!r}"
             ) from exc
 
     def _reset_idx(self, env_ids) -> None:
@@ -365,14 +366,15 @@ class SimToolRealTacMapScrapePoseEnv(SimToolRealTacMapEnv):
         return terminated, truncated
 
     def _sensor_normal_force(self) -> torch.Tensor:
-        if not bool(
-            getattr(self.cfg, "enable_tool_table_contact_force_reward", False)
-        ):
+        sensor_enabled = bool(
+            getattr(self.cfg, "enable_tool_table_contact_sensor", False)
+        ) or bool(getattr(self.cfg, "enable_tool_table_contact_force_reward", False))
+        if not sensor_enabled:
             return torch.zeros(self.num_envs, device=self.device)
         sensor = getattr(self, "_tool_table_contact_sensor", None)
         if sensor is None:
             raise RuntimeError(
-                "enable_tool_table_contact_force_reward=true, but "
+                "tool-table contact sensing is enabled, but "
                 "_tool_table_contact_sensor is not available."
             )
         data = getattr(sensor, "data", None)

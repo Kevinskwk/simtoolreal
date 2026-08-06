@@ -63,6 +63,14 @@ OBS_FIELD_SIZES: dict[str, int] = {
     "fixed_normal_offset": 1,
     "fixed_normal_velocity": 1,
     "fixed_prev_action": 1,
+    "stable_target_tangent_velocity": 3,
+    "stable_phase": 3,
+    "stable_pose_error": 1,
+    "stable_support_count": 1,
+    "stable_contact_persistence": 1,
+    "stable_relative_linear_speed": 1,
+    "stable_relative_angular_speed": 1,
+    "stable_over_force": 1,
 }
 
 SCRAPE_CONTACT_FIELDS: set[str] = {
@@ -81,6 +89,13 @@ FIXED_FORCE_FIELDS: set[str] = {
     "fixed_normal_offset",
     "fixed_normal_velocity",
     "fixed_prev_action",
+}
+
+STABLE_SCRAPE_FIELDS: set[str] = {
+    "stable_target_tangent_velocity", "stable_phase", "stable_pose_error",
+    "stable_support_count", "stable_contact_persistence",
+    "stable_relative_linear_speed", "stable_relative_angular_speed",
+    "stable_over_force",
 }
 
 
@@ -169,6 +184,29 @@ def _fixed_force_obs(env) -> dict[str, torch.Tensor]:
         "fixed_normal_velocity": (velocity / max_velocity).unsqueeze(-1),
         "fixed_prev_action": previous_action.unsqueeze(-1),
     }
+
+
+def _stable_scrape_obs(env) -> dict[str, torch.Tensor]:
+    from .stable_scrape_utils import phase_one_hot
+
+    required = {
+        "stable_target_tangent_velocity": "_stable_target_velocity_w",
+        "stable_pose_error": "_keypoints_max_dist",
+        "stable_support_count": "_stable_support_count",
+        "stable_contact_persistence": "_contact_force_reward_ramp",
+        "stable_relative_linear_speed": "_stable_relative_linear_speed",
+        "stable_relative_angular_speed": "_stable_relative_angular_speed",
+        "stable_over_force": "_stable_over_force",
+    }
+    out = {"stable_phase": phase_one_hot(env._stable_phase)}
+    for field, attr in required.items():
+        value = getattr(env, attr, None)
+        if value is None or not isinstance(value, torch.Tensor) or value.shape[0] != env.num_envs:
+            raise RuntimeError(f"Stable scrape observation {field} requires env.{attr}")
+        if not torch.isfinite(value).all():
+            raise RuntimeError(f"env.{attr} contains NaN or Inf")
+        out[field] = value if value.ndim == 2 else value.unsqueeze(-1)
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -437,6 +475,8 @@ def build_observations(env) -> dict[str, torch.Tensor]:
         obs_clean.update(_scrape_contact_obs(env))
     if requested_fields & FIXED_FORCE_FIELDS:
         obs_clean.update(_fixed_force_obs(env))
+    if requested_fields & STABLE_SCRAPE_FIELDS:
+        obs_clean.update(_stable_scrape_obs(env))
 
     obs_noisy = dict(obs_clean)
     obs_noisy["object_rot"] = noisy_obj_rot_xyzw
