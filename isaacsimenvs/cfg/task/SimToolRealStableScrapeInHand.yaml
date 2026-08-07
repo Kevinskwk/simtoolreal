@@ -1,0 +1,76 @@
+# Post-grasp stabilization gate: one verified compliant spatula, no tactile actor.
+use_tacmap: false
+enable_vbts: false
+include_tacmap_in_policy: false
+enable_tool_table_contact_force_reward: false
+enable_tool_table_contact_sensor: true
+
+assets:
+  handle_head_types: [spatula]
+  num_assets_per_type: 1
+  shuffle_assets: false
+  object_pool_limit: 1
+
+grasp_bank_min_entries: 64
+grasp_bank_joint_limit_tolerance_rad: 0.0005
+inhand_clearance_stages_m: [[0.05, 0.05], [0.045, 0.055], [0.04, 0.06], [0.04, 0.06]]
+inhand_table_angle_stages_deg: [0.0, 2.0, 5.0, 8.0]
+inhand_curriculum_success_threshold: 0.8
+inhand_curriculum_min_eligible_count: 64
+inhand_reset_penetration_tolerance_m: 0.0001
+
+edge_contact_reward_max_weight: 5.0
+edge_contact_reward_sigma_start_m: 0.03
+edge_contact_reward_sigma_target_m: 0.005
+
+contact_force_use_control_interval_average: true
+tool_table_contact_sensor_update_period: 0.0
+tool_table_contact_sensor_history_len: 2
+contact_force_filter_alpha: 0.2
+contact_force_onset_threshold_n: 0.1
+contact_force_onset_grace_steps: 3
+contact_force_reward_ramp_steps: 6
+soft_contact_normal_force_limit: 12.0
+hard_contact_normal_force_limit: 20.0
+
+approach_edge_tolerance_m: 0.01
+approach_contact_steps: 15
+grasp_loss_grace_steps: 15
+scrape_path_half_length_m: 0.04
+scrape_path_speed_mps: 0.02
+
+episode_length_s: 20.0
+scene:
+  num_envs: 12288
+reset:
+  table_reset_z: 0.38
+  table_reset_z_range: 0.0
+  table_reset_pitch_roll_range_deg: 0.0
+domain_randomization:
+  use_obs_delay: false
+  use_action_delay: false
+  use_object_state_delay_noise: false
+  joint_velocity_obs_noise_std: 0.0
+  force_scale: 0.0
+  torque_scale: 0.0
+  force_prob_range: [1.0e-12, 1.0e-12]
+  torque_prob_range: [1.0e-12, 1.0e-12]
+termination:
+  episode_length: 1200
+  max_consecutive_successes: 0
+
+obs:
+  state_list: [joint_pos, joint_vel, prev_action_targets, palm_pos, palm_rot, palm_vel,
+               object_rot, object_vel, fingertip_pos_rel_palm, keypoints_rel_palm,
+               keypoints_rel_goal, object_scales, closest_keypoint_max_dist,
+               closest_fingertip_dist, lifted_object, progress, successes, reward,
+               scrape_tool_table_normal_force, scrape_edge_contact_error,
+               scrape_table_height, scrape_table_normal, stable_pose_error,
+               stable_support_count, stable_contact_persistence,
+               stable_relative_linear_speed, stable_relative_angular_speed,
+               stable_over_force, stable_target_tangent_velocity, stable_phase]
+  obs_list: [joint_pos, joint_vel, prev_action_targets, palm_pos, palm_rot,
+             object_rot, fingertip_pos_rel_palm, keypoints_rel_palm,
+             keypoints_rel_goal, object_scales, stable_target_tangent_velocity,
+             stable_phase]
+  clamp_abs_observations: 10.0

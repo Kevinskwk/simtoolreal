@@ -411,6 +411,15 @@ class SimToolRealStableScrapeEnv(SimToolRealTacMapScrapePoseEnv):
                 self._stable_target_velocity_w, dim=-1
             ).mean(),
         })
+        if bool(getattr(self, "_frozen_acquisition_active", False)):
+            self.extras.update({
+                "phase/frozen_action_ratio": (
+                    self._stable_phase == ACQUISITION_PHASE
+                ).float().mean(),
+                "phase/frozen_acquisition_coefficient_id": float(
+                    self._frozen_acquisition_coefficient_id
+                ),
+            })
         log_step_metrics(self)
         return reward
 

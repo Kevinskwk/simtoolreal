@@ -133,7 +133,11 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         self.frozen_acquisition_model.eval()
         for parameter in self.frozen_acquisition_model.parameters():
             parameter.requires_grad_(False)
-        print(f"=> loaded frozen acquisition model from '{checkpoint_path}'")
+        coefficient_id = float(cfg.get("coefficient_id", 0.0))
+        print(
+            f"=> loaded frozen acquisition model from '{checkpoint_path}' "
+            f"with SAPG coefficient_id={coefficient_id:g}"
+        )
 
     def init_tensors(self):
         super().init_tensors()
@@ -150,7 +154,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             return base
         embed_dim = int(self.intr_reward_coef_embd.shape[1])
         coefficient = torch.zeros(base.shape[0], embed_dim, device=base.device, dtype=base.dtype)
-        coefficient[:, 0] = float(self.frozen_acquisition_cfg.get("coefficient_id", 50.0))
+        coefficient[:, 0] = float(self.frozen_acquisition_cfg.get("coefficient_id", 0.0))
         return torch.cat((base, coefficient), dim=-1)
 
     def select_rollout_actions(self, obs, res_dict):

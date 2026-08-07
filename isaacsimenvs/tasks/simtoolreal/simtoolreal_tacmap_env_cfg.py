@@ -15,7 +15,13 @@ from isaaclab.utils import configclass
 
 from isaacsimenvs.sensors.tacmap import SharpaTacmapCfg
 
-from .simtoolreal_env_cfg import AssetsCfg, ObsCfg, ResetCfg, SimToolRealEnvCfg
+from .simtoolreal_env_cfg import (
+    AssetsCfg,
+    DomainRandomizationCfg,
+    ObsCfg,
+    ResetCfg,
+    SimToolRealEnvCfg,
+)
 
 
 _TACMAP_ROOT = Path(__file__).resolve().parents[3] / "assets" / "tacmap"
@@ -280,6 +286,7 @@ class SimToolRealStableScrapeEnvCfg(SimToolRealTacMapScrapePoseEnvCfg):
 
     # The vanilla observation tuple is an exact prefix for the frozen actor.
     frozen_acquisition_obs_dim: int = 140
+    frozen_acquisition_coefficient_id: float = 0.0
     obs: ObsCfg = ObsCfg(
         obs_list=_BASE_OBS.obs_list
         + ("stable_target_tangent_velocity", "stable_phase"),
@@ -327,6 +334,49 @@ class SimToolRealStableScrapeEnvCfg(SimToolRealTacMapScrapePoseEnvCfg):
     stable_curriculum_success_threshold: float = 0.8
     stable_curriculum_min_eligible_count: int = 64
 
+
+@configclass
+class SimToolRealInHandStableScrapeEnvCfg(SimToolRealStableScrapeEnvCfg):
+    """Post-grasp stabilization gate initialized from compliant snapshots."""
+
+    assets: AssetsCfg = AssetsCfg(
+        handle_head_types=("spatula",),
+        num_assets_per_type=1,
+        shuffle_assets=False,
+        object_pool_limit=1,
+    )
+    domain_randomization: DomainRandomizationCfg = DomainRandomizationCfg(
+        use_obs_delay=False,
+        use_action_delay=False,
+        use_object_state_delay_noise=False,
+        joint_velocity_obs_noise_std=0.0,
+        force_scale=0.0,
+        torque_scale=0.0,
+        force_prob_range=(1.0e-12, 1.0e-12),
+        torque_prob_range=(1.0e-12, 1.0e-12),
+    )
+    grasp_bank_path: str = str(
+        Path(__file__).resolve().parents[3]
+        / "assets"
+        / "grasp_banks"
+        / "spatula_canonical_v1.json"
+    )
+    grasp_bank_source_checkpoint_path: str = str(
+        Path(__file__).resolve().parents[3] / "pretrained_policy" / "model.pth"
+    )
+    grasp_bank_min_entries: int = 64
+    grasp_bank_joint_limit_tolerance_rad: float = 5.0e-4
+    inhand_clearance_stages_m: tuple[tuple[float, float], ...] = (
+        (0.05, 0.05),
+        (0.045, 0.055),
+        (0.04, 0.06),
+        (0.04, 0.06),
+    )
+    inhand_table_angle_stages_deg: tuple[float, ...] = (0.0, 2.0, 5.0, 8.0)
+    inhand_curriculum_success_threshold: float = 0.8
+    inhand_curriculum_min_eligible_count: int = 64
+    inhand_reset_penetration_tolerance_m: float = 1.0e-4
+    grasp_loss_grace_steps: int = 15
 
 @configclass
 class SimToolRealFixedGraspNormalForceEnvCfg(SimToolRealTacMapScrapePoseEnvCfg):

@@ -237,12 +237,17 @@ def main() -> None:
                 "stable_target_tangent_velocity", "stable_phase"
             ):
                 raise RuntimeError("Stable phase fields must be the actor observation suffix")
+            acquisition_coefficient = float(
+                getattr(inner.cfg, "frozen_acquisition_coefficient_id", 0.0)
+            )
+            inner._frozen_acquisition_active = True
+            inner._frozen_acquisition_coefficient_id = acquisition_coefficient
             agent_cfg["params"]["config"]["frozen_acquisition"] = {
                 "enabled": True,
                 "checkpoint": str(Path(args_cli.acquisition_checkpoint).expanduser().resolve()),
                 "observation_dim": int(acquisition_obs_dim),
                 "phase_offset": actor_obs_dim - 3,
-                "coefficient_id": 50.0,
+                "coefficient_id": acquisition_coefficient,
             }
 
         runner.load(agent_cfg)
