@@ -47,6 +47,11 @@ class SimToolRealStableScrapeEnv(SimToolRealTacMapScrapePoseEnv):
         self._stable_relative_pos = torch.zeros(n, 3, device=device)
         self._stable_relative_quat = torch.zeros(n, 4, device=device)
         self._stable_relative_quat[:, 0] = 1.0
+        self._stable_grasp_reference_pos = self._stable_relative_pos.clone()
+        self._stable_grasp_reference_quat = self._stable_relative_quat.clone()
+        self._stable_grasp_position_error = torch.zeros(n, device=device)
+        self._stable_grasp_rotation_error_deg = torch.zeros(n, device=device)
+        self._stable_grasp_retained = torch.ones(n, dtype=torch.bool, device=device)
         self._stable_prev_relative_pos = self._stable_relative_pos.clone()
         self._stable_prev_relative_quat = self._stable_relative_quat.clone()
         self._stable_relative_linear_speed = torch.zeros(n, device=device)
@@ -87,6 +92,10 @@ class SimToolRealStableScrapeEnv(SimToolRealTacMapScrapePoseEnv):
             raise ValueError("scrape path speed and half-length must be positive")
         if cfg.soft_contact_normal_force_limit >= cfg.hard_contact_normal_force_limit:
             raise ValueError("soft force limit must be below hard force limit")
+        if cfg.grasp_retention_position_tolerance_m <= 0.0:
+            raise ValueError("grasp retention position tolerance must be positive")
+        if not 0.0 < cfg.grasp_retention_rotation_tolerance_deg < 180.0:
+            raise ValueError("grasp retention rotation tolerance must be in (0, 180)")
 
     def _reset_idx(self, env_ids) -> None:
         if env_ids is None:
@@ -143,6 +152,11 @@ class SimToolRealStableScrapeEnv(SimToolRealTacMapScrapePoseEnv):
         relative_pos, relative_quat = self._palm_tool_relative()
         self._stable_relative_pos[env_ids] = relative_pos[env_ids]
         self._stable_relative_quat[env_ids] = relative_quat[env_ids]
+        self._stable_grasp_reference_pos[env_ids] = relative_pos[env_ids]
+        self._stable_grasp_reference_quat[env_ids] = relative_quat[env_ids]
+        self._stable_grasp_position_error[env_ids] = 0.0
+        self._stable_grasp_rotation_error_deg[env_ids] = 0.0
+        self._stable_grasp_retained[env_ids] = True
         self._stable_prev_relative_pos[env_ids] = relative_pos[env_ids]
         self._stable_prev_relative_quat[env_ids] = relative_quat[env_ids]
         self._stable_prev_tool_velocity[env_ids] = self.object.data.root_lin_vel_w[env_ids]
@@ -209,6 +223,22 @@ class SimToolRealStableScrapeEnv(SimToolRealTacMapScrapePoseEnv):
         self._stable_tool_acceleration.copy_(
             torch.linalg.vector_norm(velocity - self._stable_prev_tool_velocity, dim=-1) / dt
         )
+        self._stable_grasp_position_error.copy_(
+            torch.linalg.vector_norm(pos - self._stable_grasp_reference_pos, dim=-1)
+        )
+        self._stable_grasp_rotation_error_deg.copy_(
+            torch.rad2deg(quaternion_distance_rad(
+                quat, self._stable_grasp_reference_quat
+            ))
+        )
+        self._stable_grasp_retained.copy_(
+            (self._stable_grasp_position_error <= float(
+                self.cfg.grasp_retention_position_tolerance_m
+            ))
+            & (self._stable_grasp_rotation_error_deg <= float(
+                self.cfg.grasp_retention_rotation_tolerance_deg
+            ))
+        )
         self._stable_relative_pos.copy_(pos)
         self._stable_relative_quat.copy_(quat)
         self._stable_prev_relative_pos.copy_(pos)
@@ -265,6 +295,11 @@ class SimToolRealStableScrapeEnv(SimToolRealTacMapScrapePoseEnv):
         )
         if bool(handoff.any()):
             ids = handoff.nonzero(as_tuple=False).squeeze(-1)
+            self._stable_grasp_reference_pos[ids] = self._stable_relative_pos[ids]
+            self._stable_grasp_reference_quat[ids] = self._stable_relative_quat[ids]
+            self._stable_grasp_position_error[ids] = 0.0
+            self._stable_grasp_rotation_error_deg[ids] = 0.0
+            self._stable_grasp_retained[ids] = True
             self._stable_phase[ids] = CONTACT_APPROACH_PHASE
             self._stable_phase_steps[ids] = 0
             self._stable_handoff_total += int(ids.numel())
@@ -278,6 +313,7 @@ class SimToolRealStableScrapeEnv(SimToolRealTacMapScrapePoseEnv):
         approach = self._stable_phase == CONTACT_APPROACH_PHASE
         ready = (
             approach
+            & self._stable_grasp_retained
             & (self._stable_support_count >= 2)
             & (edge_error <= float(self.cfg.approach_edge_tolerance_m))
             & (self._contact_force_reward_ramp >= 1.0)
@@ -342,7 +378,9 @@ class SimToolRealStableScrapeEnv(SimToolRealTacMapScrapePoseEnv):
         self._update_approach(edge_error)
 
         post_grasp = self._stable_phase != ACQUISITION_PHASE
-        lost_support = post_grasp & (self._stable_support_count < 2)
+        lost_support = post_grasp & (
+            (~self._stable_grasp_retained) | (self._stable_support_count < 2)
+        )
         self._stable_grasp_loss_count.copy_(
             consecutive_counter(lost_support, self._stable_grasp_loss_count)
         )
@@ -359,7 +397,8 @@ class SimToolRealStableScrapeEnv(SimToolRealTacMapScrapePoseEnv):
 
         eligible = self._stable_phase == SCRAPE_PHASE
         success = (
-            eligible & contact_now & (self._stable_support_count >= 2)
+            eligible & contact_now & self._stable_grasp_retained
+            & (self._stable_support_count >= 2)
             & (self._keypoints_max_dist <= self._stable_pose_sigma)
             & (edge_error <= self._edge_contact_sigma())
         )
@@ -381,6 +420,7 @@ class SimToolRealStableScrapeEnv(SimToolRealTacMapScrapePoseEnv):
             edge_score=edge_score,
             persistent_contact=self._contact_force_reward_ramp >= 1.0,
             support_count=self._stable_support_count,
+            grasp_retained=self._stable_grasp_retained,
             relative_linear_speed=self._stable_relative_linear_speed,
             relative_angular_speed=self._stable_relative_angular_speed,
             action_delta_sq_mean=self._stable_action_delta_sq_mean,
@@ -409,6 +449,11 @@ class SimToolRealStableScrapeEnv(SimToolRealTacMapScrapePoseEnv):
             "phase/scrape_ratio": (self._stable_phase == SCRAPE_PHASE).float().mean(),
             "phase/handoff_total": self._stable_handoff_total,
             "stability/support_count_mean": self._stable_support_count.float().mean(),
+            "stability/grasp_retained_ratio": self._stable_grasp_retained.float().mean(),
+            "stability/grasp_position_error_mean": self._stable_grasp_position_error.mean(),
+            "stability/grasp_rotation_error_deg_mean": (
+                self._stable_grasp_rotation_error_deg.mean()
+            ),
             "stability/relative_linear_speed_mean": self._stable_relative_linear_speed.mean(),
             "stability/relative_angular_speed_mean": self._stable_relative_angular_speed.mean(),
             "stability/contact_persistence_mean": self._contact_force_reward_ramp.mean(),

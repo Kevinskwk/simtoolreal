@@ -40,6 +40,8 @@ hard_contact_normal_force_limit: 20.0
 approach_edge_tolerance_m: 0.01
 approach_contact_steps: 15
 grasp_loss_grace_steps: 15
+grasp_retention_position_tolerance_m: 0.015
+grasp_retention_rotation_tolerance_deg: 15.0
 scrape_path_half_length_m: 0.04
 scrape_path_speed_mps: 0.02
 scrape_velocity_activation_pose_error_m: 0.02

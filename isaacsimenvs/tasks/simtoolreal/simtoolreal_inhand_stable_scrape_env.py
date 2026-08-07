@@ -394,6 +394,11 @@ class SimToolRealInHandStableScrapeEnv(SimToolRealStableScrapeEnv):
         relative_quat = self._inhand_bank_relative_quat[bank_ids]
         self._stable_relative_pos[env_ids] = relative_pos
         self._stable_relative_quat[env_ids] = relative_quat
+        self._stable_grasp_reference_pos[env_ids] = relative_pos
+        self._stable_grasp_reference_quat[env_ids] = relative_quat
+        self._stable_grasp_position_error[env_ids] = 0.0
+        self._stable_grasp_rotation_error_deg[env_ids] = 0.0
+        self._stable_grasp_retained[env_ids] = True
         self._stable_prev_relative_pos[env_ids] = relative_pos
         self._stable_prev_relative_quat[env_ids] = relative_quat
         self._stable_prev_tool_velocity[env_ids] = object_velocity[:, :3]

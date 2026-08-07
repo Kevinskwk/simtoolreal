@@ -313,6 +313,8 @@ class SimToolRealStableScrapeEnvCfg(SimToolRealTacMapScrapePoseEnvCfg):
     approach_edge_tolerance_m: float = 0.01
     approach_contact_steps: int = 15
     grasp_loss_grace_steps: int = 5
+    grasp_retention_position_tolerance_m: float = 0.015
+    grasp_retention_rotation_tolerance_deg: float = 15.0
     scrape_path_half_length_m: float = 0.04
     scrape_path_speed_mps: float = 0.02
     scrape_velocity_activation_pose_error_m: float = 0.02

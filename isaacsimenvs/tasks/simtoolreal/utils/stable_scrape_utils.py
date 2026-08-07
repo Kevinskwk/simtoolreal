@@ -60,22 +60,35 @@ def consecutive_counter(condition: torch.Tensor, previous: torch.Tensor) -> torc
 def stable_scrape_reward_terms(
     *, phase: torch.Tensor, pose_error_m: torch.Tensor, pose_sigma_m: float,
     edge_score: torch.Tensor, persistent_contact: torch.Tensor,
-    support_count: torch.Tensor, relative_linear_speed: torch.Tensor,
+    support_count: torch.Tensor, grasp_retained: torch.Tensor,
+    relative_linear_speed: torch.Tensor,
     relative_angular_speed: torch.Tensor, action_delta_sq_mean: torch.Tensor,
     tool_acceleration: torch.Tensor, normal_force_n: torch.Tensor,
     soft_force_limit_n: float,
 ) -> dict[str, torch.Tensor]:
     """Compute normalized post-grasp rewards; force is safety-only."""
     active = (phase != ACQUISITION_PHASE).to(pose_error_m.dtype)
-    grasp_valid = (support_count >= 2).to(pose_error_m.dtype)
-    tracking = (
-        torch.exp(-pose_error_m / max(float(pose_sigma_m), 1.0e-6))
+    if grasp_retained.dtype != torch.bool or grasp_retained.shape != phase.shape:
+        raise ValueError("grasp_retained must be boolean and match phase")
+    grasp_valid = (grasp_retained & (support_count >= 2)).to(pose_error_m.dtype)
+    pose_score = torch.exp(
+        -pose_error_m / max(float(pose_sigma_m), 1.0e-6)
+    )
+    tracking = pose_score * active * grasp_valid
+    # Contact at an arbitrary table pose is not task success. Scaling these
+    # terms by pose accuracy removes the stationary tool-on-table optimum.
+    edge = edge_score * pose_score * active * grasp_valid
+    contact = (
+        persistent_contact.to(pose_error_m.dtype)
+        * pose_score
         * active
         * grasp_valid
     )
-    edge = edge_score * active * grasp_valid
-    contact = persistent_contact.to(pose_error_m.dtype) * active * grasp_valid
-    support = torch.clamp(support_count.to(pose_error_m.dtype) / 2.0, 0.0, 1.0) * active
+    support = (
+        torch.clamp(support_count.to(pose_error_m.dtype) / 2.0, 0.0, 1.0)
+        * active
+        * grasp_retained.to(pose_error_m.dtype)
+    )
     slip = -torch.clamp(relative_linear_speed - 0.03, min=0.0) * active
     spin = -torch.clamp(relative_angular_speed - 1.0, min=0.0) * active
     action_rate = -action_delta_sq_mean * active

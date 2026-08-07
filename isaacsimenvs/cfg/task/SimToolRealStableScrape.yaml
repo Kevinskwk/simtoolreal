@@ -29,6 +29,8 @@ acquisition_stability_steps: 15
 approach_edge_tolerance_m: 0.01
 approach_contact_steps: 15
 grasp_loss_grace_steps: 5
+grasp_retention_position_tolerance_m: 0.015
+grasp_retention_rotation_tolerance_deg: 15.0
 scrape_path_half_length_m: 0.04
 scrape_path_speed_mps: 0.02
 

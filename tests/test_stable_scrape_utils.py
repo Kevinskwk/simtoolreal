@@ -36,7 +36,9 @@ def test_acquisition_has_no_reward_and_force_is_safety_only():
         phase=torch.tensor([0, 2]), pose_error_m=torch.tensor([0.0, 0.0]),
         pose_sigma_m=0.03, edge_score=torch.ones(2),
         persistent_contact=torch.ones(2, dtype=torch.bool),
-        support_count=torch.tensor([2, 2]), relative_linear_speed=torch.zeros(2),
+        support_count=torch.tensor([2, 2]),
+        grasp_retained=torch.ones(2, dtype=torch.bool),
+        relative_linear_speed=torch.zeros(2),
         relative_angular_speed=torch.zeros(2), action_delta_sq_mean=torch.zeros(2),
         tool_acceleration=torch.zeros(2), normal_force_n=torch.tensor([30.0, 15.0]),
         soft_force_limit_n=12.0,
@@ -46,11 +48,13 @@ def test_acquisition_has_no_reward_and_force_is_safety_only():
     assert terms["over_force"][1].item() == -9.0
 
 
-def test_contact_reward_requires_grasp_support():
+def test_contact_reward_requires_retained_grasp_not_only_nearby_fingers():
     terms = utils.stable_scrape_reward_terms(
         phase=torch.tensor([2]), pose_error_m=torch.tensor([0.0]), pose_sigma_m=0.03,
         edge_score=torch.ones(1), persistent_contact=torch.ones(1, dtype=torch.bool),
-        support_count=torch.tensor([0]), relative_linear_speed=torch.zeros(1),
+        support_count=torch.tensor([5]),
+        grasp_retained=torch.zeros(1, dtype=torch.bool),
+        relative_linear_speed=torch.zeros(1),
         relative_angular_speed=torch.zeros(1), action_delta_sq_mean=torch.zeros(1),
         tool_acceleration=torch.zeros(1), normal_force_n=torch.zeros(1),
         soft_force_limit_n=12.0,
@@ -58,3 +62,22 @@ def test_contact_reward_requires_grasp_support():
     assert terms["contact"].item() == 0.0
     assert terms["edge"].item() == 0.0
     assert terms["tracking"].item() == 0.0
+    assert terms["support"].item() == 0.0
+
+
+def test_contact_rewards_are_scaled_by_target_pose_accuracy():
+    terms = utils.stable_scrape_reward_terms(
+        phase=torch.tensor([2]),
+        pose_error_m=torch.tensor([0.03 * torch.log(torch.tensor(2.0))]),
+        pose_sigma_m=0.03, edge_score=torch.ones(1),
+        persistent_contact=torch.ones(1, dtype=torch.bool),
+        support_count=torch.tensor([3]),
+        grasp_retained=torch.ones(1, dtype=torch.bool),
+        relative_linear_speed=torch.zeros(1),
+        relative_angular_speed=torch.zeros(1), action_delta_sq_mean=torch.zeros(1),
+        tool_acceleration=torch.zeros(1), normal_force_n=torch.zeros(1),
+        soft_force_limit_n=12.0,
+    )
+    assert torch.allclose(terms["tracking"], torch.tensor([0.5]))
+    assert torch.allclose(terms["edge"], torch.tensor([0.5]))
+    assert torch.allclose(terms["contact"], torch.tensor([0.5]))
