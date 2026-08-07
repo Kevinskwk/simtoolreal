@@ -86,6 +86,11 @@ class AssetsCfg:
     )
     num_assets_per_type: int = 100
 
+    # Optional deterministic prefix of the generated pool. Zero keeps the full
+    # pool. Grasp-bank tasks set this to one so every bank entry is tied to the
+    # exact same collision geometry.
+    object_pool_limit: int = 0
+
     # Shuffle the procedural pool after generation. Legacy default (True)
     # gives env i uniform coverage over types via i % len(pool). Debug/parity
     # runs set this False so pool[0] is the first matching distribution

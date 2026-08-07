@@ -1696,6 +1696,17 @@ def setup_scene(env) -> None:
             out_dir=env._tmp_asset_dir,
             shuffle=assets_cfg.shuffle_assets,
         )
+        pool_limit = int(assets_cfg.object_pool_limit)
+        if pool_limit < 0:
+            raise ValueError("cfg.assets.object_pool_limit must be non-negative")
+        if pool_limit:
+            if pool_limit > len(urdf_paths):
+                raise ValueError(
+                    "cfg.assets.object_pool_limit exceeds the generated object pool: "
+                    f"limit={pool_limit}, generated={len(urdf_paths)}"
+                )
+            urdf_paths = urdf_paths[:pool_limit]
+            object_scales_normalized = object_scales_normalized[:pool_limit]
     if not urdf_paths:
         raise ValueError(
             "No procedural object URDFs were generated. "

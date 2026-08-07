@@ -284,6 +284,7 @@ class SimToolRealTacMapScrapePoseEnv(SimToolRealTacMapEnv):
         bounds = [load_urdf_collision_bounds(path) for path in self._object_urdf_paths]
         bounds_t = torch.tensor(bounds, device=self.device, dtype=torch.float32)
         per_env_bounds = bounds_t[self._object_asset_index_per_env]
+        self._scrape_collision_bounds_per_env = per_env_bounds
         self._scrape_x_tip_per_env = per_env_bounds[:, 3]
         self._scrape_y_min_per_env = per_env_bounds[:, 1]
         self._scrape_y_max_per_env = per_env_bounds[:, 4]
