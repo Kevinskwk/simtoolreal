@@ -18,6 +18,7 @@ quat_apply_wxyz = _utils.quat_apply_wxyz
 sample_edge_contact_goal_pose = _utils.sample_edge_contact_goal_pose
 load_urdf_collision_bounds = _utils.load_urdf_collision_bounds
 edge_contact_points_w = _utils.edge_contact_points_w
+edge_tilt_from_pose = _utils.edge_tilt_from_pose
 contact_force_reward = _utils.contact_force_reward
 conditional_success_rate = _utils.conditional_success_rate
 contact_force_onset_gate = _utils.contact_force_onset_gate
@@ -117,6 +118,29 @@ def test_resampling_with_prior_edge_yaw_keeps_same_contact_edge_direction():
     y_axis1 = quat_apply_wxyz(q1, torch.tensor([[0.0, 1.0, 0.0]]))
     assert torch.allclose(yaw, yaw_reused)
     assert torch.allclose(y_axis0, y_axis1, atol=1e-6)
+
+
+def test_explicit_edge_tilt_is_preserved_and_recoverable():
+    table_pos = torch.tensor([[0.0, 0.0, 0.38], [0.0, 0.0, 0.38]])
+    table_quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(2, 1)
+    yaw = torch.tensor([-0.3, 0.4])
+    tilt = torch.tensor([0.12, 0.31])
+    _, quat, _, _ = sample_edge_contact_goal_pose(
+        table_pos_w=table_pos,
+        table_quat_wxyz=table_quat,
+        x_tip=torch.tensor([0.23, 0.23]),
+        y_center=torch.zeros(2),
+        z_contact=torch.tensor([-0.04, -0.04]),
+        xy_half_range=(0.0, 0.0),
+        edge_yaw_range_rad=0.0,
+        tilt_range_rad=(0.0, 0.0),
+        device=torch.device("cpu"),
+        edge_yaw=yaw,
+        edge_tilt=tilt,
+    )
+    normal = torch.tensor([[0.0, 0.0, 1.0]]).repeat(2, 1)
+    recovered = edge_tilt_from_pose(quat, normal, yaw)
+    assert torch.allclose(recovered, tilt, atol=1.0e-6)
 
 
 def test_edge_contact_reward_scores_selected_edge_distance():

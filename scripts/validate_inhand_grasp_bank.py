@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import traceback
 from pathlib import Path
 
 from isaaclab.app import AppLauncher
@@ -19,7 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimum-pass-rate", type=float, default=0.95)
     parser.add_argument(
         "--grasp-bank", type=Path,
-        default=Path("assets/grasp_banks/spatula_canonical_v1.json"),
+        default=Path("assets/grasp_banks/eraser_canonical_v2.json"),
     )
     parser.add_argument("--write-filtered-bank", type=Path)
     parser.add_argument("--minimum-filtered-entries", type=int, default=64)
@@ -42,6 +43,9 @@ from isaaclab.utils.math import subtract_frame_transforms  # noqa: E402
 import isaacsimenvs  # noqa: E402,F401
 from isaacsimenvs.tasks.simtoolreal.simtoolreal_tacmap_env_cfg import (  # noqa: E402
     SimToolRealInHandStableScrapeEnvCfg,
+)
+from isaacsimenvs.tasks.simtoolreal.utils.inhand_grasp_bank import (  # noqa: E402
+    validate_grasp_bank,
 )
 
 
@@ -195,10 +199,31 @@ def run() -> None:
                 f"need {ARGS.minimum_filtered_entries}"
             )
         payload = json.loads(ARGS.grasp_bank.read_text())
-        payload["entries"] = [
-            payload["entries"][index]
-            for index in robust_entry_ids[: int(ARGS.minimum_filtered_entries)]
+        tactile_min = int(payload["tactile_min_fingers"])
+        required_count = math.ceil(
+            float(payload["tactile_rich_fraction_min"])
+            * int(ARGS.minimum_filtered_entries)
+        )
+        tactile_ids = [
+            index for index in robust_entry_ids
+            if int(payload["entries"][index]["verification"]["tactile_finger_count_min"])
+            >= tactile_min
         ]
+        if len(tactile_ids) < required_count:
+            raise RuntimeError(
+                f"only {len(tactile_ids)} replay-robust tactile-rich entries are "
+                f"available; need {required_count}"
+            )
+        selected_ids = tactile_ids[:required_count]
+        selected_set = set(selected_ids)
+        selected_ids.extend(
+            index for index in robust_entry_ids if index not in selected_set
+        )
+        selected_ids = selected_ids[: int(ARGS.minimum_filtered_entries)]
+        payload["entries"] = [payload["entries"][index] for index in selected_ids]
+        validate_grasp_bank(
+            payload, minimum_entries=int(ARGS.minimum_filtered_entries)
+        )
         ARGS.write_filtered_bank.parent.mkdir(parents=True, exist_ok=True)
         ARGS.write_filtered_bank.write_text(
             json.dumps(payload, indent=2, allow_nan=False) + "\n"
@@ -214,5 +239,8 @@ def run() -> None:
 if __name__ == "__main__":
     try:
         run()
+    except BaseException:
+        traceback.print_exc()
+        raise
     finally:
         APP.close()

@@ -63,6 +63,9 @@ class SimToolRealStableScrapeEnv(SimToolRealTacMapScrapePoseEnv):
         self._stable_path_offset = torch.zeros(n, device=device)
         self._stable_path_sign = torch.ones(n, device=device)
         self._stable_target_velocity_w = torch.zeros(n, 3, device=device)
+        self._stable_velocity_tracking_active = torch.zeros(
+            n, dtype=torch.bool, device=device
+        )
         self._stable_over_force = torch.zeros(n, device=device)
         self._stable_previous_contact = torch.zeros(n, dtype=torch.bool, device=device)
         self._stable_contact_churn = torch.zeros(n, device=device)
@@ -122,6 +125,7 @@ class SimToolRealStableScrapeEnv(SimToolRealTacMapScrapePoseEnv):
             torch.rand(env_ids.numel(), device=self.device) < 0.5, -1.0, 1.0
         )
         self._stable_target_velocity_w[env_ids] = 0.0
+        self._stable_velocity_tracking_active[env_ids] = False
         self._stable_over_force[env_ids] = 0.0
         self._stable_previous_action[env_ids] = 0.0
         self._stable_action_delta_sq_mean[env_ids] = 0.0
@@ -161,7 +165,15 @@ class SimToolRealStableScrapeEnv(SimToolRealTacMapScrapePoseEnv):
         super()._pre_physics_step(actions)
 
     def _advance_scrape_reference(self) -> None:
-        active = self._stable_phase == SCRAPE_PHASE
+        threshold = float(self.cfg.scrape_velocity_activation_pose_error_m)
+        if threshold <= 0.0:
+            raise ValueError("scrape_velocity_activation_pose_error_m must be positive")
+        active = (
+            (self._stable_phase == SCRAPE_PHASE)
+            & torch.isfinite(self._keypoints_max_dist)
+            & (self._keypoints_max_dist <= threshold)
+        )
+        self._stable_velocity_tracking_active.copy_(active)
         if not bool(active.any()):
             self._stable_target_velocity_w.zero_()
             return
@@ -410,6 +422,12 @@ class SimToolRealStableScrapeEnv(SimToolRealTacMapScrapePoseEnv):
             "task/target_speed_mean": torch.linalg.vector_norm(
                 self._stable_target_velocity_w, dim=-1
             ).mean(),
+            "task/velocity_tracking_active_ratio": (
+                self._stable_velocity_tracking_active.float().mean()
+            ),
+            "task/velocity_activation_pose_error_m": float(
+                self.cfg.scrape_velocity_activation_pose_error_m
+            ),
         })
         if bool(getattr(self, "_frozen_acquisition_active", False)):
             self.extras.update({

@@ -315,6 +315,7 @@ class SimToolRealStableScrapeEnvCfg(SimToolRealTacMapScrapePoseEnvCfg):
     grasp_loss_grace_steps: int = 5
     scrape_path_half_length_m: float = 0.04
     scrape_path_speed_mps: float = 0.02
+    scrape_velocity_activation_pose_error_m: float = 0.02
     edge_contact_xy_range_m: tuple[float, float] = (0.04, 0.04)
 
     pose_reward_weight: float = 5.0
@@ -340,10 +341,19 @@ class SimToolRealInHandStableScrapeEnvCfg(SimToolRealStableScrapeEnvCfg):
     """Post-grasp stabilization gate initialized from compliant snapshots."""
 
     assets: AssetsCfg = AssetsCfg(
-        handle_head_types=("spatula",),
-        num_assets_per_type=1,
-        shuffle_assets=False,
-        object_pool_limit=1,
+        handle_head_types=("eraser",),
+        object_urdf=str(
+            Path(__file__).resolve().parents[3]
+            / "assets"
+            / "urdf"
+            / "objects"
+            / "eraser_tactile_canonical.urdf"
+        ),
+        object_scale=(
+            2.9373215824170767,
+            0.5126639800346792,
+            1.2951200580119278,
+        ),
     )
     domain_randomization: DomainRandomizationCfg = DomainRandomizationCfg(
         use_obs_delay=False,
@@ -359,7 +369,7 @@ class SimToolRealInHandStableScrapeEnvCfg(SimToolRealStableScrapeEnvCfg):
         Path(__file__).resolve().parents[3]
         / "assets"
         / "grasp_banks"
-        / "spatula_canonical_v1.json"
+        / "eraser_canonical_v2.json"
     )
     grasp_bank_source_checkpoint_path: str = str(
         Path(__file__).resolve().parents[3] / "pretrained_policy" / "model.pth"
@@ -376,6 +386,10 @@ class SimToolRealInHandStableScrapeEnvCfg(SimToolRealStableScrapeEnvCfg):
     inhand_curriculum_success_threshold: float = 0.8
     inhand_curriculum_min_eligible_count: int = 64
     inhand_reset_penetration_tolerance_m: float = 1.0e-4
+    inhand_target_yaw_delta_deg: float = 5.0
+    inhand_target_tilt_delta_deg: float = 5.0
+    inhand_target_max_rotation_deg: float = 30.0
+    inhand_target_sampling_attempts: int = 32
     grasp_loss_grace_steps: int = 15
 
 @configclass

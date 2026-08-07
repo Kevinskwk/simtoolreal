@@ -141,6 +141,7 @@ def sample_edge_contact_goal_pose(
     tilt_range_rad: tuple[float, float],
     device: torch.device,
     edge_yaw: torch.Tensor | None = None,
+    edge_tilt: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sample tool poses whose lower leading tip edge is anchored on the tabletop.
 
@@ -158,8 +159,13 @@ def sample_edge_contact_goal_pose(
         )
     edge_dir_w, forward_flat_w = tangent_basis_from_yaw(edge_yaw, normal_w)
 
-    tilt_lo, tilt_hi = tilt_range_rad
-    tilt = torch.empty(n_envs, device=device).uniform_(float(tilt_lo), float(tilt_hi))
+    if edge_tilt is None:
+        tilt_lo, tilt_hi = tilt_range_rad
+        tilt = torch.empty(n_envs, device=device).uniform_(float(tilt_lo), float(tilt_hi))
+    else:
+        if edge_tilt.shape != (n_envs,) or not bool(torch.isfinite(edge_tilt).all()):
+            raise ValueError(f"edge_tilt must be a finite ({n_envs},) tensor")
+        tilt = edge_tilt
     cos_t = torch.cos(tilt).unsqueeze(-1)
     sin_t = torch.sin(tilt).unsqueeze(-1)
     local_x_w = cos_t * forward_flat_w - sin_t * normal_w
@@ -178,6 +184,25 @@ def sample_edge_contact_goal_pose(
     contact_edge_local = torch.stack((x_tip, y_center, z_contact), dim=-1)
     goal_pos_w = edge_center_w - quat_apply_wxyz(goal_quat_wxyz, contact_edge_local)
     return goal_pos_w, goal_quat_wxyz, edge_center_w, edge_yaw
+
+
+def edge_tilt_from_pose(
+    object_quat_wxyz: torch.Tensor,
+    table_normal_w: torch.Tensor,
+    edge_yaw: torch.Tensor,
+) -> torch.Tensor:
+    """Recover signed edge tilt from an edge-contact orientation."""
+    if object_quat_wxyz.shape != table_normal_w.shape[:1] + (4,):
+        raise ValueError("object quaternion must have shape (N, 4)")
+    if table_normal_w.shape[-1] != 3 or edge_yaw.shape != table_normal_w.shape[:-1]:
+        raise ValueError("table normal or edge yaw shape is invalid")
+    _, forward_w = tangent_basis_from_yaw(edge_yaw, table_normal_w)
+    local_z = torch.zeros_like(table_normal_w)
+    local_z[:, 2] = 1.0
+    tool_z_w = quat_apply_wxyz(object_quat_wxyz, local_z)
+    sin_tilt = (tool_z_w * forward_w).sum(dim=-1)
+    cos_tilt = (tool_z_w * table_normal_w).sum(dim=-1)
+    return torch.atan2(sin_tilt, cos_tilt)
 
 
 def edge_contact_points_w(
@@ -318,6 +343,7 @@ __all__ = [
     "load_urdf_collision_bounds",
     "sample_edge_contact_goal_pose",
     "edge_contact_points_w",
+    "edge_tilt_from_pose",
     "contact_force_reward",
     "conditional_success_rate",
     "contact_force_onset_gate",

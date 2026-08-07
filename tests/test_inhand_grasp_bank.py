@@ -25,6 +25,9 @@ def valid_entry():
         "object_velocity": [0.0] * 6,
         "palm_to_tool_pos": [0.0, 0.0, 0.2],
         "palm_to_tool_quat_wxyz": [1.0, 0.0, 0.0, 0.0],
+        "reference_contact_quat_wxyz": [1.0, 0.0, 0.0, 0.0],
+        "reference_edge_yaw_rad": 0.0,
+        "reference_edge_tilt_rad": 0.25,
         "verification": {
             "support_count": 2,
             "edge_clearance_m": 0.04,
@@ -33,23 +36,30 @@ def valid_entry():
             "hold_steps": 120,
             "hold_drift_m": 0.004,
             "hold_rotation_deg": 1.0,
+            "pickup_orientation_error_deg": 5.0,
+            "tactile_finger_count_min": 2,
+            "tactile_contact_area_mean": 0.01,
+            "tactile_depth_mean": 0.1,
+            "tactile_depth_max": 0.2,
         },
     }
 
 
 def valid_bank():
     return {
-        "schema_version": 1,
-        "tool_type": "spatula",
+        "schema_version": 2,
+        "tool_type": "eraser",
         "asset_sha256": "a" * 64,
         "source_checkpoint_sha256": "b" * 64,
         "policy_coefficient_id": 0.0,
+        "tactile_rich_fraction_min": 0.75,
+        "tactile_min_fingers": 2,
         "entries": [valid_entry()],
     }
 
 
 def test_grasp_bank_requires_verified_compliant_grasp():
-    assert utils.validate_grasp_bank(valid_bank())["tool_type"] == "spatula"
+    assert utils.validate_grasp_bank(valid_bank())["tool_type"] == "eraser"
     payload = valid_bank()
     payload["entries"][0]["verification"]["support_count"] = 1
     with pytest.raises(ValueError, match="support"):
@@ -75,6 +85,13 @@ def test_grasp_bank_rejects_nonfinite_metrics_and_short_verification():
     payload = valid_bank()
     payload["entries"][0]["verification"]["hold_steps"] = 30
     with pytest.raises(ValueError, match="hold window"):
+        utils.validate_grasp_bank(payload)
+
+
+def test_grasp_bank_enforces_tactile_rich_fraction():
+    payload = valid_bank()
+    payload["entries"][0]["verification"]["tactile_finger_count_min"] = 1
+    with pytest.raises(ValueError, match="tactile-rich fraction"):
         utils.validate_grasp_bank(payload)
 
 

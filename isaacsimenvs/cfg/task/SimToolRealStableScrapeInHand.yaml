@@ -1,4 +1,4 @@
-# Post-grasp stabilization gate: one verified compliant spatula, no tactile actor.
+# Post-grasp stabilization gate: one verified tactile-rich eraser, no tactile actor.
 use_tacmap: false
 enable_vbts: false
 include_tacmap_in_policy: false
@@ -6,7 +6,7 @@ enable_tool_table_contact_force_reward: false
 enable_tool_table_contact_sensor: true
 
 assets:
-  handle_head_types: [spatula]
+  handle_head_types: [eraser]
   num_assets_per_type: 1
   shuffle_assets: false
   object_pool_limit: 1
@@ -18,6 +18,10 @@ inhand_table_angle_stages_deg: [0.0, 2.0, 5.0, 8.0]
 inhand_curriculum_success_threshold: 0.8
 inhand_curriculum_min_eligible_count: 64
 inhand_reset_penetration_tolerance_m: 0.0001
+inhand_target_yaw_delta_deg: 5.0
+inhand_target_tilt_delta_deg: 5.0
+inhand_target_max_rotation_deg: 30.0
+inhand_target_sampling_attempts: 32
 
 edge_contact_reward_max_weight: 5.0
 edge_contact_reward_sigma_start_m: 0.03
@@ -38,6 +42,7 @@ approach_contact_steps: 15
 grasp_loss_grace_steps: 15
 scrape_path_half_length_m: 0.04
 scrape_path_speed_mps: 0.02
+scrape_velocity_activation_pose_error_m: 0.02
 
 episode_length_s: 20.0
 scene:

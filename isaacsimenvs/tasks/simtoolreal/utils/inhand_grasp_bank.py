@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 JOINT_COUNT = 29
 
 
@@ -42,8 +42,8 @@ def validate_grasp_bank(payload: dict, *, minimum_entries: int = 1) -> dict:
             f"unsupported grasp-bank schema {payload.get('schema_version')!r}; "
             f"expected {SCHEMA_VERSION}"
         )
-    if payload.get("tool_type") != "spatula":
-        raise ValueError("V1 in-hand grasp bank must use tool_type='spatula'")
+    if payload.get("tool_type") != "eraser":
+        raise ValueError("V2 in-hand grasp bank must use tool_type='eraser'")
     for name in ("asset_sha256", "source_checkpoint_sha256"):
         value = payload.get(name)
         if (
@@ -54,6 +54,12 @@ def validate_grasp_bank(payload: dict, *, minimum_entries: int = 1) -> dict:
             raise ValueError(f"grasp bank {name} must be a SHA-256 hex digest")
     if float(payload.get("policy_coefficient_id", float("nan"))) != 0.0:
         raise ValueError("grasp bank policy_coefficient_id must be 0.0")
+    tactile_fraction = float(payload.get("tactile_rich_fraction_min", float("nan")))
+    tactile_min_fingers = int(payload.get("tactile_min_fingers", 0))
+    if not math.isfinite(tactile_fraction) or not 0.0 <= tactile_fraction <= 1.0:
+        raise ValueError("grasp bank tactile_rich_fraction_min must be in [0, 1]")
+    if tactile_min_fingers < 1 or tactile_min_fingers > 5:
+        raise ValueError("grasp bank tactile_min_fingers must be in [1, 5]")
     entries = payload.get("entries")
     if not isinstance(entries, list) or len(entries) < int(minimum_entries):
         raise ValueError(
@@ -73,9 +79,13 @@ def validate_grasp_bank(payload: dict, *, minimum_entries: int = 1) -> dict:
             ("object_velocity", 6),
             ("palm_to_tool_pos", 3),
             ("palm_to_tool_quat_wxyz", 4),
+            ("reference_contact_quat_wxyz", 4),
         ):
             _finite_vector(entry, name, size)
-        for name in ("object_quat_wxyz", "palm_to_tool_quat_wxyz"):
+        for name in (
+            "object_quat_wxyz", "palm_to_tool_quat_wxyz",
+            "reference_contact_quat_wxyz",
+        ):
             norm = torch.linalg.vector_norm(torch.tensor(entry[name], dtype=torch.float32))
             if not bool(torch.isclose(norm, torch.tensor(1.0), atol=1.0e-3)):
                 raise ValueError(f"grasp entry {index} {name} is not normalized")
@@ -84,7 +94,9 @@ def validate_grasp_bank(payload: dict, *, minimum_entries: int = 1) -> dict:
             raise ValueError(f"grasp entry {index} has no verification metrics")
         for name in (
             "edge_clearance_m", "table_force_n", "hold_drift_m",
-            "hold_rotation_deg",
+            "hold_rotation_deg", "pickup_orientation_error_deg",
+            "tactile_contact_area_mean", "tactile_depth_mean",
+            "tactile_depth_max",
         ):
             value = float(metrics.get(name, float("nan")))
             if not math.isfinite(value) or value < 0.0:
@@ -93,6 +105,8 @@ def validate_grasp_bank(payload: dict, *, minimum_entries: int = 1) -> dict:
                 )
         if int(metrics.get("support_count", 0)) < 2:
             raise ValueError(f"grasp entry {index} has insufficient fingertip support")
+        if int(metrics.get("tactile_finger_count_min", -1)) < 0:
+            raise ValueError(f"grasp entry {index} has invalid tactile finger count")
         if int(metrics.get("stable_steps", 0)) < 15:
             raise ValueError(f"grasp entry {index} has an insufficient stability window")
         if int(metrics.get("hold_steps", 0)) < 120:
@@ -103,8 +117,27 @@ def validate_grasp_bank(payload: dict, *, minimum_entries: int = 1) -> dict:
             raise ValueError(f"grasp entry {index} failed the hold-drift limit")
         if float(metrics.get("hold_rotation_deg", float("inf"))) > 2.0:
             raise ValueError(f"grasp entry {index} failed the hold-rotation limit")
+        if float(metrics.get("pickup_orientation_error_deg", float("inf"))) > 15.0:
+            raise ValueError(f"grasp entry {index} did not track its edge-contact orientation")
         if float(metrics.get("table_force_n", float("inf"))) >= 0.1:
             raise ValueError(f"grasp entry {index} was touching the table")
+        yaw = float(entry.get("reference_edge_yaw_rad", float("nan")))
+        tilt = float(entry.get("reference_edge_tilt_rad", float("nan")))
+        if not math.isfinite(yaw) or not math.isfinite(tilt):
+            raise ValueError(f"grasp entry {index} has non-finite edge orientation")
+        if abs(yaw) > math.pi or not 0.0 < tilt < 0.5 * math.pi:
+            raise ValueError(f"grasp entry {index} edge orientation is out of range")
+    tactile_rich_count = sum(
+        int(entry["verification"]["tactile_finger_count_min"])
+        >= tactile_min_fingers
+        for entry in entries
+    )
+    actual_fraction = tactile_rich_count / len(entries)
+    if actual_fraction + 1.0e-12 < tactile_fraction:
+        raise ValueError(
+            "grasp bank tactile-rich fraction is below its declared minimum: "
+            f"actual={actual_fraction:.3f}, required={tactile_fraction:.3f}"
+        )
     return payload
 
 

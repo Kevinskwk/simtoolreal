@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import traceback
 from pathlib import Path
 
 from isaaclab.app import AppLauncher
@@ -28,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output", type=Path,
-        default=REPO_ROOT / "assets/grasp_banks/spatula_canonical_v1.json",
+        default=REPO_ROOT / "assets/grasp_banks/eraser_canonical_v2.json",
     )
     parser.add_argument("--entries", type=int, default=64)
     parser.add_argument("--num-envs", type=int, default=512)
@@ -37,6 +39,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hold-steps", type=int, default=120)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--policy-coef-id", type=float, default=0.0)
+    parser.add_argument("--pickup-height-m", type=float, default=0.12)
+    parser.add_argument("--max-pickup-orientation-error-deg", type=float, default=15.0)
+    parser.add_argument("--tactile-entry-fraction", type=float, default=0.75)
+    parser.add_argument("--min-tactile-fingers", type=int, default=1)
     AppLauncher.add_app_launcher_args(parser)
     parser.set_defaults(headless=True)
     args = parser.parse_args()
@@ -64,6 +70,7 @@ from isaacsimenvs.tasks.simtoolreal.utils.inhand_grasp_bank import (  # noqa: E4
 )
 from isaacsimenvs.tasks.simtoolreal.utils.scrape_pose_utils import (  # noqa: E402
     edge_contact_points_w,
+    edge_tilt_from_pose,
     table_top_state,
 )
 
@@ -80,6 +87,14 @@ def validate_args() -> None:
         raise ValueError("--entries cannot exceed --num-envs in the one-pass collector")
     if float(ARGS.policy_coef_id) != 0.0:
         raise ValueError("V1 grasp collection requires --policy-coef-id=0.0")
+    if float(ARGS.pickup_height_m) <= 0.0:
+        raise ValueError("--pickup-height-m must be positive")
+    if not 0.0 < float(ARGS.max_pickup_orientation_error_deg) <= 15.0:
+        raise ValueError("--max-pickup-orientation-error-deg must be in (0, 15]")
+    if not 0.0 <= float(ARGS.tactile_entry_fraction) <= 1.0:
+        raise ValueError("--tactile-entry-fraction must be in [0, 1]")
+    if not 1 <= int(ARGS.min_tactile_fingers) <= 5:
+        raise ValueError("--min-tactile-fingers must be in [1, 5]")
     if not ARGS.checkpoint.is_file() or not ARGS.policy_config.is_file():
         raise FileNotFoundError("checkpoint and policy config must both exist")
 
@@ -89,13 +104,18 @@ def make_cfg() -> SimToolRealTacMapScrapePoseEnvCfg:
     cfg.seed = int(ARGS.seed)
     cfg.scene.num_envs = int(ARGS.num_envs)
     cfg.episode_length_s = max(60.0, (ARGS.acquisition_steps + ARGS.hold_steps + 60) / 60.0)
-    cfg.assets.handle_head_types = ("spatula",)
-    cfg.assets.num_assets_per_type = 1
-    cfg.assets.shuffle_assets = False
-    cfg.assets.object_pool_limit = 1
-    cfg.use_tacmap = False
-    cfg.enable_vbts = False
-    cfg.enable_tactile = False
+    cfg.assets.handle_head_types = ("eraser",)
+    cfg.assets.object_urdf = str(
+        REPO_ROOT / "assets/urdf/objects/eraser_tactile_canonical.urdf"
+    )
+    cfg.assets.object_scale = (
+        2.9373215824170767,
+        0.5126639800346792,
+        1.2951200580119278,
+    )
+    cfg.use_tacmap = True
+    cfg.enable_vbts = True
+    cfg.enable_tactile = True
     cfg.include_tacmap_in_policy = False
     cfg.obs.obs_list = BASE_OBS
     cfg.obs.state_list = BASE_OBS
@@ -115,6 +135,45 @@ def make_cfg() -> SimToolRealTacMapScrapePoseEnvCfg:
     cfg.domain_randomization.force_prob_range = (1.0e-12, 1.0e-12)
     cfg.domain_randomization.torque_prob_range = (1.0e-12, 1.0e-12)
     return cfg
+
+
+def quaternion_error_deg(actual: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    if actual.shape != target.shape or actual.shape[-1] != 4:
+        raise ValueError("quaternion tensors must have matching (..., 4) shapes")
+    alignment = torch.abs((actual * target).sum(dim=-1)).clamp(0.0, 1.0)
+    return torch.rad2deg(2.0 * torch.acos(alignment))
+
+
+def tactile_metrics(inner) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not bool(inner.cfg.enable_vbts) or len(inner._vbts_sensor) != 5:
+        raise RuntimeError("tactile-rich collection requires all five VBTS sensors")
+    scale = float(inner.cfg.tacmap_obs_normalization)
+    if scale <= 0.0:
+        raise RuntimeError("tacmap_obs_normalization must be positive")
+    tactile = inner.vbts_deform.to(torch.float32) / scale
+    if tactile.shape[:2] != (inner.num_envs, 5) or not bool(torch.isfinite(tactile).all()):
+        raise RuntimeError(
+            f"invalid tactile tensor during grasp collection: {tuple(tactile.shape)}"
+        )
+    mask = tactile > float(inner.cfg.contact_threshold)
+    active_fingers = mask.flatten(start_dim=2).any(dim=-1).sum(dim=-1)
+    area = mask.to(torch.float32).mean(dim=(-1, -2, -3))
+    active_count = mask.sum(dim=(-1, -2, -3))
+    active_depth = torch.where(mask, tactile, torch.zeros_like(tactile))
+    depth_mean = active_depth.sum(dim=(-1, -2, -3)) / active_count.clamp_min(1)
+    depth_max = active_depth.amax(dim=(-1, -2, -3))
+    return active_fingers, area, depth_mean, depth_max
+
+
+def fingertip_support(inner) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return center-distance support using the eraser bounding sphere plus 12 mm."""
+    object_size = inner._object_scale_per_env * 0.04
+    object_radius = 0.5 * torch.linalg.vector_norm(object_size, dim=-1)
+    max_center_distance = object_radius + 0.012
+    support = (
+        inner._curr_fingertip_distances < max_center_distance.unsqueeze(-1)
+    ).sum(dim=-1)
+    return support, max_center_distance
 
 
 def palm_tool_relative(inner) -> tuple[torch.Tensor, torch.Tensor]:
@@ -151,7 +210,15 @@ def hold_action(inner) -> torch.Tensor:
     return action.clamp(-1.0, 1.0)
 
 
-def snapshot(inner, env_id: int, action: torch.Tensor, verification: dict) -> dict:
+def snapshot(
+    inner,
+    env_id: int,
+    action: torch.Tensor,
+    verification: dict,
+    reference_contact_quat: torch.Tensor,
+    reference_edge_yaw: torch.Tensor,
+    reference_edge_tilt: torch.Tensor,
+) -> dict:
     perm = inner._perm_lab_to_canon
     relative_pos, relative_quat = palm_tool_relative(inner)
     return {
@@ -169,6 +236,9 @@ def snapshot(inner, env_id: int, action: torch.Tensor, verification: dict) -> di
         )).tolist(),
         "palm_to_tool_pos": relative_pos[env_id].tolist(),
         "palm_to_tool_quat_wxyz": relative_quat[env_id].tolist(),
+        "reference_contact_quat_wxyz": reference_contact_quat[env_id].tolist(),
+        "reference_edge_yaw_rad": float(reference_edge_yaw[env_id].item()),
+        "reference_edge_tilt_rad": float(reference_edge_tilt[env_id].item()),
         "verification": verification,
     }
 
@@ -199,13 +269,19 @@ def collect() -> dict:
         inner.goal_viz.data.root_quat_w.clone(),
     ), dim=-1)
     contact_anchor = inner._scrape_edge_anchor_w.clone()
+    reference_edge_yaw = inner._scrape_edge_yaw.clone()
+    reference_edge_tilt = edge_tilt_from_pose(
+        contact_pose[:, 3:], normal, reference_edge_yaw
+    )
     pickup_pose = contact_pose.clone()
-    pickup_pose[:, :3] += 0.12 * normal
+    pickup_pose[:, :3] += float(ARGS.pickup_height_m) * normal
     inner.goal_viz.write_root_pose_to_sim(pickup_pose)
     inner.goal_viz.write_root_velocity_to_sim(
         torch.zeros(inner.num_envs, 6, device=inner.device)
     )
-    inner._scrape_edge_anchor_w.copy_(contact_anchor + 0.12 * normal)
+    inner._scrape_edge_anchor_w.copy_(
+        contact_anchor + float(ARGS.pickup_height_m) * normal
+    )
     observation = inner._get_observations()
 
     stable_count = torch.zeros(inner.num_envs, dtype=torch.long, device=inner.device)
@@ -218,8 +294,19 @@ def collect() -> dict:
     reference_quat[:, 0] = 1.0
     maximum_drift = torch.zeros(inner.num_envs, device=inner.device)
     maximum_rotation = torch.zeros(inner.num_envs, device=inner.device)
+    minimum_tactile_fingers = torch.full(
+        (inner.num_envs,), 5, dtype=torch.long, device=inner.device
+    )
+    tactile_area_sum = torch.zeros(inner.num_envs, device=inner.device)
+    tactile_depth_sum = torch.zeros(inner.num_envs, device=inner.device)
+    tactile_depth_max = torch.zeros(inner.num_envs, device=inner.device)
     last_action = torch.zeros(inner.num_envs, inner.cfg.action_space, device=inner.device)
-    entries: list[dict] = []
+    tactile_entries: list[dict] = []
+    fallback_entries: list[dict] = []
+    required_tactile = math.ceil(float(ARGS.tactile_entry_fraction) * int(ARGS.entries))
+    observed_tactile_depth_max = 0.0
+    observed_tactile_fingers_max = 0
+    observed_min_fingertip_distance = float("inf")
 
     for step in range(int(ARGS.acquisition_steps)):
         policy_action = player.get_normalized_action(
@@ -230,14 +317,29 @@ def collect() -> dict:
         last_action.copy_(action)
         observation, _, terminated, truncated, _ = env.step(action)
         relative_pos, relative_quat = palm_tool_relative(inner)
-        support = (inner._curr_fingertip_distances < 0.12).sum(-1)
+        support, support_distance = fingertip_support(inner)
+        observed_min_fingertip_distance = min(
+            observed_min_fingertip_distance,
+            float(inner._curr_fingertip_distances.min().item()),
+        )
+        tactile_fingers, tactile_area, tactile_depth_mean, tactile_max = tactile_metrics(inner)
+        observed_tactile_depth_max = max(
+            observed_tactile_depth_max, float(tactile_max.max().item())
+        )
+        observed_tactile_fingers_max = max(
+            observed_tactile_fingers_max, int(tactile_fingers.max().item())
+        )
         clearance = edge_clearance(inner)
         force = inner._scrape_table_normal_force_interval
+        pickup_orientation_error = quaternion_error_deg(
+            inner.object.data.root_quat_w, pickup_pose[:, 3:]
+        )
         done = terminated | truncated
 
         candidate = (
             ~holding & ~complete & ~failed & ~done
             & (support >= 2) & (clearance >= 0.03) & (force < 0.1)
+            & (pickup_orientation_error <= float(ARGS.max_pickup_orientation_error_deg))
         )
         starting = candidate & (stable_count == 0)
         reference_pos[starting] = relative_pos[starting]
@@ -256,6 +358,10 @@ def collect() -> dict:
         hold_count[newly_holding] = 0
         reference_pos[newly_holding] = relative_pos[newly_holding]
         reference_quat[newly_holding] = relative_quat[newly_holding]
+        minimum_tactile_fingers[newly_holding] = tactile_fingers[newly_holding]
+        tactile_area_sum[newly_holding] = 0.0
+        tactile_depth_sum[newly_holding] = 0.0
+        tactile_depth_max[newly_holding] = 0.0
 
         hold_drift = torch.linalg.vector_norm(relative_pos - reference_pos, dim=-1)
         hold_rotation = torch.rad2deg(2.0 * torch.acos(
@@ -265,9 +371,24 @@ def collect() -> dict:
         maximum_rotation = torch.where(
             holding, torch.maximum(maximum_rotation, hold_rotation), maximum_rotation
         )
+        minimum_tactile_fingers = torch.where(
+            holding,
+            torch.minimum(minimum_tactile_fingers, tactile_fingers),
+            minimum_tactile_fingers,
+        )
+        tactile_area_sum = torch.where(
+            holding, tactile_area_sum + tactile_area, tactile_area_sum
+        )
+        tactile_depth_sum = torch.where(
+            holding, tactile_depth_sum + tactile_depth_mean, tactile_depth_sum
+        )
+        tactile_depth_max = torch.where(
+            holding, torch.maximum(tactile_depth_max, tactile_max), tactile_depth_max
+        )
         valid_hold = (
             holding & ~done & (support >= 2) & (clearance >= 0.03)
             & (force < 0.1) & (maximum_drift <= 0.005) & (maximum_rotation <= 2.0)
+            & (pickup_orientation_error <= float(ARGS.max_pickup_orientation_error_deg))
         )
         failed_now = holding & ~valid_hold
         failed |= failed_now
@@ -283,37 +404,80 @@ def collect() -> dict:
                 "hold_steps": int(ARGS.hold_steps),
                 "hold_drift_m": float(maximum_drift[env_id].item()),
                 "hold_rotation_deg": float(maximum_rotation[env_id].item()),
+                "pickup_orientation_error_deg": float(
+                    pickup_orientation_error[env_id].item()
+                ),
+                "tactile_finger_count_min": int(
+                    minimum_tactile_fingers[env_id].item()
+                ),
+                "tactile_contact_area_mean": float(
+                    tactile_area_sum[env_id].item() / max(int(hold_count[env_id].item()), 1)
+                ),
+                "tactile_depth_mean": float(
+                    tactile_depth_sum[env_id].item() / max(int(hold_count[env_id].item()), 1)
+                ),
+                "tactile_depth_max": float(tactile_depth_max[env_id].item()),
             }
-            entries.append(snapshot(inner, env_id, last_action, verification))
+            entry = snapshot(
+                inner,
+                env_id,
+                last_action,
+                verification,
+                contact_pose[:, 3:],
+                reference_edge_yaw,
+                reference_edge_tilt,
+            )
+            if verification["tactile_finger_count_min"] >= int(ARGS.min_tactile_fingers):
+                tactile_entries.append(entry)
+            else:
+                fallback_entries.append(entry)
             complete[env_id] = True
             holding[env_id] = False
-            if len(entries) >= int(ARGS.entries):
+            if (
+                len(tactile_entries) >= required_tactile
+                and len(tactile_entries) + len(fallback_entries) >= int(ARGS.entries)
+            ):
                 break
-        if len(entries) >= int(ARGS.entries):
+        if (
+            len(tactile_entries) >= required_tactile
+            and len(tactile_entries) + len(fallback_entries) >= int(ARGS.entries)
+        ):
             break
         if (step + 1) % 300 == 0:
             print(
                 f"[collect] step={step + 1} stable={int(holding.sum())} "
-                f"complete={len(entries)} failed={int(failed.sum())}",
+                f"tactile={len(tactile_entries)} fallback={len(fallback_entries)} "
+                f"failed={int(failed.sum())} "
+                f"tactile_depth_max={observed_tactile_depth_max:.4f} "
+                f"tactile_fingers_max={observed_tactile_fingers_max} "
+                f"fingertip_distance_min={observed_min_fingertip_distance:.4f} "
+                f"support_distance_mean={float(support_distance.mean().item()):.4f}",
                 flush=True,
             )
 
     asset_path = Path(inner._object_urdf_paths[0])
     payload = {
         "schema_version": SCHEMA_VERSION,
-        "tool_type": "spatula",
+        "tool_type": "eraser",
         "asset_sha256": sha256_file(asset_path),
         "source_checkpoint": str(ARGS.checkpoint.resolve()),
         "source_checkpoint_sha256": sha256_file(ARGS.checkpoint),
         "policy_coefficient_id": float(ARGS.policy_coef_id),
+        "tactile_rich_fraction_min": float(ARGS.tactile_entry_fraction),
+        "tactile_min_fingers": int(ARGS.min_tactile_fingers),
         "seed": int(ARGS.seed),
         "control_dt_s": float(inner.step_dt),
-        "entries": entries[: int(ARGS.entries)],
+        "entries": (
+            tactile_entries[: int(ARGS.entries)]
+            + fallback_entries[: max(0, int(ARGS.entries) - len(tactile_entries))]
+        )[: int(ARGS.entries)],
     }
     env.close()
-    if len(payload["entries"]) < int(ARGS.entries):
+    if len(payload["entries"]) < int(ARGS.entries) or len(tactile_entries) < required_tactile:
         raise CollectionFailure(
-            f"collected only {len(payload['entries'])}/{ARGS.entries} verified grasps"
+            "failed grasp-bank quota: "
+            f"total={len(payload['entries'])}/{ARGS.entries}, "
+            f"tactile={len(tactile_entries)}/{required_tactile}"
         )
     return validate_grasp_bank(payload, minimum_entries=int(ARGS.entries))
 
@@ -329,5 +493,8 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
+    except BaseException:
+        traceback.print_exc()
+        raise
     finally:
         APP.close()

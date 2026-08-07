@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<robot name="eraser_tactile_canonical">
+  <link name="object_root">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.11749286329668307 0.020506559201387168 0.051804802320477114"/></geometry>
+      <material name="eraser"><color rgba="0.2 0.65 0.55 1.0"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.11749286329668307 0.020506559201387168 0.051804802320477114"/></geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.06850195522570308"/>
+      <inertia ixx="1.772063672613072e-05" iyy="9.412345879191068e-05" izz="8.120388401139314e-05" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+</robot>
