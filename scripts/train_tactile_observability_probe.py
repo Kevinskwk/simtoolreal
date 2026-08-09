@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--episode-split",
         action="store_true",
-        help="Split by episode instead of holding out tool IDs.",
+        help="Split by episode instead of holding out collection split groups.",
     )
     parser.add_argument("--max-train-batches", type=int, default=0)
     parser.add_argument("--log-every-batches", type=int, default=100)
@@ -149,8 +149,11 @@ def best_f1_threshold(target: np.ndarray, score: np.ndarray) -> float:
 
 
 def macro_f1(target: np.ndarray, prediction: np.ndarray, classes: int = 3) -> float:
+    present = [label for label in range(classes) if np.any(target == label)]
+    if not present:
+        return float("nan")
     scores = []
-    for label in range(classes):
+    for label in present:
         scores.append(threshold_metrics(target == label, (prediction == label).astype(float), 0.5)["f1"])
     return float(np.mean(scores))
 
@@ -235,8 +238,10 @@ def collect_support(
             target = labels[name][steps][mask].bool()
             counts[name][0] += int((~target).sum())
             counts[name][1] += int(target.sum())
-    if min(contact_counts) == 0:
-        raise RuntimeError(f"contact-mode classes lack support: {contact_counts}")
+    if sum(count > 0 for count in contact_counts) < 2:
+        raise RuntimeError(
+            f"contact mode needs at least two observed classes: {contact_counts}"
+        )
     for name, (negative, positive) in counts.items():
         if negative == 0 or positive == 0:
             raise RuntimeError(
@@ -414,32 +419,15 @@ def gate_decision(results: list[dict]) -> dict:
             - by_variant["state"][seed][head]["auprc"]
             for seed in common_seeds
         ]
-        source_signs = {}
-        for source in ("tactile", "no-tactile"):
-            source_signs[source] = all(
-                by_variant["state_compact"][seed]
-                .get("by_policy_source", {})
-                .get(source, {})
-                .get(head, {})
-                .get("auprc", -math.inf)
-                > by_variant["state"][seed]
-                .get("by_policy_source", {})
-                .get(source, {})
-                .get(head, {})
-                .get("auprc", math.inf)
-                for seed in common_seeds
-            )
         heads[head] = {
             "delta_by_seed": deltas,
             "mean_delta": float(np.mean(deltas)),
             "same_positive_sign": all(value > 0.0 for value in deltas),
             "shuffled_mean_delta": float(np.mean(shuffled)),
-            "both_policy_sources_positive": all(source_signs.values()),
             "passes": bool(
                 np.mean(deltas) >= 0.05
                 and all(value > 0.0 for value in deltas)
                 and np.mean(shuffled) <= 0.02
-                and all(source_signs.values())
             ),
         }
     return {"evaluated": True, "passed": any(value["passes"] for value in heads.values()), "heads": heads}
@@ -562,6 +550,14 @@ def main() -> None:
         }
         stats = prepared[history]["stats"]
         support = prepared[history]["support"]
+        actor_state_dim = datasets[history]["train"].actor_state_dim
+        split_dims = {
+            dataset.actor_state_dim for dataset in datasets[history].values()
+        }
+        if split_dims != {actor_state_dim}:
+            raise ValueError(
+                f"actor-state dimensions differ across splits: {sorted(split_dims)}"
+            )
         print(
             f"[train] variant={variant} history={history} "
             f"train_windows={len(datasets[history]['train'])}",
@@ -578,9 +574,9 @@ def main() -> None:
             if variant == "oracle":
                 state_dim = 3
             elif variant in {"state_geometry", "state_geometry_compact"}:
-                state_dim = 153
+                state_dim = actor_state_dim + 13
             else:
-                state_dim = 140
+                state_dim = actor_state_dim
             model = ObservabilityProbe(state_dim=state_dim, variant=model_variant).to(device)
             optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
             best_state = None

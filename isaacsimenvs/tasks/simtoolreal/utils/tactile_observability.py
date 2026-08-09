@@ -41,8 +41,10 @@ class LabelConfig:
     slip_rotation_speed_radps: float = 1.0
     slip_persistence_steps: int = 2
     instability_horizon_steps: int = 15
-    instability_translation_m: float = 0.03
-    loss_translation_m: float = 0.06
+    instability_translation_m: float = 0.01
+    instability_rotation_deg: float = 10.0
+    loss_translation_m: float = 0.015
+    loss_rotation_deg: float = 15.0
 
 
 def _require_tensor(episode: dict, key: str) -> torch.Tensor:
@@ -61,7 +63,6 @@ def validate_episode(episode: dict) -> int:
     if length <= 0:
         raise ValueError("episode must contain at least one frame")
     expected_shapes = {
-        "actor_state": (length, 140),
         "deployable_geometry": (length, 13),
         "oracle_geometry": (length, 3),
         "tactile_compact": (length, 5, 5),
@@ -73,6 +74,13 @@ def validate_episode(episode: dict) -> int:
         "fingertip_count": (length,),
         "object_fallen": (length,),
     }
+    actor_state = _require_tensor(episode, "actor_state")
+    if actor_state.ndim != 2 or actor_state.shape[0] != length or actor_state.shape[1] <= 0:
+        raise ValueError(
+            "episode['actor_state'] must have shape (length, positive state dimension)"
+        )
+    if not torch.isfinite(actor_state).all():
+        raise ValueError("episode['actor_state'] contains NaN or Inf")
     for key, shape in expected_shapes.items():
         value = _require_tensor(episode, key)
         if tuple(value.shape) != shape:
@@ -185,12 +193,16 @@ def derive_labels(episode: dict, cfg: LabelConfig = LabelConfig()) -> dict[str, 
     # Mark the current frame once at least N of the latest N frames indicate motion.
     slip = _persistent_end(slip_candidate, cfg.slip_persistence_steps)
 
-    unstable_now = translation_drift >= cfg.instability_translation_m
+    unstable_now = (
+        (translation_drift >= cfg.instability_translation_m)
+        | (rotation_drift_deg >= cfg.instability_rotation_deg)
+    )
     instability, instability_eligible = _future_any(
         unstable_now, cfg.instability_horizon_steps
     )
     hard_loss = (
         (translation_drift >= cfg.loss_translation_m)
+        | (rotation_drift_deg >= cfg.loss_rotation_deg)
         | episode["object_fallen"].bool()
         | _persistent_end(
             episode["fingertip_count"].long() < 2,
@@ -224,10 +236,16 @@ def stable_bucket(value: str, seed: int, buckets: int = 10_000) -> int:
 
 
 def assign_split(metadata: dict, seed: int = 0, holdout_tools: bool = True) -> str:
-    """Assign a stable episode split without frame-level leakage."""
+    """Assign a stable grouped episode split without frame-level leakage."""
     episode_id = str(metadata["episode_id"])
     tool_id = str(metadata.get("tool_id", "unknown"))
-    key = tool_id if holdout_tools and tool_id != "unknown" else episode_id
+    split_group = str(metadata.get("split_group", "unknown"))
+    if holdout_tools and split_group != "unknown":
+        key = split_group
+    elif holdout_tools and tool_id != "unknown":
+        key = tool_id
+    else:
+        key = episode_id
     bucket = stable_bucket(key, seed)
     if bucket < 7000:
         return "train"
@@ -255,7 +273,7 @@ class EpisodeShardCache:
         return value
 
 
-CATALOG_CACHE_VERSION = 1
+CATALOG_CACHE_VERSION = 2
 
 
 def _catalog_fingerprint(
@@ -444,6 +462,15 @@ class EpisodeWindowDataset(Dataset):
             self.cumulative_windows.append(total)
         if total == 0:
             raise ValueError(f"no windows found for split {split!r}")
+        dimensions = {
+            int(self.catalog.episode(record)["actor_state"].shape[1])
+            for record in self.records
+        }
+        if len(dimensions) != 1:
+            raise ValueError(
+                f"split {split!r} mixes actor-state dimensions: {sorted(dimensions)}"
+            )
+        self.actor_state_dim = dimensions.pop()
 
     def __len__(self) -> int:
         return self.cumulative_windows[-1]

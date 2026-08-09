@@ -94,6 +94,7 @@ def test_probe_shapes_for_all_input_encoders():
 
 def test_window_dataset_preserves_temporal_order(tmp_path):
     episode = make_episode()
+    episode["actor_state"] = torch.zeros(episode["actor_state"].shape[0], 146)
     episode["actor_state"][:, 0] = torch.arange(episode["actor_state"].shape[0])
     # Ensure this tool hashes into a train split without weakening production splitting.
     index = 0
@@ -104,8 +105,9 @@ def test_window_dataset_preserves_temporal_order(tmp_path):
     torch.save({"schema_version": 1, "episodes": [episode]}, shard)
     dataset = utils.EpisodeWindowDataset([shard], "train", history=5)
     sample = dataset[0]
-    assert sample["state"].shape == (5, 140)
-    assert sample["state_geometry"].shape == (5, 153)
+    assert dataset.actor_state_dim == 146
+    assert sample["state"].shape == (5, 146)
+    assert sample["state_geometry"].shape == (5, 159)
     assert torch.equal(sample["state"][:, 0], torch.arange(5).float())
     assert sample["compact"].shape == (5, 5, 5)
     assert sample["raw"].shape == (5, 5, 12, 12)
@@ -117,6 +119,17 @@ def test_hard_loss_uses_persistent_fingertip_loss():
     labels = utils.derive_labels(episode)
     assert not labels["hard_loss"][20]
     assert labels["hard_loss"][34]
+
+
+def test_rotation_drift_contributes_to_instability_and_hard_loss():
+    episode = make_episode()
+    episode["palm_tool_pos"].zero_()
+    half_angle = torch.deg2rad(torch.tensor(16.0)) / 2.0
+    episode["palm_tool_quat"][24:, 0] = torch.cos(half_angle)
+    episode["palm_tool_quat"][24:, 1] = torch.sin(half_angle)
+    labels = utils.derive_labels(episode)
+    assert labels["instability"][:24].any()
+    assert labels["hard_loss"][24]
 
 
 def test_catalog_cache_skips_label_recomputation(tmp_path, monkeypatch):
@@ -146,3 +159,22 @@ def test_catalog_cache_skips_label_recomputation(tmp_path, monkeypatch):
         [shard], "train", history=5, catalog=cached
     )
     assert dataset[0]["state"].shape == (5, 140)
+
+
+def test_split_group_overrides_single_tool_identity():
+    metadata = {
+        "episode_id": "episode-0",
+        "tool_id": "eraser",
+        "split_group": "grasp-bank-7",
+    }
+    expected = utils.assign_split(metadata, seed=3)
+    metadata["episode_id"] = "episode-1"
+    assert utils.assign_split(metadata, seed=3) == expected
+
+    changed = False
+    for index in range(8, 100):
+        metadata["split_group"] = f"grasp-bank-{index}"
+        if utils.assign_split(metadata, seed=3) != expected:
+            changed = True
+            break
+    assert changed
