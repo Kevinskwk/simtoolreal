@@ -60,6 +60,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("data_roots", nargs="+", type=Path)
     parser.add_argument("--output-root", type=Path, default=REPO_ROOT / "outputs/tactile_observability/probes")
+    parser.add_argument(
+        "--resume-dir",
+        type=Path,
+        default=None,
+        help="Reuse completed variant/seed results in an interrupted output directory.",
+    )
     parser.add_argument("--cache-dir", type=Path, default=REPO_ROOT / "outputs/tactile_observability/cache")
     parser.add_argument("--rebuild-cache", action="store_true")
     parser.add_argument("--build-cache-only", action="store_true")
@@ -81,6 +87,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-train-batches", type=int, default=0)
     parser.add_argument("--log-every-batches", type=int, default=100)
+    parser.add_argument("--bootstrap-repetitions", type=int, default=100)
+    parser.add_argument("--bootstrap-score-bins", type=int, default=256)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -294,25 +302,59 @@ def predict(model, loader, stats, device, variant) -> dict[str, np.ndarray]:
     return {key: np.concatenate(items) for key, items in values.items()}
 
 
-def bootstrap_primary_auprc(values: dict[str, np.ndarray], repetitions: int = 300) -> list[float]:
+def bootstrap_primary_auprc(
+    values: dict[str, np.ndarray],
+    repetitions: int = 100,
+    score_bins: int = 256,
+) -> list[float]:
+    """Episode-cluster bootstrap using per-episode score histograms.
+
+    Sorting every resampled test window made the previous implementation scale
+    quadratically in episodes and windows. Histograms preserve clustered
+    resampling while bounding each replicate by ``score_bins`` ranked groups.
+    """
+    if repetitions <= 0:
+        return [float("nan"), float("nan")]
+    if score_bins < 16:
+        raise ValueError("bootstrap score bins must be at least 16")
     episode_ids = np.unique(values["contact_mode_episode_id"])
     if episode_ids.size < 2:
         return [float("nan"), float("nan")]
     rng = np.random.default_rng(0)
-    scores = []
-    for _ in range(repetitions):
-        sampled = rng.choice(episode_ids, size=episode_ids.size, replace=True)
-        head_scores = []
-        for name in PRIMARY_HEADS:
-            ids = values[f"{name}_episode_id"]
-            indices = np.concatenate([np.flatnonzero(ids == episode_id) for episode_id in sampled])
-            head_scores.append(
-                binary_average_precision(
-                    values[f"{name}_target"][indices],
-                    values[f"{name}_score"][indices],
-                )
-            )
-        scores.append(float(np.nanmean(head_scores)))
+    episode_lookup = {episode_id: index for index, episode_id in enumerate(episode_ids)}
+    sampled_counts = rng.multinomial(
+        episode_ids.size,
+        np.full(episode_ids.size, 1.0 / episode_ids.size),
+        size=repetitions,
+    ).astype(np.float32)
+    replicate_heads = []
+    for name in PRIMARY_HEADS:
+        target = values[f"{name}_target"].astype(bool)
+        score = np.clip(values[f"{name}_score"], 0.0, 1.0)
+        ids = values[f"{name}_episode_id"]
+        episode_index = np.fromiter(
+            (episode_lookup[item] for item in ids), dtype=np.int64, count=ids.size
+        )
+        bin_index = np.minimum(
+            (score * score_bins).astype(np.int64), score_bins - 1
+        )
+        positive = np.zeros((episode_ids.size, score_bins), dtype=np.float32)
+        negative = np.zeros_like(positive)
+        np.add.at(positive, (episode_index[target], bin_index[target]), 1.0)
+        np.add.at(negative, (episode_index[~target], bin_index[~target]), 1.0)
+
+        positive = (sampled_counts @ positive)[:, ::-1]
+        negative = (sampled_counts @ negative)[:, ::-1]
+        cumulative_positive = np.cumsum(positive, axis=1)
+        cumulative_total = np.cumsum(positive + negative, axis=1)
+        precision = cumulative_positive / np.maximum(cumulative_total, 1.0)
+        total_positive = positive.sum(axis=1)
+        average_precision = (
+            (precision * positive).sum(axis=1) / np.maximum(total_positive, 1.0)
+        )
+        average_precision[total_positive == 0] = np.nan
+        replicate_heads.append(average_precision)
+    scores = np.nanmean(np.stack(replicate_heads, axis=1), axis=1)
     return np.nanquantile(scores, [0.025, 0.975]).tolist()
 
 
@@ -339,6 +381,8 @@ def evaluate_predictions(
     thresholds: dict[str, float] | None = None,
     include_groups: bool = True,
     include_bootstrap: bool = True,
+    bootstrap_repetitions: int = 100,
+    bootstrap_score_bins: int = 256,
 ) -> tuple[dict, dict]:
     thresholds = dict(thresholds or {})
     result = {}
@@ -378,7 +422,13 @@ def evaluate_predictions(
     }
     result["primary_macro_auprc"] = float(np.nanmean([result[name]["auprc"] for name in PRIMARY_HEADS]))
     result["primary_macro_auprc_ci95"] = (
-        bootstrap_primary_auprc(values) if include_bootstrap else None
+        bootstrap_primary_auprc(
+            values,
+            repetitions=bootstrap_repetitions,
+            score_bins=bootstrap_score_bins,
+        )
+        if include_bootstrap
+        else None
     )
     if include_groups:
         result["by_policy_source"] = {}
@@ -493,9 +543,18 @@ def main() -> None:
     args = parse_args()
     if args.history <= 0 or args.batch_size <= 0 or args.epochs <= 0:
         raise ValueError("history, batch size, and epochs must be positive")
+    if args.bootstrap_repetitions <= 0 or args.bootstrap_score_bins < 16:
+        raise ValueError(
+            "bootstrap repetitions must be positive and score bins at least 16"
+        )
     shards = discover_shards(args.data_roots)
-    run_dir = args.output_root / datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir.mkdir(parents=True, exist_ok=False)
+    if args.resume_dir is None:
+        run_dir = args.output_root / datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir.mkdir(parents=True, exist_ok=False)
+    else:
+        run_dir = args.resume_dir.resolve()
+        if not run_dir.is_dir():
+            raise FileNotFoundError(f"resume directory does not exist: {run_dir}")
     device = torch.device(args.device)
     print(
         f"[setup] {len(shards)} shards, device={device}, output={run_dir}",
@@ -570,6 +629,19 @@ def main() -> None:
             "state_geometry_compact": "state_compact",
         }.get(variant, variant)
         for seed in args.seeds:
+            result_path = run_dir / f"{variant}_seed{seed}.json"
+            checkpoint_path = run_dir / f"{variant}_seed{seed}.pt"
+            if result_path.exists() and not checkpoint_path.exists():
+                raise RuntimeError(
+                    f"saved metrics have no model checkpoint: {result_path}"
+                )
+            if result_path.exists():
+                result = json.loads(result_path.read_text())
+                if result.get("variant") != variant or int(result.get("seed", -1)) != seed:
+                    raise RuntimeError(f"saved result identity mismatch: {result_path}")
+                all_results.append(result)
+                print(f"[resume] reusing {variant} seed={seed}", flush=True)
+                continue
             seed_everything(seed)
             if variant == "oracle":
                 state_dim = 3
@@ -578,76 +650,112 @@ def main() -> None:
             else:
                 state_dim = actor_state_dim
             model = ObservabilityProbe(state_dim=state_dim, variant=model_variant).to(device)
-            optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-            best_state = None
-            best_score = -float("inf")
-            stale = 0
-            history_rows = []
-            for epoch in range(args.epochs):
-                model.train()
-                total_loss = 0.0
-                batches = 0
-                for batch_index, raw_batch in enumerate(loaders["train"]):
-                    batch = normalize_batch(raw_batch, stats, device, variant)
-                    if variant == "state_compact_shuffled" and batch["compact"].shape[0] > 1:
-                        batch["compact"] = batch["compact"][torch.randperm(batch["compact"].shape[0], device=device)]
-                    output = model(batch["state"], batch["compact"], batch["raw"])
-                    loss = loss_for_batch(output, batch, support)
-                    if not torch.isfinite(loss):
-                        raise RuntimeError(f"non-finite loss for {variant}, seed {seed}")
-                    optimizer.zero_grad(set_to_none=True)
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-                    optimizer.step()
-                    total_loss += float(loss.item())
-                    batches += 1
-                    if (
-                        args.log_every_batches > 0
-                        and batches % args.log_every_batches == 0
-                    ):
-                        print(
-                            f"[{variant} seed={seed}] epoch={epoch + 1} "
-                            f"batch={batches}/{len(loaders['train'])} "
-                            f"loss={total_loss / batches:.4f}",
-                            flush=True,
-                        )
-                    if args.max_train_batches and batch_index + 1 >= args.max_train_batches:
-                        break
-                validation_values = predict(model, loaders["validation"], stats, device, variant)
-                validation, _ = evaluate_predictions(
-                    validation_values,
-                    include_groups=False,
-                    include_bootstrap=False,
-                )
-                score = validation["primary_macro_auprc"]
-                history_rows.append(
-                    {
-                        "epoch": epoch + 1,
-                        "train_loss": total_loss / max(batches, 1),
-                        "validation_macro_auprc": score,
-                    }
-                )
+            if checkpoint_path.exists():
+                saved = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+                if saved.get("variant") != variant or int(saved.get("state_dim", -1)) != state_dim:
+                    raise RuntimeError(f"saved checkpoint identity mismatch: {checkpoint_path}")
+                best_state = saved.get("model")
+                history_rows = saved.get("history", [])
+                if not isinstance(best_state, dict):
+                    raise RuntimeError(f"saved checkpoint has no model: {checkpoint_path}")
                 print(
-                    f"[{variant} seed={seed}] epoch={epoch + 1} "
-                    f"loss={history_rows[-1]['train_loss']:.4f} "
-                    f"val_AUPRC={score:.4f}",
+                    f"[resume] evaluating trained checkpoint {variant} seed={seed}",
                     flush=True,
                 )
-                if score > best_score:
-                    best_score = score
-                    best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
-                    stale = 0
-                else:
-                    stale += 1
-                    if stale >= args.patience:
-                        break
-            if best_state is None:
-                raise RuntimeError("training produced no valid checkpoint")
+            else:
+                optimizer = torch.optim.AdamW(
+                    model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+                )
+                best_state = None
+                best_score = -float("inf")
+                stale = 0
+                history_rows = []
+                for epoch in range(args.epochs):
+                    model.train()
+                    total_loss = 0.0
+                    batches = 0
+                    for batch_index, raw_batch in enumerate(loaders["train"]):
+                        batch = normalize_batch(raw_batch, stats, device, variant)
+                        if variant == "state_compact_shuffled" and batch["compact"].shape[0] > 1:
+                            batch["compact"] = batch["compact"][torch.randperm(batch["compact"].shape[0], device=device)]
+                        output = model(batch["state"], batch["compact"], batch["raw"])
+                        loss = loss_for_batch(output, batch, support)
+                        if not torch.isfinite(loss):
+                            raise RuntimeError(f"non-finite loss for {variant}, seed {seed}")
+                        optimizer.zero_grad(set_to_none=True)
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                        optimizer.step()
+                        total_loss += float(loss.item())
+                        batches += 1
+                        if (
+                            args.log_every_batches > 0
+                            and batches % args.log_every_batches == 0
+                        ):
+                            print(
+                                f"[{variant} seed={seed}] epoch={epoch + 1} "
+                                f"batch={batches}/{len(loaders['train'])} "
+                                f"loss={total_loss / batches:.4f}",
+                                flush=True,
+                            )
+                        if args.max_train_batches and batch_index + 1 >= args.max_train_batches:
+                            break
+                    validation_values = predict(model, loaders["validation"], stats, device, variant)
+                    validation, _ = evaluate_predictions(
+                        validation_values,
+                        include_groups=False,
+                        include_bootstrap=False,
+                    )
+                    score = validation["primary_macro_auprc"]
+                    history_rows.append(
+                        {
+                            "epoch": epoch + 1,
+                            "train_loss": total_loss / max(batches, 1),
+                            "validation_macro_auprc": score,
+                        }
+                    )
+                    print(
+                        f"[{variant} seed={seed}] epoch={epoch + 1} "
+                        f"loss={history_rows[-1]['train_loss']:.4f} "
+                        f"val_AUPRC={score:.4f}",
+                        flush=True,
+                    )
+                    if score > best_score:
+                        best_score = score
+                        best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+                        stale = 0
+                    else:
+                        stale += 1
+                        if stale >= args.patience:
+                            break
+                if best_state is None:
+                    raise RuntimeError("training produced no valid checkpoint")
+                torch.save(
+                    {
+                        "model": best_state,
+                        "normalization": stats,
+                        "thresholds": None,
+                        "variant": variant,
+                        "state_dim": state_dim,
+                        "history": history_rows,
+                        "status": "trained",
+                    },
+                    checkpoint_path,
+                )
             model.load_state_dict(best_state)
             validation_values = predict(model, loaders["validation"], stats, device, variant)
-            validation, thresholds = evaluate_predictions(validation_values)
+            validation, thresholds = evaluate_predictions(
+                validation_values,
+                bootstrap_repetitions=args.bootstrap_repetitions,
+                bootstrap_score_bins=args.bootstrap_score_bins,
+            )
             test_values = predict(model, loaders["test"], stats, device, variant)
-            test, _ = evaluate_predictions(test_values, thresholds)
+            test, _ = evaluate_predictions(
+                test_values,
+                thresholds,
+                bootstrap_repetitions=args.bootstrap_repetitions,
+                bootstrap_score_bins=args.bootstrap_score_bins,
+            )
             result = {
                 "variant": variant,
                 "seed": seed,
@@ -663,10 +771,12 @@ def main() -> None:
                     "thresholds": thresholds,
                     "variant": variant,
                     "state_dim": state_dim,
+                    "history": history_rows,
+                    "status": "complete",
                 },
-                run_dir / f"{variant}_seed{seed}.pt",
+                checkpoint_path,
             )
-            (run_dir / f"{variant}_seed{seed}.json").write_text(json.dumps(finite_json(result), indent=2) + "\n")
+            result_path.write_text(json.dumps(finite_json(result), indent=2) + "\n")
     summary = {
         "args": vars(args)
         | {
