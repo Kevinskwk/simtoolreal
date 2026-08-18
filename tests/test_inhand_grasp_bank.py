@@ -1,4 +1,5 @@
 from pathlib import Path
+import copy
 import importlib.util
 
 import pytest
@@ -49,6 +50,7 @@ def valid_bank():
     return {
         "schema_version": 2,
         "tool_type": "eraser",
+        "object_name": "eraser_canonical",
         "asset_sha256": "a" * 64,
         "source_checkpoint_sha256": "b" * 64,
         "policy_coefficient_id": 0.0,
@@ -63,6 +65,74 @@ def test_grasp_bank_requires_verified_compliant_grasp():
     payload = valid_bank()
     payload["entries"][0]["verification"]["support_count"] = 1
     with pytest.raises(ValueError, match="support"):
+        utils.validate_grasp_bank(payload)
+
+
+@pytest.mark.parametrize("tool_type", sorted(utils.SUPPORTED_TOOL_TYPES))
+def test_grasp_bank_accepts_all_supported_tool_categories(tool_type):
+    payload = valid_bank()
+    payload["tool_type"] = tool_type
+    payload["object_name"] = f"test_{tool_type}"
+    assert utils.validate_grasp_bank(payload)["tool_type"] == tool_type
+
+
+def test_grasp_bank_requires_object_name_for_new_non_eraser_banks():
+    payload = valid_bank()
+    payload["tool_type"] = "hammer"
+    payload.pop("object_name")
+    with pytest.raises(ValueError, match="object_name"):
+        utils.validate_grasp_bank(payload)
+
+
+def test_legacy_canonical_eraser_bank_without_object_name_is_accepted():
+    payload = valid_bank()
+    payload.pop("object_name")
+    assert utils.validate_grasp_bank(payload)["tool_type"] == "eraser"
+
+
+def test_merge_grasp_banks_combines_seeds_and_removes_exact_duplicates():
+    first = valid_bank()
+    first["seed"] = 1
+    second = copy.deepcopy(first)
+    second["seed"] = 2
+    second["entries"][0]["object_pos_local"][0] = 0.1
+    duplicate = copy.deepcopy(first)
+
+    merged = utils.merge_grasp_banks([first, second, duplicate])
+
+    assert len(merged["entries"]) == 2
+    assert merged["seeds"] == [1, 2]
+    assert merged["merged_bank_count"] == 3
+    assert merged["duplicates_removed"] == 1
+
+
+def test_merge_grasp_banks_rejects_incompatible_assets():
+    first = valid_bank()
+    second = copy.deepcopy(first)
+    second["asset_sha256"] = "c" * 64
+    with pytest.raises(ValueError, match="asset_sha256"):
+        utils.merge_grasp_banks([first, second])
+
+
+def test_grasp_bank_enforces_embedded_joint_limits_and_hold_verification():
+    payload = valid_bank()
+    payload["joint_lower_canonical"] = [-2.0] * 29
+    payload["joint_upper_canonical"] = [2.0] * 29
+    payload["joint_limit_tolerance_rad"] = 5.0e-4
+    payload["entries"][0]["verification"][
+        "joint_limit_violation_max_rad"
+    ] = 0.0
+    utils.validate_grasp_bank(payload)
+
+    payload["entries"][0]["joint_pos_canonical"][22] = -2.01
+    with pytest.raises(ValueError, match="canonical joint limits"):
+        utils.validate_grasp_bank(payload)
+
+
+def test_grasp_bank_rejects_incomplete_joint_limit_metadata():
+    payload = valid_bank()
+    payload["joint_lower_canonical"] = [-2.0] * 29
+    with pytest.raises(ValueError, match="metadata is incomplete"):
         utils.validate_grasp_bank(payload)
 
 

@@ -45,11 +45,22 @@ from isaacsimenvs.tasks.simtoolreal.simtoolreal_tacmap_env_cfg import (  # noqa:
     SimToolRealInHandStableScrapeEnvCfg,
 )
 from isaacsimenvs.tasks.simtoolreal.utils.inhand_grasp_bank import (  # noqa: E402
+    sha256_file,
     validate_grasp_bank,
 )
+from dextoolbench.objects import NAME_TO_OBJECT  # noqa: E402
 
 
 TASK_ID = "Isaacsimenvs-SimToolReal-Stable-Scrape-InHand-Direct-v0"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+OBJECT_TO_CATEGORY = {
+    "mallet_hammer": "hammer", "claw_hammer": "hammer",
+    "long_screwdriver": "screwdriver", "short_screwdriver": "screwdriver",
+    "handle_eraser": "eraser", "flat_eraser": "eraser",
+    "flat_spatula": "spatula", "spoon_spatula": "spatula",
+    "sharpie_marker": "marker", "staples_marker": "marker",
+    "red_brush": "brush", "blue_brush": "brush",
+}
 
 
 def validate_args() -> None:
@@ -85,8 +96,46 @@ def hold_action(inner) -> torch.Tensor:
 
 def run() -> None:
     validate_args()
+    if not ARGS.grasp_bank.is_file():
+        raise FileNotFoundError(f"grasp bank does not exist: {ARGS.grasp_bank}")
+    payload = validate_grasp_bank(json.loads(ARGS.grasp_bank.read_text()))
+    object_name = payload.get("object_name", "eraser_canonical")
+    if object_name == "eraser_canonical":
+        object_urdf = REPO_ROOT / "assets/urdf/objects/eraser_tactile_canonical.urdf"
+        object_scale = (2.9373215824170767, 0.5126639800346792, 1.2951200580119278)
+    else:
+        if object_name not in NAME_TO_OBJECT:
+            raise ValueError(f"unknown DexToolBench object_name {object_name!r}")
+        expected_category = OBJECT_TO_CATEGORY[object_name]
+        if payload["tool_type"] != expected_category:
+            raise ValueError(
+                f"bank tool_type {payload['tool_type']!r} does not match "
+                f"{object_name!r} category {expected_category!r}"
+            )
+        tool = NAME_TO_OBJECT[object_name]
+        object_urdf = tool.decomposed_urdf_path
+        object_scale = tool.scale
+    if sha256_file(object_urdf) != payload["asset_sha256"]:
+        raise RuntimeError(f"bank asset hash does not match {object_urdf}")
+    checkpoint = Path(payload.get("source_checkpoint", ""))
+    if not checkpoint.is_file():
+        raise FileNotFoundError(
+            f"bank source checkpoint is unavailable: {checkpoint}"
+        )
+    if sha256_file(checkpoint) != payload["source_checkpoint_sha256"]:
+        raise RuntimeError(f"bank checkpoint hash does not match {checkpoint}")
+
     cfg = SimToolRealInHandStableScrapeEnvCfg()
     cfg.grasp_bank_path = str(ARGS.grasp_bank.resolve())
+    cfg.grasp_bank_source_checkpoint_path = str(checkpoint.resolve())
+    cfg.grasp_bank_min_entries = 1
+    cfg.assets.handle_head_types = (payload["tool_type"],)
+    cfg.assets.object_urdf = str(object_urdf)
+    cfg.assets.object_scale = tuple(float(value) for value in object_scale)
+    object_root_name = "object_root" if object_name == "eraser_canonical" else object_name
+    cfg.tool_table_contact_sensor_prim_path = (
+        f"/World/envs/env_.*/Object/{object_root_name}"
+    )
     cfg.scene.num_envs = min(int(ARGS.num_envs), int(ARGS.resets))
     env = gym.make(TASK_ID, cfg=cfg)
     inner = env.unwrapped
@@ -111,10 +160,17 @@ def run() -> None:
         env.reset()
         active_count = min(inner.num_envs, ARGS.resets - attempted)
         active = torch.arange(active_count, device=inner.device)
-        # Rotate candidates through different cloned environment slots. A fixed
-        # entry-to-slot assignment can hide replay failures tied to per-env state.
+        # Cover every bank entry before repeating any. On later passes, rotate
+        # the entry-to-slot assignment so cloned-environment artifacts cannot be
+        # hidden by one fixed pairing.
+        sample_ids = torch.arange(
+            attempted, attempted + active_count, device=inner.device
+        )
+        replay_cycle = torch.div(
+            sample_ids, inner._inhand_bank_size, rounding_mode="floor"
+        )
         bank_ids = (
-            torch.arange(active_count, device=inner.device) + 37 * batch_index
+            sample_ids % inner._inhand_bank_size + 37 * replay_cycle
         ) % inner._inhand_bank_size
         inner._restore_inhand_state(active, bank_ids)
         reference_pos = inner._stable_relative_pos.clone()

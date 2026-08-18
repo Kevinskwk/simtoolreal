@@ -12,6 +12,9 @@ import torch
 
 SCHEMA_VERSION = 2
 JOINT_COUNT = 29
+SUPPORTED_TOOL_TYPES = frozenset(
+    ("hammer", "screwdriver", "eraser", "spatula", "marker", "brush")
+)
 
 
 def sha256_file(path: str | Path) -> str:
@@ -42,8 +45,20 @@ def validate_grasp_bank(payload: dict, *, minimum_entries: int = 1) -> dict:
             f"unsupported grasp-bank schema {payload.get('schema_version')!r}; "
             f"expected {SCHEMA_VERSION}"
         )
-    if payload.get("tool_type") != "eraser":
-        raise ValueError("V2 in-hand grasp bank must use tool_type='eraser'")
+    tool_type = payload.get("tool_type")
+    if tool_type not in SUPPORTED_TOOL_TYPES:
+        raise ValueError(
+            "V2 in-hand grasp bank tool_type must be one of "
+            f"{sorted(SUPPORTED_TOOL_TYPES)}, got {tool_type!r}"
+        )
+    object_name = payload.get("object_name")
+    # Banks created before multi-tool collection did not carry object_name.
+    if object_name is None and tool_type != "eraser":
+        raise ValueError("non-eraser grasp banks must specify object_name")
+    if object_name is not None and (
+        not isinstance(object_name, str) or not object_name.strip()
+    ):
+        raise ValueError("grasp bank object_name must be a non-empty string")
     for name in ("asset_sha256", "source_checkpoint_sha256"):
         value = payload.get(name)
         if (
@@ -66,6 +81,38 @@ def validate_grasp_bank(payload: dict, *, minimum_entries: int = 1) -> dict:
             f"grasp bank requires at least {minimum_entries} entries, got "
             f"{len(entries) if isinstance(entries, list) else 'invalid'}"
         )
+    has_joint_limits = any(
+        name in payload
+        for name in (
+            "joint_lower_canonical",
+            "joint_upper_canonical",
+            "joint_limit_tolerance_rad",
+        )
+    )
+    joint_lower = joint_upper = None
+    joint_limit_tolerance = None
+    if has_joint_limits:
+        if not all(
+            name in payload
+            for name in (
+                "joint_lower_canonical",
+                "joint_upper_canonical",
+                "joint_limit_tolerance_rad",
+            )
+        ):
+            raise ValueError("grasp bank joint-limit metadata is incomplete")
+        joint_lower = torch.tensor(
+            _finite_vector(payload, "joint_lower_canonical", JOINT_COUNT)
+        )
+        joint_upper = torch.tensor(
+            _finite_vector(payload, "joint_upper_canonical", JOINT_COUNT)
+        )
+        if bool((joint_upper <= joint_lower).any()):
+            raise ValueError("grasp bank canonical joint limits are not ordered")
+        joint_limit_tolerance = float(payload["joint_limit_tolerance_rad"])
+        if not math.isfinite(joint_limit_tolerance) or not 0.0 <= joint_limit_tolerance <= 0.01:
+            raise ValueError("grasp bank joint_limit_tolerance_rad must be in [0, 0.01]")
+
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             raise ValueError(f"grasp entry {index} must be an object")
@@ -121,6 +168,29 @@ def validate_grasp_bank(payload: dict, *, minimum_entries: int = 1) -> dict:
             raise ValueError(f"grasp entry {index} did not track its edge-contact orientation")
         if float(metrics.get("table_force_n", float("inf"))) >= 0.1:
             raise ValueError(f"grasp entry {index} was touching the table")
+        if has_joint_limits:
+            joint_pos = torch.tensor(entry["joint_pos_canonical"])
+            violation = torch.maximum(
+                (joint_lower - joint_pos).clamp_min(0.0),
+                (joint_pos - joint_upper).clamp_min(0.0),
+            ).max()
+            if float(violation.item()) > joint_limit_tolerance:
+                raise ValueError(
+                    f"grasp entry {index} exceeds canonical joint limits: "
+                    f"violation={float(violation.item()):.7f}, "
+                    f"tolerance={joint_limit_tolerance:.7f}"
+                )
+            recorded_violation = float(
+                metrics.get("joint_limit_violation_max_rad", float("nan"))
+            )
+            if (
+                not math.isfinite(recorded_violation)
+                or recorded_violation < 0.0
+                or recorded_violation > joint_limit_tolerance
+            ):
+                raise ValueError(
+                    f"grasp entry {index} has invalid hold-window joint-limit verification"
+                )
         yaw = float(entry.get("reference_edge_yaw_rad", float("nan")))
         tilt = float(entry.get("reference_edge_tilt_rad", float("nan")))
         if not math.isfinite(yaw) or not math.isfinite(tilt):
@@ -151,6 +221,56 @@ def load_grasp_bank(path: str | Path, *, minimum_entries: int = 1) -> dict:
     with path.open() as stream:
         payload = json.load(stream)
     return validate_grasp_bank(payload, minimum_entries=minimum_entries)
+
+
+def merge_grasp_banks(payloads: list[dict]) -> dict:
+    """Merge compatible banks while removing byte-identical grasp entries."""
+    if not payloads:
+        raise ValueError("at least one grasp bank is required for merging")
+    validated = [validate_grasp_bank(payload) for payload in payloads]
+    reference = validated[0]
+    identity_fields = (
+        "schema_version",
+        "tool_type",
+        "object_name",
+        "asset_sha256",
+        "source_checkpoint_sha256",
+        "policy_coefficient_id",
+        "tactile_rich_fraction_min",
+        "tactile_min_fingers",
+        "control_dt_s",
+        "joint_lower_canonical",
+        "joint_upper_canonical",
+        "joint_limit_tolerance_rad",
+    )
+    for bank_index, payload in enumerate(validated[1:], start=1):
+        for field in identity_fields:
+            if payload.get(field) != reference.get(field):
+                raise ValueError(
+                    f"grasp bank {bank_index} has incompatible {field}: "
+                    f"{payload.get(field)!r} != {reference.get(field)!r}"
+                )
+
+    merged = dict(reference)
+    entries: list[dict] = []
+    fingerprints: set[str] = set()
+    duplicate_count = 0
+    seeds: list[int] = []
+    for payload in validated:
+        if "seed" in payload:
+            seeds.append(int(payload["seed"]))
+        for entry in payload["entries"]:
+            fingerprint = json.dumps(entry, sort_keys=True, separators=(",", ":"))
+            if fingerprint in fingerprints:
+                duplicate_count += 1
+                continue
+            fingerprints.add(fingerprint)
+            entries.append(entry)
+    merged["entries"] = entries
+    merged["seeds"] = sorted(set(seeds))
+    merged["merged_bank_count"] = len(validated)
+    merged["duplicates_removed"] = duplicate_count
+    return validate_grasp_bank(merged)
 
 
 def collision_box_corners(bounds: torch.Tensor) -> torch.Tensor:

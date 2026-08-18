@@ -7,6 +7,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import torch
+import trimesh
 
 
 TABLE_HALF_HEIGHT: float = 0.15
@@ -80,7 +81,8 @@ def _matvec(mat: list[list[float]], vec: tuple[float, float, float]) -> tuple[fl
 
 
 def load_urdf_collision_bounds(path: str | Path) -> tuple[float, float, float, float, float, float]:
-    """Return local collision AABB bounds from generated box/cylinder URDFs."""
+    """Return local collision AABB bounds from primitive or mesh URDF geometry."""
+    path = Path(path)
     root = ET.parse(path).getroot()
     mins = [float("inf"), float("inf"), float("inf")]
     maxs = [float("-inf"), float("-inf"), float("-inf")]
@@ -99,6 +101,7 @@ def load_urdf_collision_bounds(path: str | Path) -> tuple[float, float, float, f
             continue
         box = geom.find("box")
         cyl = geom.find("cylinder")
+        mesh = geom.find("mesh")
         if box is not None:
             sx, sy, sz = (float(v) for v in box.get("size", "0 0 0").split())
             local_corners = [
@@ -124,6 +127,36 @@ def load_urdf_collision_bounds(path: str | Path) -> tuple[float, float, float, f
             for i in range(3):
                 mins[i] = min(mins[i], xyz[i] - extents[i])
                 maxs[i] = max(maxs[i], xyz[i] + extents[i])
+        elif mesh is not None:
+            filename = mesh.get("filename")
+            if not filename:
+                raise ValueError(f"collision mesh in {path} has no filename")
+            if filename.startswith("package://"):
+                raise ValueError(
+                    f"package:// collision mesh paths are unsupported in {path}: {filename}"
+                )
+            mesh_path = (path.parent / filename).resolve()
+            if not mesh_path.is_file():
+                raise FileNotFoundError(f"collision mesh does not exist: {mesh_path}")
+            loaded = trimesh.load(str(mesh_path), force="scene", process=False)
+            if not isinstance(loaded, trimesh.Scene) or not loaded.geometry:
+                raise ValueError(f"collision mesh has no geometry: {mesh_path}")
+            mesh_bounds = loaded.bounds
+            scale = tuple(float(v) for v in mesh.get("scale", "1 1 1").split())
+            if len(scale) != 3 or any(not math.isfinite(v) or v <= 0.0 for v in scale):
+                raise ValueError(f"collision mesh has invalid scale in {path}: {scale}")
+            local_corners = [
+                (x * scale[0], y * scale[1], z * scale[2])
+                for x in (float(mesh_bounds[0][0]), float(mesh_bounds[1][0]))
+                for y in (float(mesh_bounds[0][1]), float(mesh_bounds[1][1]))
+                for z in (float(mesh_bounds[0][2]), float(mesh_bounds[1][2]))
+            ]
+            for corner in local_corners:
+                rotated = _matvec(rot, corner)
+                point = [xyz[i] + rotated[i] for i in range(3)]
+                for i in range(3):
+                    mins[i] = min(mins[i], point[i])
+                    maxs[i] = max(maxs[i], point[i])
     if not all(math.isfinite(v) for v in mins + maxs):
         raise ValueError(f"No supported collision geometry found in {path}")
     return (mins[0], mins[1], mins[2], maxs[0], maxs[1], maxs[2])

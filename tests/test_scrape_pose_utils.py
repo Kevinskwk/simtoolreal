@@ -1,6 +1,7 @@
 from pathlib import Path
 import importlib.util
 
+import pytest
 import torch
 
 
@@ -95,6 +96,29 @@ def test_load_urdf_collision_bounds_includes_head_offset(tmp_path):
     bounds = load_urdf_collision_bounds(urdf)
 
     assert bounds == (-0.1, -0.03, -0.02, 0.2, 0.03, 0.02)
+
+
+def test_load_urdf_collision_bounds_supports_scaled_meshes(tmp_path):
+    mesh = tmp_path / "part.obj"
+    mesh.write_text(
+        "v -1 -2 -3\n"
+        "v 1 -2 -3\n"
+        "v -1 2 -3\n"
+        "v -1 -2 3\n"
+        "f 1 2 3\n"
+        "f 1 2 4\n"
+    )
+    urdf = tmp_path / "mesh_tool.urdf"
+    urdf.write_text(
+        '<?xml version="1.0"?>\n<robot name="tool"><link name="tool">'
+        '<collision><origin xyz="0.5 1.0 -0.5" rpy="0 0 0"/>'
+        '<geometry><mesh filename="part.obj" scale="0.1 0.2 0.3"/></geometry>'
+        '</collision></link></robot>\n'
+    )
+
+    bounds = load_urdf_collision_bounds(urdf)
+
+    assert bounds == pytest.approx((0.4, 0.6, -1.4, 0.6, 1.4, 0.4))
 
 
 def test_resampling_with_prior_edge_yaw_keeps_same_contact_edge_direction():
