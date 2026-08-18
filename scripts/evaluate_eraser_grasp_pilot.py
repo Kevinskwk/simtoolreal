@@ -9,6 +9,7 @@ import importlib.util
 import json
 import math
 from pathlib import Path
+import subprocess
 import sys
 
 import numpy as np
@@ -244,6 +245,12 @@ def main() -> None:
         "selected_entry_ids": selected_ids.tolist(),
         "computed_gate_pass_counts": gate_counts,
         "result_count": len(results),
+        "provenance": {
+            "code_commit": subprocess.run(
+                ("git", "rev-parse", "HEAD"), cwd=REPO_ROOT,
+                check=True, capture_output=True, text=True,
+            ).stdout.strip(),
+        },
         "results": results,
     }
     output_path = output_dir / "pilot_results.json"

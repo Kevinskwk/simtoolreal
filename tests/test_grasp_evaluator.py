@@ -63,3 +63,8 @@ def test_functional_edge_clearance_uses_palm_in_tool_frame():
     palm_to_tool[0, 3] = 0.04
     bounds = (-0.1, -0.02, -0.01, 0.1, 0.02, 0.01)
     assert module.bounds_edge_clearance(palm_to_tool, bounds) == pytest.approx(0.14)
+
+
+def test_functional_edge_threshold_is_explicit():
+    thresholds = module.GraspEvaluatorThresholds()
+    assert thresholds.functional_edge_clearance_m == pytest.approx(0.02)

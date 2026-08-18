@@ -217,6 +217,7 @@ class GraspEvaluatorThresholds:
     ik_orientation_deg: float = 5.0
     velocity_ratio: float = 1.0
     penetration_tolerance_m: float = 5.0e-4
+    functional_edge_clearance_m: float = 0.02
     max_ik_iterations: int = 200
     ik_damping: float = 0.03
     ik_step_limit_rad: float = 0.08
@@ -407,6 +408,7 @@ def evaluate_grasp_trajectory(
     tool_clearances: list[float] = []
     arm_trajectory: list[np.ndarray] = []
     waypoint_feasible: list[bool] = []
+    functional_edge_clearance = bounds_edge_clearance(palm_to_tool, tool_bounds)
     for tool_pose in tool_trajectory:
         target_palm = tool_pose @ np.linalg.inv(palm_to_tool)
         arm_q, pos_error, rot_error, jacobian, links = solve_arm_ik(
@@ -451,6 +453,9 @@ def evaluate_grasp_trajectory(
         "robot_self_collision": min(self_clearances) >= -thresholds.penetration_tolerance_m,
         "tool_environment_collision": min(tool_clearances) >= -thresholds.penetration_tolerance_m,
         "trajectory_coverage": all(waypoint_feasible),
+        "functional_region_clearance": (
+            functional_edge_clearance >= thresholds.functional_edge_clearance_m
+        ),
     }
     failures = [name for name, passed in gates.items() if not passed]
     metrics: dict[str, float | int] = {
@@ -470,9 +475,7 @@ def evaluate_grasp_trajectory(
         "minimum_robot_table_clearance_m": min(robot_clearances),
         "minimum_robot_self_clearance_m": min(self_clearances),
         "minimum_tool_table_clearance_m": min(tool_clearances),
-        "palm_to_functional_edge_clearance_m": float(
-            bounds_edge_clearance(palm_to_tool, tool_bounds)
-        ),
+        "palm_to_functional_edge_clearance_m": functional_edge_clearance,
     }
     return TrajectoryEvaluation(
         metrics=metrics,
