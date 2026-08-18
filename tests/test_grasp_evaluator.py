@@ -1,0 +1,65 @@
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+import sys
+
+import numpy as np
+import pytest
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+MODULE_PATH = REPO_ROOT / "isaacsimenvs/tasks/simtoolreal/utils/grasp_evaluator.py"
+spec = importlib.util.spec_from_file_location("grasp_evaluator", MODULE_PATH)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+
+def test_pose_matrix_round_trip():
+    position = np.array([0.2, -0.4, 0.7])
+    quaternion = np.array([0.9238795325, 0.0, 0.3826834324, 0.0])
+    transform = module.pose_matrix(position, quaternion)
+    recovered_position, recovered_quaternion = module.matrix_pose(transform)
+    assert np.allclose(recovered_position, position)
+    assert abs(np.dot(recovered_quaternion, quaternion)) == pytest.approx(1.0)
+
+
+def test_urdf_fk_jacobian_matches_finite_difference():
+    kinematics = module.UrdfKinematics(
+        REPO_ROOT / "assets/urdf/kuka_sharpa_description/iiwa14_left_sharpa_adjusted_restricted.urdf"
+    )
+    arm = np.array([-1.5, 1.3, -0.2, 1.2, -0.1, 1.5, 1.3])
+    hand = np.zeros(22)
+    base = np.eye(4)
+    base[1, 3] = 0.8
+    palm, jacobian, _ = kinematics.palm_fk_jacobian(arm, hand, base)
+    epsilon = 1e-6
+    finite = np.zeros((3, 7))
+    for index in range(7):
+        shifted = arm.copy()
+        shifted[index] += epsilon
+        shifted_palm, _, _ = kinematics.palm_fk_jacobian(shifted, hand, base)
+        finite[:, index] = (shifted_palm[:3, 3] - palm[:3, 3]) / epsilon
+    assert np.allclose(jacobian[:3], finite, atol=2e-6)
+
+
+def test_tool_box_clearance_detects_penetration():
+    bounds = (-0.1, -0.02, -0.01, 0.1, 0.02, 0.01)
+    pose = np.eye(4)
+    pose[2, 3] = 0.009
+    clearance = module.tool_box_table_clearance(
+        pose, bounds, np.zeros(3), np.array([0.0, 0.0, 1.0])
+    )
+    assert clearance == pytest.approx(-0.001)
+
+
+def test_grasp_fingerprint_is_order_independent():
+    assert module.grasp_fingerprint({"a": 1, "b": 2}) == module.grasp_fingerprint({"b": 2, "a": 1})
+
+
+def test_functional_edge_clearance_uses_palm_in_tool_frame():
+    palm_to_tool = np.eye(4)
+    palm_to_tool[0, 3] = 0.04
+    bounds = (-0.1, -0.02, -0.01, 0.1, 0.02, 0.01)
+    assert module.bounds_edge_clearance(palm_to_tool, bounds) == pytest.approx(0.14)
