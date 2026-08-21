@@ -110,25 +110,6 @@ def _rewrite_embedded_urdf_mesh_urls(
         return urdf_text
 
     changed = False
-    # The Allen-key mesh is a unit prism used only to author simple swept
-    # segments. Convert it to its exact bounding box in the viewer copy so a
-    # newly added local asset never depends on a remote branch being published.
-    for geometry_elem in root.findall(".//geometry"):
-        mesh_elem = geometry_elem.find("mesh")
-        if mesh_elem is None:
-            continue
-        filename = mesh_elem.get("filename", "")
-        if Path(filename).name != "unit_hex_prism_x.obj":
-            continue
-        scale = [float(value) for value in mesh_elem.get("scale", "1 1 1").split()]
-        if len(scale) != 3:
-            raise ValueError("unit_hex_prism_x.obj scale must have three values")
-        geometry_elem.remove(mesh_elem)
-        ET.SubElement(geometry_elem, "box", {
-            "size": f"{scale[0]} {2.0 * 0.866025 * scale[1]} {2.0 * scale[2]}"
-        })
-        changed = True
-
     for mesh_elem in root.findall(".//mesh"):
         filename = mesh_elem.get("filename")
         if not filename:

@@ -35,7 +35,7 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         self._allen_target_error_obs = torch.zeros(n, 5, device=device)
         self._allen_geometry_obs = torch.zeros(n, 9, device=device)
         geometry = torch.tensor(
-            (0.264, 0.06, 0.034, *cfg.allen_screw_axis_tool, *cfg.allen_screw_pivot_tool_m),
+            (0.264, 0.06, 0.010, *cfg.allen_screw_axis_tool, *cfg.allen_screw_pivot_tool_m),
             device=device,
         )
         self._allen_geometry_obs[:] = geometry

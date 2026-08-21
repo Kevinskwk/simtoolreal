@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Adapt screwdriver grasps to a tightened, socket-engaged Allen-key bank."""
+"""Adapt a validated screwdriver grasp to the thin, socket-engaged Allen key."""
 
 from __future__ import annotations
 
@@ -29,6 +29,20 @@ def parse_args() -> argparse.Namespace:
         default=ROOT / "assets/grasp_banks/allen_key_canonical_v1.json",
     )
     parser.add_argument("--source-assets", type=int, default=256)
+    parser.add_argument(
+        "--source-entry-indices", type=int, nargs="+", default=(201,),
+        help="Source grasps to adapt; entry 201 is the validated thin-key seed.",
+    )
+    parser.add_argument(
+        "--palm-shift-radii-m", type=float, nargs="+",
+        default=(0.004, 0.008, 0.012, 0.016),
+        help="Tool-frame radial shifts searched around the long handle axis.",
+    )
+    parser.add_argument(
+        "--palm-shift-angles-deg", type=float, nargs="+",
+        default=(0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0),
+        help="Tool-frame radial shift angles searched around the handle.",
+    )
     parser.add_argument("--settle-steps", type=int, default=60)
     parser.add_argument("--hold-steps", type=int, default=120)
     parser.add_argument("--desired-entries", type=int, default=1)
@@ -65,7 +79,7 @@ from isaacsimenvs.tasks.simtoolreal.utils.scene_utils import (  # noqa: E402
 )
 
 
-TIGHTENING_LEVELS = (0.0, 0.05, 0.10, 0.15, 0.20)
+TIGHTENING_LEVELS = (0.0, 0.15, 0.30, 0.45, 0.60, 0.75, 0.90)
 FLEXION_INDICES = tuple(
     index for index, name in enumerate(JOINT_NAMES_CANONICAL)
     if index >= 7 and (
@@ -80,7 +94,10 @@ def quaternion_wxyz(matrix: np.ndarray) -> list[float]:
     return [float(xyzw[3]), float(xyzw[0]), float(xyzw[1]), float(xyzw[2])]
 
 
-def provisional_entries(source: dict, count_assets: int) -> list[tuple[dict, dict]]:
+def provisional_entries(
+    source: dict, count_assets: int, source_entry_indices: list[int] | None,
+    palm_shift_radii_m: tuple[float, ...], palm_shift_angles_deg: tuple[float, ...],
+) -> list[tuple[dict, dict]]:
     robot = ROOT / "assets/urdf/kuka_sharpa_description/iiwa14_left_sharpa_adjusted_restricted.urdf"
     kinematics = UrdfKinematics(robot)
     thresholds = GraspEvaluatorThresholds(
@@ -96,55 +113,87 @@ def provisional_entries(source: dict, count_assets: int) -> list[tuple[dict, dic
             source["assets"],
             key=lambda asset: abs(float(asset["object_scale"][1]) * 0.04 - 0.02),
         )[:count_assets]
+        assets = [
+            {**asset, "indexed_entries": list(enumerate(asset["entries"]))}
+            for asset in assets
+        ]
     else:
-        assets = [{"asset_index": 0, "entries": source["entries"][:count_assets]}]
+        indexed = list(enumerate(source["entries"]))
+        if source_entry_indices is not None:
+            requested = set(source_entry_indices)
+            indexed = [item for item in indexed if item[0] in requested]
+            missing = requested - {item[0] for item in indexed}
+            if missing:
+                raise ValueError(f"source entry indices are out of range: {sorted(missing)}")
+        else:
+            indexed = indexed[:count_assets]
+        assets = [{"asset_index": 0, "indexed_entries": indexed}]
+    shifts_tool = [np.zeros(3)]
+    for radius in palm_shift_radii_m:
+        if not math.isfinite(float(radius)) or float(radius) < 0.0:
+            raise ValueError("palm shift radii must be finite and non-negative")
+        if float(radius) == 0.0:
+            continue
+        for angle_deg in palm_shift_angles_deg:
+            if not math.isfinite(float(angle_deg)):
+                raise ValueError("palm shift angles must be finite")
+            angle = math.radians(float(angle_deg))
+            shifts_tool.append(np.asarray(
+                (0.0, float(radius) * math.cos(angle), float(radius) * math.sin(angle))
+            ))
     candidates: list[tuple[dict, dict]] = []
     for asset in assets:
-        for source_index, source_entry in enumerate(asset["entries"]):
-            palm_to_tool = pose_matrix(
+        for source_index, source_entry in asset["indexed_entries"]:
+            source_palm_to_tool = pose_matrix(
                 np.asarray(source_entry["palm_to_tool_pos"]),
                 np.asarray(source_entry["palm_to_tool_quat_wxyz"]),
             )
-            target_palm = desired_tool @ np.linalg.inv(palm_to_tool)
-            original = np.asarray(source_entry["joint_pos_canonical"], dtype=np.float64)
-            arm, pos_error, rot_error, _, _ = solve_arm_ik(
-                kinematics, target_palm, original[:7], original[7:],
-                robot_base, thresholds,
-            )
-            if pos_error > thresholds.ik_position_m or rot_error > thresholds.ik_orientation_deg:
-                continue
-            entry = copy.deepcopy(source_entry)
-            joints = np.concatenate((arm, original[7:]))
-            targets = np.asarray(source_entry["joint_targets_canonical"], dtype=np.float64)
-            targets[:7] = arm
-            entry.update({
-                "joint_pos_canonical": joints.tolist(),
-                "joint_vel_canonical": [0.0] * 29,
-                "joint_targets_canonical": targets.tolist(),
-                "object_pos_local": desired_tool[:3, 3].tolist(),
-                "object_quat_wxyz": quaternion_wxyz(desired_tool),
-                "object_velocity": [0.0] * 6,
-                "reference_contact_quat_wxyz": quaternion_wxyz(desired_tool),
-                "reference_edge_yaw_rad": 0.0,
-                "reference_edge_tilt_rad": math.radians(45.0),
-            })
-            verification = dict(entry["verification"])
-            verification.update({
-                "edge_clearance_m": 0.04,
-                "table_force_n": 0.0,
-                "pickup_orientation_error_deg": 0.0,
-                "tactile_finger_count_min": 0,
-                "tactile_contact_area_mean": 0.0,
-                "tactile_depth_mean": 0.0,
-                "tactile_depth_max": 0.0,
-            })
-            entry["verification"] = verification
-            candidates.append((entry, {
-                "source_asset_index": int(asset["asset_index"]),
-                "source_entry_index": source_index,
-                "ik_position_error_m": pos_error,
-                "ik_rotation_error_deg": rot_error,
-            }))
+            for shift_tool in shifts_tool:
+                palm_to_tool = source_palm_to_tool.copy()
+                palm_to_tool[:3, 3] += palm_to_tool[:3, :3] @ shift_tool
+                target_palm = desired_tool @ np.linalg.inv(palm_to_tool)
+                original = np.asarray(source_entry["joint_pos_canonical"], dtype=np.float64)
+                arm, pos_error, rot_error, _, _ = solve_arm_ik(
+                    kinematics, target_palm, original[:7], original[7:],
+                    robot_base, thresholds,
+                )
+                if pos_error > thresholds.ik_position_m or rot_error > thresholds.ik_orientation_deg:
+                    continue
+                entry = copy.deepcopy(source_entry)
+                joints = np.concatenate((arm, original[7:]))
+                targets = np.asarray(source_entry["joint_targets_canonical"], dtype=np.float64)
+                targets[:7] = arm
+                entry.update({
+                    "joint_pos_canonical": joints.tolist(),
+                    "joint_vel_canonical": [0.0] * 29,
+                    "joint_targets_canonical": targets.tolist(),
+                    "object_pos_local": desired_tool[:3, 3].tolist(),
+                    "object_quat_wxyz": quaternion_wxyz(desired_tool),
+                    "object_velocity": [0.0] * 6,
+                    "palm_to_tool_pos": palm_to_tool[:3, 3].tolist(),
+                    "palm_to_tool_quat_wxyz": quaternion_wxyz(palm_to_tool),
+                    "reference_contact_quat_wxyz": quaternion_wxyz(desired_tool),
+                    "reference_edge_yaw_rad": 0.0,
+                    "reference_edge_tilt_rad": math.radians(45.0),
+                })
+                verification = dict(entry["verification"])
+                verification.update({
+                    "edge_clearance_m": 0.04,
+                    "table_force_n": 0.0,
+                    "pickup_orientation_error_deg": 0.0,
+                    "tactile_finger_count_min": 0,
+                    "tactile_contact_area_mean": 0.0,
+                    "tactile_depth_mean": 0.0,
+                    "tactile_depth_max": 0.0,
+                })
+                entry["verification"] = verification
+                candidates.append((entry, {
+                    "source_asset_index": int(asset["asset_index"]),
+                    "source_entry_index": source_index,
+                    "palm_shift_tool_m": shift_tool.tolist(),
+                    "ik_position_error_m": pos_error,
+                    "ik_rotation_error_deg": rot_error,
+                }))
     if not candidates:
         raise RuntimeError("no screwdriver grasp candidate has a reachable engaged Allen-key pose")
     return candidates
@@ -175,7 +224,13 @@ def main() -> None:
     if not ARGS.source_bank.is_file():
         raise FileNotFoundError(f"source screwdriver bank does not exist: {ARGS.source_bank}")
     source = json.loads(ARGS.source_bank.read_text())
-    candidates = provisional_entries(source, int(ARGS.source_assets))
+    candidates = provisional_entries(
+        source,
+        int(ARGS.source_assets),
+        ARGS.source_entry_indices,
+        tuple(float(value) for value in ARGS.palm_shift_radii_m),
+        tuple(float(value) for value in ARGS.palm_shift_angles_deg),
+    )
     expanded_entries: list[dict] = []
     metadata: list[dict] = []
     levels: list[float] = []
@@ -312,22 +367,6 @@ def main() -> None:
                 "tightening_residual_fraction": float(levels[index]),
                 **metadata[index],
             })
-            actual = inner.robot.data.joint_pos[index, inner._perm_lab_to_canon]
-            current_pos, current_quat = inner._palm_tool_relative()
-            entry["joint_pos_canonical"] = actual.tolist()
-            entry["joint_targets_canonical"] = actual.tolist()
-            hand_action = 2.0 * (actual[7:] - lower[7:].to(inner.device)) / (
-                upper[7:].to(inner.device) - lower[7:].to(inner.device)
-            ) - 1.0
-            entry["last_action_canonical"] = [0.0] * 7 + hand_action.clamp(-1, 1).tolist()
-            object_pos_local = (
-                inner.object.data.root_pos_w[index] - inner.scene.env_origins[index]
-            )
-            entry["object_pos_local"] = object_pos_local.tolist()
-            entry["object_quat_wxyz"] = inner.object.data.root_quat_w[index].tolist()
-            entry["reference_contact_quat_wxyz"] = entry["object_quat_wxyz"]
-            entry["palm_to_tool_pos"] = current_pos[index].tolist()
-            entry["palm_to_tool_quat_wxyz"] = current_quat[index].tolist()
             selected.append(entry)
             used_sources.add(source_id)
             if len(selected) >= int(ARGS.desired_entries):

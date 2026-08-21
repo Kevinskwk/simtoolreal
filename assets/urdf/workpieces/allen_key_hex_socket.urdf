@@ -10,20 +10,19 @@
       <origin xyz="0 0 0.015" rpy="0 0 0"/>
       <geometry><box size="0.15 0.15 0.03"/></geometry>
     </collision>
-    <!-- Six tangent walls form a 24 mm across-flats opening. The 2 mm radial
-         clearance prevents reset impulses while retaining lateral support. -->
-    <visual><origin xyz="0.016 0 0.0425" rpy="0 0 0"/><geometry><box size="0.008 0.030 0.025"/></geometry><material name="socket"><color rgba="0.55 0.58 0.62 1"/></material></visual>
-    <collision><origin xyz="0.016 0 0.0425" rpy="0 0 0"/><geometry><box size="0.008 0.030 0.025"/></geometry></collision>
-    <visual><origin xyz="-0.016 0 0.0425" rpy="0 0 0"/><geometry><box size="0.008 0.030 0.025"/></geometry><material name="socket"/></visual>
-    <collision><origin xyz="-0.016 0 0.0425" rpy="0 0 0"/><geometry><box size="0.008 0.030 0.025"/></geometry></collision>
-    <visual><origin xyz="0.008 0.013856 0.0425" rpy="0 0 1.0471975512"/><geometry><box size="0.008 0.030 0.025"/></geometry><material name="socket"/></visual>
-    <collision><origin xyz="0.008 0.013856 0.0425" rpy="0 0 1.0471975512"/><geometry><box size="0.008 0.030 0.025"/></geometry></collision>
-    <visual><origin xyz="-0.008 -0.013856 0.0425" rpy="0 0 1.0471975512"/><geometry><box size="0.008 0.030 0.025"/></geometry><material name="socket"/></visual>
-    <collision><origin xyz="-0.008 -0.013856 0.0425" rpy="0 0 1.0471975512"/><geometry><box size="0.008 0.030 0.025"/></geometry></collision>
-    <visual><origin xyz="-0.008 0.013856 0.0425" rpy="0 0 -1.0471975512"/><geometry><box size="0.008 0.030 0.025"/></geometry><material name="socket"/></visual>
-    <collision><origin xyz="-0.008 0.013856 0.0425" rpy="0 0 -1.0471975512"/><geometry><box size="0.008 0.030 0.025"/></geometry></collision>
-    <visual><origin xyz="0.008 -0.013856 0.0425" rpy="0 0 -1.0471975512"/><geometry><box size="0.008 0.030 0.025"/></geometry><material name="socket"/></visual>
-    <collision><origin xyz="0.008 -0.013856 0.0425" rpy="0 0 -1.0471975512"/><geometry><box size="0.008 0.030 0.025"/></geometry></collision>
+    <!-- Six tangent walls form a 12 mm across-flats opening for the 10 mm key. -->
+    <visual><origin xyz="0.010 0 0.0425" rpy="0 0 0"/><geometry><box size="0.008 0.020 0.025"/></geometry><material name="socket"><color rgba="0.55 0.58 0.62 1"/></material></visual>
+    <collision><origin xyz="0.010 0 0.0425" rpy="0 0 0"/><geometry><box size="0.008 0.020 0.025"/></geometry></collision>
+    <visual><origin xyz="-0.010 0 0.0425" rpy="0 0 0"/><geometry><box size="0.008 0.020 0.025"/></geometry><material name="socket"/></visual>
+    <collision><origin xyz="-0.010 0 0.0425" rpy="0 0 0"/><geometry><box size="0.008 0.020 0.025"/></geometry></collision>
+    <visual><origin xyz="0.005 0.008660 0.0425" rpy="0 0 1.0471975512"/><geometry><box size="0.008 0.020 0.025"/></geometry><material name="socket"/></visual>
+    <collision><origin xyz="0.005 0.008660 0.0425" rpy="0 0 1.0471975512"/><geometry><box size="0.008 0.020 0.025"/></geometry></collision>
+    <visual><origin xyz="-0.005 -0.008660 0.0425" rpy="0 0 1.0471975512"/><geometry><box size="0.008 0.020 0.025"/></geometry><material name="socket"/></visual>
+    <collision><origin xyz="-0.005 -0.008660 0.0425" rpy="0 0 1.0471975512"/><geometry><box size="0.008 0.020 0.025"/></geometry></collision>
+    <visual><origin xyz="-0.005 0.008660 0.0425" rpy="0 0 -1.0471975512"/><geometry><box size="0.008 0.020 0.025"/></geometry><material name="socket"/></visual>
+    <collision><origin xyz="-0.005 0.008660 0.0425" rpy="0 0 -1.0471975512"/><geometry><box size="0.008 0.020 0.025"/></geometry></collision>
+    <visual><origin xyz="0.005 -0.008660 0.0425" rpy="0 0 -1.0471975512"/><geometry><box size="0.008 0.020 0.025"/></geometry><material name="socket"/></visual>
+    <collision><origin xyz="0.005 -0.008660 0.0425" rpy="0 0 -1.0471975512"/><geometry><box size="0.008 0.020 0.025"/></geometry></collision>
     <inertial>
       <origin xyz="0 0 0.02" rpy="0 0 0"/>
       <mass value="5.0"/>
