@@ -54,6 +54,19 @@ def parse_args() -> argparse.Namespace:
         default=REPO_ROOT / "assets/grasp_banks/eraser_canonical_v2.json",
     )
     parser.add_argument("--entries", type=int, default=64)
+    parser.add_argument("--procedural", action="store_true")
+    parser.add_argument(
+        "--procedural-tool-types",
+        nargs="+",
+        choices=("hammer", "screwdriver", "marker", "spatula", "eraser", "brush"),
+        default=("hammer", "screwdriver", "marker", "spatula", "eraser", "brush"),
+        help="Procedural categories to include, in generator configuration order.",
+    )
+    parser.add_argument("--assets-per-distribution", type=int, default=20)
+    parser.add_argument("--grasps-per-asset", type=int, default=2)
+    parser.add_argument("--procedural-asset-seed", type=int, default=42)
+    parser.add_argument("--max-trials-per-asset", type=int, default=128)
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--num-envs", type=int, default=512)
     parser.add_argument("--acquisition-steps", type=int, default=1800)
     parser.add_argument("--stable-steps", type=int, default=15)
@@ -92,6 +105,7 @@ from isaacsimenvs.tasks.simtoolreal.simtoolreal_tacmap_env_cfg import (  # noqa:
     SimToolRealTacMapScrapePoseEnvCfg,
 )
 from isaacsimenvs.tasks.simtoolreal.utils.inhand_grasp_bank import (  # noqa: E402
+    MULTI_ASSET_SCHEMA_VERSION,
     SCHEMA_VERSION,
     sha256_file,
     validate_grasp_bank,
@@ -111,8 +125,11 @@ def validate_args() -> None:
     for name in ("entries", "num_envs", "acquisition_steps", "stable_steps", "hold_steps"):
         if int(getattr(ARGS, name)) <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
-    if ARGS.entries > ARGS.num_envs:
+    if not ARGS.procedural and ARGS.entries > ARGS.num_envs:
         raise ValueError("--entries cannot exceed --num-envs in the one-pass collector")
+    for name in ("assets_per_distribution", "grasps_per_asset", "max_trials_per_asset"):
+        if int(getattr(ARGS, name)) <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be positive")
     if float(ARGS.policy_coef_id) != 0.0:
         raise ValueError("V1 grasp collection requires --policy-coef-id=0.0")
     if float(ARGS.pickup_height_m) <= 0.0:
@@ -131,10 +148,18 @@ def validate_args() -> None:
 
 def make_cfg() -> SimToolRealTacMapScrapePoseEnvCfg:
     cfg = SimToolRealTacMapScrapePoseEnvCfg()
-    cfg.seed = int(ARGS.seed)
+    collection_wave = 0
+    if ARGS.procedural and ARGS.resume and ARGS.output.is_file():
+        previous = json.loads(ARGS.output.read_text())
+        collection_wave = int(previous.get("collection_waves", 0))
+    cfg.seed = int(ARGS.seed) + collection_wave
     cfg.scene.num_envs = int(ARGS.num_envs)
     cfg.episode_length_s = max(60.0, (ARGS.acquisition_steps + ARGS.hold_steps + 60) / 60.0)
-    if ARGS.object_name == CANONICAL_OBJECT_NAME:
+    if ARGS.procedural:
+        tool_type = "procedural"
+        object_urdf = None
+        object_scale = None
+    elif ARGS.object_name == CANONICAL_OBJECT_NAME:
         tool_type = "eraser"
         object_urdf = REPO_ROOT / "assets/urdf/objects/eraser_tactile_canonical.urdf"
         object_scale = (2.9373215824170767, 0.5126639800346792, 1.2951200580119278)
@@ -143,11 +168,20 @@ def make_cfg() -> SimToolRealTacMapScrapePoseEnvCfg:
         tool_type = OBJECT_TO_CATEGORY[ARGS.object_name]
         object_urdf = tool.decomposed_urdf_path
         object_scale = tool.scale
-    if not object_urdf.is_file():
+    if object_urdf is not None and not object_urdf.is_file():
         raise FileNotFoundError(f"tool URDF does not exist: {object_urdf}")
-    cfg.assets.handle_head_types = (tool_type,)
-    cfg.assets.object_urdf = str(object_urdf)
-    cfg.assets.object_scale = tuple(float(value) for value in object_scale)
+    if ARGS.procedural:
+        cfg.assets.handle_head_types = tuple(ARGS.procedural_tool_types)
+        cfg.assets.object_urdf = ""
+        cfg.assets.object_scale = None
+        cfg.assets.num_assets_per_type = int(ARGS.assets_per_distribution)
+        cfg.assets.procedural_asset_seed = int(ARGS.procedural_asset_seed)
+        cfg.assets.shuffle_assets = True
+        cfg.assets.object_pool_limit = 0
+    else:
+        cfg.assets.handle_head_types = (tool_type,)
+        cfg.assets.object_urdf = str(object_urdf)
+        cfg.assets.object_scale = tuple(float(value) for value in object_scale)
     object_root_name = (
         "object_root" if ARGS.object_name == CANONICAL_OBJECT_NAME
         else ARGS.object_name
@@ -155,7 +189,7 @@ def make_cfg() -> SimToolRealTacMapScrapePoseEnvCfg:
     cfg.tool_table_contact_sensor_prim_path = (
         f"/World/envs/env_.*/Object/{object_root_name}"
     )
-    collect_tactile = float(ARGS.tactile_entry_fraction) > 0.0
+    collect_tactile = float(ARGS.tactile_entry_fraction) > 0.0 and not ARGS.procedural
     cfg.use_tacmap = collect_tactile
     cfg.enable_vbts = collect_tactile
     cfg.enable_tactile = collect_tactile
@@ -364,9 +398,38 @@ def collect() -> tuple[dict, bool]:
     tactile_depth_sum = torch.zeros(inner.num_envs, device=inner.device)
     tactile_depth_max = torch.zeros(inner.num_envs, device=inner.device)
     last_action = torch.zeros(inner.num_envs, inner.cfg.action_space, device=inner.device)
+    asset_count = len(inner._object_urdf_paths)
+    entries_by_asset: list[list[dict]] = [[] for _ in range(asset_count)]
+    trials_by_asset = [0] * asset_count
+    previous_waves = 0
+    if ARGS.procedural and ARGS.resume and ARGS.output.is_file():
+        previous = json.loads(ARGS.output.read_text())
+        if int(previous.get("schema_version", -1)) != MULTI_ASSET_SCHEMA_VERSION:
+            raise CollectionFailure("cannot resume a procedural cache from a non-V3 file")
+        if previous.get("source_checkpoint_sha256") != sha256_file(ARGS.checkpoint):
+            raise CollectionFailure("cannot resume because the acquisition checkpoint changed")
+        procedural = previous.get("procedural", {})
+        if (
+            int(procedural.get("asset_seed", -1)) != int(ARGS.procedural_asset_seed)
+            or int(procedural.get("assets_per_distribution", -1))
+            != int(ARGS.assets_per_distribution)
+            or tuple(procedural.get("tool_types", ARGS.procedural_tool_types))
+            != tuple(ARGS.procedural_tool_types)
+        ):
+            raise CollectionFailure("cannot resume because procedural generation settings changed")
+        if [asset["asset_sha256"] for asset in previous["assets"]] != [
+            sha256_file(path) for path in inner._object_urdf_paths
+        ]:
+            raise CollectionFailure("cannot resume because the procedural asset pool changed")
+        entries_by_asset = [list(asset["entries"]) for asset in previous["assets"]]
+        trials_by_asset = [int(asset.get("attempts", 0)) for asset in previous["assets"]]
+        previous_waves = int(previous.get("collection_waves", 0))
     tactile_entries: list[dict] = []
     fallback_entries: list[dict] = []
-    required_tactile = math.ceil(float(ARGS.tactile_entry_fraction) * int(ARGS.entries))
+    required_tactile = (
+        0 if ARGS.procedural else
+        math.ceil(float(ARGS.tactile_entry_fraction) * int(ARGS.entries))
+    )
     observed_tactile_depth_max = 0.0
     observed_tactile_fingers_max = 0
     observed_min_fingertip_distance = float("inf")
@@ -505,18 +568,38 @@ def collect() -> tuple[dict, bool]:
                 reference_edge_yaw,
                 reference_edge_tilt,
             )
-            if verification["tactile_finger_count_min"] >= int(ARGS.min_tactile_fingers):
+            asset_index = int(inner._object_asset_index_per_env[env_id].item())
+            if ARGS.procedural:
+                if len(entries_by_asset[asset_index]) < int(ARGS.grasps_per_asset):
+                    fingerprint = json.dumps(entry, sort_keys=True, separators=(",", ":"))
+                    existing = {
+                        json.dumps(value, sort_keys=True, separators=(",", ":"))
+                        for value in entries_by_asset[asset_index]
+                    }
+                    if fingerprint not in existing:
+                        entries_by_asset[asset_index].append(entry)
+            elif verification["tactile_finger_count_min"] >= int(ARGS.min_tactile_fingers):
                 tactile_entries.append(entry)
             else:
                 fallback_entries.append(entry)
             complete[env_id] = True
             holding[env_id] = False
-            if (
+            if ARGS.procedural and all(
+                len(entries) >= int(ARGS.grasps_per_asset)
+                for entries in entries_by_asset
+            ):
+                break
+            if not ARGS.procedural and (
                 len(tactile_entries) >= required_tactile
                 and len(tactile_entries) + len(fallback_entries) >= int(ARGS.entries)
             ):
                 break
-        if (
+        if ARGS.procedural and all(
+            len(entries) >= int(ARGS.grasps_per_asset)
+            for entries in entries_by_asset
+        ):
+            break
+        if not ARGS.procedural and (
             len(tactile_entries) >= required_tactile
             and len(tactile_entries) + len(fallback_entries) >= int(ARGS.entries)
         ):
@@ -525,6 +608,7 @@ def collect() -> tuple[dict, bool]:
             print(
                 f"[collect] step={step + 1} stable={int(holding.sum())} "
                 f"tactile={len(tactile_entries)} fallback={len(fallback_entries)} "
+                f"procedural_covered={sum(bool(entries) for entries in entries_by_asset)}/{asset_count} "
                 f"failed={int(failed.sum())} "
                 f"tactile_depth_max={observed_tactile_depth_max:.4f} "
                 f"tactile_fingers_max={observed_tactile_fingers_max} "
@@ -533,6 +617,18 @@ def collect() -> tuple[dict, bool]:
                 flush=True,
             )
 
+    common = {
+        "source_checkpoint": str(ARGS.checkpoint.resolve()),
+        "source_checkpoint_sha256": sha256_file(ARGS.checkpoint),
+        "policy_coefficient_id": float(ARGS.policy_coef_id),
+        "tactile_rich_fraction_min": 0.0 if ARGS.procedural else float(ARGS.tactile_entry_fraction),
+        "tactile_min_fingers": int(ARGS.min_tactile_fingers),
+        "seed": int(ARGS.seed),
+        "control_dt_s": float(inner.step_dt),
+        "joint_lower_canonical": inner._joint_lower_canon.tolist(),
+        "joint_upper_canonical": inner._joint_upper_canon.tolist(),
+        "joint_limit_tolerance_rad": float(ARGS.joint_limit_tolerance_rad),
+    }
     asset_path = Path(inner._object_urdf_paths[0])
     payload = {
         "schema_version": SCHEMA_VERSION,
@@ -542,26 +638,74 @@ def collect() -> tuple[dict, bool]:
         ),
         "object_name": ARGS.object_name,
         "asset_sha256": sha256_file(asset_path),
-        "source_checkpoint": str(ARGS.checkpoint.resolve()),
-        "source_checkpoint_sha256": sha256_file(ARGS.checkpoint),
-        "policy_coefficient_id": float(ARGS.policy_coef_id),
-        "tactile_rich_fraction_min": float(ARGS.tactile_entry_fraction),
-        "tactile_min_fingers": int(ARGS.min_tactile_fingers),
-        "seed": int(ARGS.seed),
-        "control_dt_s": float(inner.step_dt),
-        "joint_lower_canonical": inner._joint_lower_canon.tolist(),
-        "joint_upper_canonical": inner._joint_upper_canon.tolist(),
-        "joint_limit_tolerance_rad": float(ARGS.joint_limit_tolerance_rad),
+        **common,
         "entries": (
             tactile_entries[: int(ARGS.entries)]
             + fallback_entries[: max(0, int(ARGS.entries) - len(tactile_entries))]
         )[: int(ARGS.entries)],
     }
+    if ARGS.procedural:
+        env_counts = torch.bincount(
+            inner._object_asset_index_per_env, minlength=asset_count
+        ).cpu().tolist()
+        assets = []
+        for asset_index, path in enumerate(inner._object_urdf_paths):
+            trials_by_asset[asset_index] += int(env_counts[asset_index])
+            name = Path(path).name
+            tool_type = next((candidate for candidate in (
+                "hammer", "screwdriver", "marker", "spatula", "eraser", "brush"
+            ) if f"_{candidate}_" in name), None)
+            if tool_type is None:
+                raise CollectionFailure(f"cannot infer tool category from generated asset {name}")
+            assigned = (inner._object_asset_index_per_env == asset_index).nonzero(
+                as_tuple=False
+            ).squeeze(-1)
+            if assigned.numel() == 0:
+                raise CollectionFailure(
+                    f"asset {asset_index} has no environment; increase --num-envs"
+                )
+            object_scale = inner._object_scale_per_env[int(assigned[0].item())]
+            assets.append({
+                "asset_index": asset_index,
+                "tool_type": tool_type,
+                "object_name": f"procedural_{asset_index:04d}_{tool_type}",
+                "asset_sha256": sha256_file(path),
+                "object_scale": [float(value) for value in object_scale.tolist()],
+                "attempts": trials_by_asset[asset_index],
+                "entries": entries_by_asset[asset_index][: int(ARGS.grasps_per_asset)],
+            })
+        payload = {
+            "schema_version": MULTI_ASSET_SCHEMA_VERSION,
+            "kind": "simtoolreal_multi_asset_grasp_cache",
+            **common,
+            "procedural": {
+                "asset_seed": int(ARGS.procedural_asset_seed),
+                "assets_per_distribution": int(ARGS.assets_per_distribution),
+                "grasps_per_asset": int(ARGS.grasps_per_asset),
+                "tool_types": list(ARGS.procedural_tool_types),
+            },
+            "collection_waves": previous_waves + 1,
+            "assets": assets,
+        }
     env.close()
-    if not payload["entries"]:
+    if not ARGS.procedural and not payload["entries"]:
         raise CollectionFailure(
             "grasp collection produced zero mechanically verified entries"
         )
+    if ARGS.procedural:
+        quota_met = all(
+            len(asset["entries"]) >= int(ARGS.grasps_per_asset)
+            for asset in payload["assets"]
+        )
+        exhausted = [
+            asset["asset_index"] for asset in payload["assets"]
+            if len(asset["entries"]) < int(ARGS.grasps_per_asset)
+            and int(asset["attempts"]) >= int(ARGS.max_trials_per_asset)
+        ]
+        if quota_met:
+            validate_grasp_bank(payload, minimum_entries=int(ARGS.grasps_per_asset))
+        payload["collection_exhausted_assets"] = exhausted
+        return payload, quota_met
     return validate_grasp_bank(payload), (
         len(payload["entries"]) >= int(ARGS.entries)
         and len(tactile_entries) >= required_tactile
@@ -572,18 +716,32 @@ def main() -> None:
     validate_args()
     payload, quota_met = collect()
     ARGS.output.parent.mkdir(parents=True, exist_ok=True)
-    ARGS.output.write_text(json.dumps(payload, indent=2, allow_nan=False) + "\n")
+    temporary = ARGS.output.with_suffix(ARGS.output.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, allow_nan=False) + "\n")
+    temporary.replace(ARGS.output)
+    grasp_count = (
+        sum(len(asset["entries"]) for asset in payload["assets"])
+        if ARGS.procedural else len(payload["entries"])
+    )
+    requested = (
+        f"{ARGS.grasps_per_asset}/asset" if ARGS.procedural else str(ARGS.entries)
+    )
     print(
-        f"[output] {ARGS.output.resolve()} ({len(payload['entries'])} grasps; "
-        f"requested={ARGS.entries}; quota_met={quota_met})",
+        f"[output] {ARGS.output.resolve()} ({grasp_count} grasps; "
+        f"requested={requested}; quota_met={quota_met})",
         flush=True,
     )
-    if not quota_met and ARGS.allow_partial:
+    if not quota_met and (ARGS.allow_partial or ARGS.procedural):
         print(
             f"[partial] requested quota was not met; retained "
-            f"{len(payload['entries'])} verified entries",
+            f"{grasp_count} verified entries",
             flush=True,
         )
+        exhausted = payload.get("collection_exhausted_assets", [])
+        if exhausted:
+            raise CollectionFailure(
+                f"max trials exhausted without grasp quota for assets {exhausted}"
+            )
     elif not quota_met:
         raise CollectionFailure(
             "failed grasp-bank quota after writing partial bank: "

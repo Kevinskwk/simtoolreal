@@ -213,6 +213,9 @@ class UrdfKinematics:
 @dataclass(frozen=True)
 class GraspEvaluatorThresholds:
     joint_violation_rad: float = 5.0e-4
+    arm_joint_margin_rad: float = 0.05
+    minimum_jacobian_singular_value: float = 0.10
+    maximum_jacobian_condition_number: float = 20.0
     ik_position_m: float = 0.005
     ik_orientation_deg: float = 5.0
     velocity_ratio: float = 1.0
@@ -221,6 +224,59 @@ class GraspEvaluatorThresholds:
     max_ik_iterations: int = 200
     ik_damping: float = 0.03
     ik_step_limit_rad: float = 0.08
+
+    def __post_init__(self) -> None:
+        nonnegative = {
+            "joint_violation_rad": self.joint_violation_rad,
+            "arm_joint_margin_rad": self.arm_joint_margin_rad,
+        }
+        positive = {
+            "minimum_jacobian_singular_value": self.minimum_jacobian_singular_value,
+            "maximum_jacobian_condition_number": self.maximum_jacobian_condition_number,
+        }
+        for name, value in nonnegative.items():
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+        for name, value in positive.items():
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive")
+
+
+def arm_controllability_gates(
+    *,
+    initial_joint_violation_rad: float,
+    minimum_joint_margin_rad: float,
+    minimum_jacobian_singular_value: float,
+    maximum_jacobian_condition_number: float,
+    maximum_arm_velocity_ratio: float,
+    thresholds: GraspEvaluatorThresholds,
+) -> dict[str, bool]:
+    """Return distinct validity, margin, singularity, and motion gates."""
+    values = (
+        initial_joint_violation_rad,
+        minimum_joint_margin_rad,
+        minimum_jacobian_singular_value,
+        maximum_jacobian_condition_number,
+        maximum_arm_velocity_ratio,
+    )
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("arm controllability metrics must be finite")
+    return {
+        "joint_limits": (
+            initial_joint_violation_rad <= thresholds.joint_violation_rad
+            and minimum_joint_margin_rad >= -thresholds.joint_violation_rad
+        ),
+        "arm_joint_margin": minimum_joint_margin_rad >= thresholds.arm_joint_margin_rad,
+        "arm_singularity": (
+            minimum_jacobian_singular_value
+            >= thresholds.minimum_jacobian_singular_value
+            and maximum_jacobian_condition_number
+            <= thresholds.maximum_jacobian_condition_number
+        ),
+        # This ratio is measured along the requested future trajectory, rather
+        # than being a configuration-only Jacobian score.
+        "arm_velocity": maximum_arm_velocity_ratio <= thresholds.velocity_ratio,
+    }
 
 
 @dataclass(frozen=True)
@@ -444,11 +500,19 @@ def evaluate_grasp_trajectory(
     min_joint_margin = float(np.minimum(
         arm_array - kinematics.arm_lower, kinematics.arm_upper - arm_array
     ).min())
+    minimum_singular_value = min(min_singular_values)
+    maximum_condition_number = max(condition_numbers)
     gates = {
-        "joint_limits": initial_violation <= thresholds.joint_violation_rad and min_joint_margin >= -thresholds.joint_violation_rad,
+        **arm_controllability_gates(
+            initial_joint_violation_rad=initial_violation,
+            minimum_joint_margin_rad=min_joint_margin,
+            minimum_jacobian_singular_value=minimum_singular_value,
+            maximum_jacobian_condition_number=maximum_condition_number,
+            maximum_arm_velocity_ratio=max_velocity_ratio,
+            thresholds=thresholds,
+        ),
         "ik_position": max(position_errors) <= thresholds.ik_position_m,
         "ik_orientation": max(orientation_errors) <= thresholds.ik_orientation_deg,
-        "arm_velocity": max_velocity_ratio <= thresholds.velocity_ratio,
         "robot_environment_collision": min(robot_clearances) >= -thresholds.penetration_tolerance_m,
         "robot_self_collision": min(self_clearances) >= -thresholds.penetration_tolerance_m,
         "tool_environment_collision": min(tool_clearances) >= -thresholds.penetration_tolerance_m,
@@ -469,8 +533,8 @@ def evaluate_grasp_trajectory(
         "mean_ik_orientation_error_deg": float(np.mean(orientation_errors)),
         "maximum_arm_velocity_ratio": max_velocity_ratio,
         "maximum_arm_acceleration_rad_s2": float(np.abs(accelerations).max(initial=0.0)),
-        "minimum_jacobian_singular_value": min(min_singular_values),
-        "maximum_jacobian_condition_number": max(condition_numbers),
+        "minimum_jacobian_singular_value": minimum_singular_value,
+        "maximum_jacobian_condition_number": maximum_condition_number,
         "minimum_yoshikawa_manipulability": min(manipulabilities),
         "minimum_robot_table_clearance_m": min(robot_clearances),
         "minimum_robot_self_clearance_m": min(self_clearances),
@@ -503,7 +567,8 @@ def bounds_edge_clearance(
 
 __all__ = [
     "GraspEvaluatorThresholds", "TrajectoryEvaluation", "UrdfKinematics",
-    "bounds_edge_clearance", "evaluate_grasp_trajectory", "grasp_fingerprint", "matrix_pose", "pose_matrix",
+    "arm_controllability_gates", "bounds_edge_clearance", "evaluate_grasp_trajectory",
+    "grasp_fingerprint", "matrix_pose", "pose_matrix",
     "solve_arm_ik", "sphere_table_clearance", "tool_box_table_clearance",
     "sphere_box_clearance", "sphere_self_clearance",
 ]

@@ -11,6 +11,7 @@ import torch
 
 
 SCHEMA_VERSION = 2
+MULTI_ASSET_SCHEMA_VERSION = 3
 JOINT_COUNT = 29
 SUPPORTED_TOOL_TYPES = frozenset(
     ("hammer", "screwdriver", "eraser", "spatula", "marker", "brush")
@@ -40,6 +41,10 @@ def validate_grasp_bank(payload: dict, *, minimum_entries: int = 1) -> dict:
         raise ValueError("minimum_entries must be positive")
     if not isinstance(payload, dict):
         raise ValueError("grasp bank must be a JSON object")
+    if int(payload.get("schema_version", -1)) == MULTI_ASSET_SCHEMA_VERSION:
+        return validate_multi_asset_grasp_bank(
+            payload, minimum_entries_per_asset=minimum_entries
+        )
     if int(payload.get("schema_version", -1)) != SCHEMA_VERSION:
         raise ValueError(
             f"unsupported grasp-bank schema {payload.get('schema_version')!r}; "
@@ -211,6 +216,76 @@ def validate_grasp_bank(payload: dict, *, minimum_entries: int = 1) -> dict:
     return payload
 
 
+def validate_multi_asset_grasp_bank(
+    payload: dict, *, minimum_entries_per_asset: int = 1
+) -> dict:
+    """Validate a strict cache of matched grasps for procedural assets."""
+    if int(minimum_entries_per_asset) <= 0:
+        raise ValueError("minimum_entries_per_asset must be positive")
+    if payload.get("kind") != "simtoolreal_multi_asset_grasp_cache":
+        raise ValueError("V3 grasp cache has an invalid kind")
+    assets = payload.get("assets")
+    if not isinstance(assets, list) or not assets:
+        raise ValueError("V3 grasp cache must contain a non-empty assets list")
+    indices: set[int] = set()
+    hashes: set[str] = set()
+    common = {
+        "schema_version": SCHEMA_VERSION,
+        "source_checkpoint_sha256": payload.get("source_checkpoint_sha256"),
+        "policy_coefficient_id": payload.get("policy_coefficient_id"),
+        "tactile_rich_fraction_min": payload.get("tactile_rich_fraction_min", 0.0),
+        "tactile_min_fingers": payload.get("tactile_min_fingers", 1),
+        "control_dt_s": payload.get("control_dt_s"),
+    }
+    for optional in (
+        "joint_lower_canonical", "joint_upper_canonical", "joint_limit_tolerance_rad"
+    ):
+        if optional in payload:
+            common[optional] = payload[optional]
+    for position, asset in enumerate(assets):
+        if not isinstance(asset, dict):
+            raise ValueError(f"V3 grasp-cache asset {position} must be an object")
+        index = int(asset.get("asset_index", -1))
+        if index < 0 or index in indices:
+            raise ValueError(f"V3 grasp-cache asset index {index} is invalid or duplicated")
+        indices.add(index)
+        digest = asset.get("asset_sha256")
+        if not isinstance(digest, str) or len(digest) != 64 or digest in hashes:
+            raise ValueError(f"V3 grasp-cache asset {index} has an invalid or duplicate hash")
+        hashes.add(digest)
+        scale = asset.get("object_scale")
+        if (
+            not isinstance(scale, list) or len(scale) != 3
+            or not all(math.isfinite(float(value)) and float(value) > 0.0 for value in scale)
+        ):
+            raise ValueError(f"V3 grasp-cache asset {index} has an invalid object scale")
+        single = dict(common)
+        single.update({
+            "tool_type": asset.get("tool_type"),
+            "object_name": asset.get("object_name", f"procedural_{index:04d}"),
+            "asset_sha256": digest,
+            "entries": asset.get("entries"),
+        })
+        validate_grasp_bank(single, minimum_entries=minimum_entries_per_asset)
+    expected = list(range(len(assets)))
+    if sorted(indices) != expected:
+        raise ValueError(
+            "V3 grasp-cache asset indices must be contiguous and match generated-pool order"
+        )
+    return payload
+
+
+def flatten_multi_asset_grasp_bank(payload: dict) -> tuple[list[dict], list[int]]:
+    """Return entries and their generated-pool asset indices."""
+    validate_multi_asset_grasp_bank(payload)
+    entries: list[dict] = []
+    asset_indices: list[int] = []
+    for asset in payload["assets"]:
+        entries.extend(asset["entries"])
+        asset_indices.extend([int(asset["asset_index"])] * len(asset["entries"]))
+    return entries, asset_indices
+
+
 def load_grasp_bank(path: str | Path, *, minimum_entries: int = 1) -> dict:
     path = Path(path)
     if not path.is_file():
@@ -317,6 +392,8 @@ def table_root_z_for_lowest_clearance(
 
 
 __all__ = [
-    "SCHEMA_VERSION", "collision_box_corners", "load_grasp_bank", "sha256_file",
+    "MULTI_ASSET_SCHEMA_VERSION", "SCHEMA_VERSION", "collision_box_corners",
+    "flatten_multi_asset_grasp_bank", "load_grasp_bank", "sha256_file",
     "table_root_z_for_lowest_clearance", "validate_grasp_bank",
+    "validate_multi_asset_grasp_bank",
 ]

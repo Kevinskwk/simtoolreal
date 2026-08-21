@@ -11,6 +11,7 @@ from .simtoolreal_stable_scrape_env import SimToolRealStableScrapeEnv
 from .simtoolreal_tacmap_env_cfg import SimToolRealInHandStableScrapeEnvCfg
 from .utils.inhand_grasp_bank import (
     collision_box_corners,
+    flatten_multi_asset_grasp_bank,
     load_grasp_bank,
     sha256_file,
     table_root_z_for_lowest_clearance,
@@ -46,13 +47,21 @@ class SimToolRealInHandStableScrapeEnv(SimToolRealStableScrapeEnv):
             )
         self._inhand_ready = False
         super().__init__(cfg, render_mode, **kwargs)
-        actual_asset_hash = sha256_file(self._object_urdf_paths[0])
-        expected_asset_hash = str(self._inhand_bank_payload["asset_sha256"])
-        if actual_asset_hash != expected_asset_hash:
-            raise RuntimeError(
-                "in-hand grasp bank asset hash does not match the spawned eraser: "
-                f"bank={expected_asset_hash}, spawned={actual_asset_hash}"
-            )
+        if int(self._inhand_bank_payload["schema_version"]) == 3:
+            expected = [asset["asset_sha256"] for asset in self._inhand_bank_payload["assets"]]
+            actual = [sha256_file(path) for path in self._object_urdf_paths]
+            if actual != expected:
+                raise RuntimeError(
+                    "multi-asset grasp cache does not match the spawned procedural pool"
+                )
+        else:
+            actual_asset_hash = sha256_file(self._object_urdf_paths[0])
+            expected_asset_hash = str(self._inhand_bank_payload["asset_sha256"])
+            if actual_asset_hash != expected_asset_hash:
+                raise RuntimeError(
+                    "in-hand grasp bank asset hash does not match the spawned eraser: "
+                    f"bank={expected_asset_hash}, spawned={actual_asset_hash}"
+                )
         self._materialize_grasp_bank()
         self._inhand_curriculum_stage = 0
         self._inhand_curriculum_updates = 0
@@ -100,7 +109,13 @@ class SimToolRealInHandStableScrapeEnv(SimToolRealStableScrapeEnv):
             raise ValueError("inhand_target_sampling_attempts must be positive")
 
     def _materialize_grasp_bank(self) -> None:
-        entries = self._inhand_bank_payload["entries"]
+        if int(self._inhand_bank_payload["schema_version"]) == 3:
+            entries, asset_indices = flatten_multi_asset_grasp_bank(
+                self._inhand_bank_payload
+            )
+        else:
+            entries = self._inhand_bank_payload["entries"]
+            asset_indices = [0] * len(entries)
         tensor_fields = {
             "joint_pos_canonical": "_inhand_bank_joint_pos",
             "joint_targets_canonical": "_inhand_bank_joint_targets",
@@ -141,6 +156,29 @@ class SimToolRealInHandStableScrapeEnv(SimToolRealStableScrapeEnv):
             device=self.device,
         )
         self._inhand_bank_size = len(entries)
+        self._inhand_bank_asset_index = torch.tensor(
+            asset_indices, dtype=torch.long, device=self.device
+        )
+        asset_count = len(self._object_urdf_paths)
+        starts = torch.zeros(asset_count, dtype=torch.long, device=self.device)
+        counts = torch.zeros_like(starts)
+        for asset_index in range(asset_count):
+            matched = (self._inhand_bank_asset_index == asset_index).nonzero(
+                as_tuple=False
+            ).squeeze(-1)
+            if matched.numel() < int(self.cfg.grasp_bank_min_entries):
+                raise RuntimeError(
+                    f"asset {asset_index} has {matched.numel()} cached grasps; "
+                    f"required={self.cfg.grasp_bank_min_entries}"
+                )
+            if not torch.equal(
+                matched, torch.arange(matched[0], matched[0] + matched.numel(), device=self.device)
+            ):
+                raise RuntimeError("multi-asset grasp entries must be contiguous per asset")
+            starts[asset_index] = matched[0]
+            counts[asset_index] = matched.numel()
+        self._inhand_bank_asset_starts = starts
+        self._inhand_bank_asset_counts = counts
 
         lower = self._joint_lower_canon.unsqueeze(0)
         upper = self._joint_upper_canon.unsqueeze(0)
@@ -281,9 +319,12 @@ class SimToolRealInHandStableScrapeEnv(SimToolRealStableScrapeEnv):
     ) -> None:
         count = env_ids.numel()
         if bank_ids is None:
-            bank_ids = torch.randint(
-                0, self._inhand_bank_size, (count,), device=self.device
-            )
+            asset_ids = self._object_asset_index_per_env[env_ids]
+            starts = self._inhand_bank_asset_starts[asset_ids]
+            counts_per_env = self._inhand_bank_asset_counts[asset_ids]
+            bank_ids = starts + torch.floor(
+                torch.rand(count, device=self.device) * counts_per_env
+            ).long()
         else:
             bank_ids = torch.as_tensor(bank_ids, device=self.device, dtype=torch.long)
             if bank_ids.shape != (count,):
@@ -292,6 +333,9 @@ class SimToolRealInHandStableScrapeEnv(SimToolRealStableScrapeEnv):
                 )
             if bool(((bank_ids < 0) | (bank_ids >= self._inhand_bank_size)).any()):
                 raise ValueError("bank_ids contains an out-of-range grasp-bank index")
+        expected_assets = self._object_asset_index_per_env[env_ids]
+        if bool((self._inhand_bank_asset_index[bank_ids] != expected_assets).any()):
+            raise RuntimeError("grasp-bank entries do not match environment tool assets")
         self._inhand_reset_bank_index[env_ids] = bank_ids
         joint_pos_canonical = self._inhand_bank_joint_pos[bank_ids]
         target_canonical = self._inhand_bank_joint_targets[bank_ids]

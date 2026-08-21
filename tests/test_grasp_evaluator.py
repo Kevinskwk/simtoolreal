@@ -68,3 +68,48 @@ def test_functional_edge_clearance_uses_palm_in_tool_frame():
 def test_functional_edge_threshold_is_explicit():
     thresholds = module.GraspEvaluatorThresholds()
     assert thresholds.functional_edge_clearance_m == pytest.approx(0.02)
+
+
+def test_arm_controllability_thresholds_are_explicit():
+    thresholds = module.GraspEvaluatorThresholds()
+    assert thresholds.arm_joint_margin_rad == pytest.approx(0.05)
+    assert thresholds.minimum_jacobian_singular_value == pytest.approx(0.10)
+    assert thresholds.maximum_jacobian_condition_number == pytest.approx(20.0)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "failed_gate"),
+    [
+        ({"minimum_joint_margin_rad": 0.049}, "arm_joint_margin"),
+        ({"minimum_jacobian_singular_value": 0.099}, "arm_singularity"),
+        ({"maximum_jacobian_condition_number": 20.01}, "arm_singularity"),
+        ({"maximum_arm_velocity_ratio": 1.01}, "arm_velocity"),
+    ],
+)
+def test_arm_controllability_gates_reject_hard_cases(overrides, failed_gate):
+    values = {
+        "initial_joint_violation_rad": 0.0,
+        "minimum_joint_margin_rad": 0.1,
+        "minimum_jacobian_singular_value": 0.2,
+        "maximum_jacobian_condition_number": 10.0,
+        "maximum_arm_velocity_ratio": 0.5,
+    }
+    values.update(overrides)
+    gates = module.arm_controllability_gates(
+        **values, thresholds=module.GraspEvaluatorThresholds()
+    )
+    assert not gates[failed_gate]
+    assert all(passed for name, passed in gates.items() if name != failed_gate)
+
+
+def test_joint_limit_validity_is_distinct_from_joint_margin():
+    gates = module.arm_controllability_gates(
+        initial_joint_violation_rad=0.0,
+        minimum_joint_margin_rad=0.0,
+        minimum_jacobian_singular_value=0.2,
+        maximum_jacobian_condition_number=10.0,
+        maximum_arm_velocity_ratio=0.5,
+        thresholds=module.GraspEvaluatorThresholds(),
+    )
+    assert gates["joint_limits"]
+    assert not gates["arm_joint_margin"]
