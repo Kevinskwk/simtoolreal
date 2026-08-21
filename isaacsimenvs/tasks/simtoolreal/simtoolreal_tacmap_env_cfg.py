@@ -560,6 +560,8 @@ class SimToolRealAllenKeyAdjustmentEnvCfg(SimToolRealInHandAdjustmentEnvCfg):
     allen_adjustment_steps: int = 360
     allen_hold_steps: int = 120
     allen_success_hold_steps: int = 60
+    # One-sided from the validated bank pose; negative yaw unloads its palm contact.
+    allen_reset_yaw_range_stages_deg: tuple[float, ...] = (5.0, 10.0, 15.0, 20.0, 30.0)
     allen_screw_axis_tool: tuple[float, float, float] = (0.0, 0.0, -1.0)
     allen_screw_pivot_tool_m: tuple[float, float, float] = (0.192, 0.0, -0.03)
     allen_workpiece_from_tool_m: tuple[float, float, float] = (0.192, 0.0, -0.095)

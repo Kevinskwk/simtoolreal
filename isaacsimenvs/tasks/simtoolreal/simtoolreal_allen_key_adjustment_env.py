@@ -6,7 +6,7 @@ import math
 
 import torch
 from isaaclab.sensors import ContactSensor, ContactSensorCfg
-from isaaclab.utils.math import quat_apply
+from isaaclab.utils.math import quat_apply, quat_from_angle_axis, quat_mul
 
 from .simtoolreal_inhand_adjustment_env import SimToolRealInHandAdjustmentEnv
 from .simtoolreal_tacmap_env_cfg import SimToolRealAllenKeyAdjustmentEnvCfg
@@ -48,6 +48,7 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         self._allen_socket_lateral_error = torch.zeros(n, device=device)
         self._allen_socket_insertion_error = torch.zeros(n, device=device)
         self._allen_socket_tilt_error = torch.zeros(n, device=device)
+        self._allen_palm_force_n = torch.zeros(n, device=device)
         self._allen_palm_contact = torch.zeros(n, dtype=torch.bool, device=device)
         self._allen_socket_valid = torch.zeros(n, dtype=torch.bool, device=device)
         self._allen_combined_valid = torch.zeros(n, dtype=torch.bool, device=device)
@@ -55,6 +56,7 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         self._allen_succeeded = torch.zeros(n, dtype=torch.bool, device=device)
         self._allen_just_succeeded = torch.zeros(n, dtype=torch.bool, device=device)
         self._allen_previous_potentials = torch.zeros(n, 3, device=device)
+        self._allen_reset_yaw_rad = torch.zeros(n, device=device)
         self._allen_curriculum_eligible = 0
         self._allen_curriculum_successes = 0
         self._allen_curriculum_success_mean = 0.0
@@ -69,6 +71,11 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
             raise ValueError("Allen-key successful hold length is invalid")
         if tuple(cfg.allen_screw_axis_tool) != (0.0, 0.0, -1.0):
             raise ValueError("the canonical Allen-key screw axis must be local -Z")
+        yaw_ranges = tuple(float(value) for value in cfg.allen_reset_yaw_range_stages_deg)
+        if len(yaw_ranges) != len(cfg.adjustment_target_rotation_deg):
+            raise ValueError("Allen-key reset yaw curriculum length is inconsistent")
+        if any(not math.isfinite(value) or not 0.0 <= value <= 45.0 for value in yaw_ranges):
+            raise ValueError("Allen-key reset yaw ranges must be finite and in [0, 45]")
         for name in (
             "allen_socket_lateral_tolerance_m", "allen_socket_insertion_tolerance_m",
             "allen_socket_tilt_tolerance_deg", "allen_palm_contact_threshold_n",
@@ -133,6 +140,8 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         if not hasattr(self, "workpiece"):
             return
         count = env_ids.numel()
+        if getattr(self, "_allen_ready", False):
+            self._randomize_engaged_yaw(env_ids)
         tool_pos = self.object.data.root_pos_w[env_ids]
         tool_quat = self.object.data.root_quat_w[env_ids]
         offset = torch.tensor(
@@ -162,6 +171,62 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
             self._allen_just_succeeded[env_ids] = False
             self._allen_previous_potentials[env_ids] = 0.0
 
+    def _randomize_engaged_yaw(self, env_ids: torch.Tensor) -> None:
+        """Rotate the grasped key and its world targets about the robot base Z axis."""
+        count = env_ids.numel()
+        limit = math.radians(float(
+            self.cfg.allen_reset_yaw_range_stages_deg[self._adjustment_curriculum_stage]
+        ))
+        arm_joint = int(self._arm_joint_ids[0])
+        current_targets = self._cur_targets[env_ids, arm_joint]
+        low = torch.maximum(
+            torch.zeros_like(current_targets),
+            self._arm_lower[env_ids, 0] - current_targets,
+        )
+        high = torch.minimum(
+            torch.full_like(current_targets, limit),
+            self._arm_upper[env_ids, 0] - current_targets,
+        )
+        if bool((low > high).any()):
+            raise RuntimeError("Allen-key reset yaw has no valid first-joint interval")
+        yaw = low + torch.rand(count, device=self.device) * (high - low)
+        self._allen_reset_yaw_rad[env_ids] = yaw
+
+        z_axis = torch.zeros(count, 3, device=self.device)
+        z_axis[:, 2] = 1.0
+        yaw_quat = quat_from_angle_axis(yaw, z_axis)
+        robot_base = self.robot.data.root_pos_w[env_ids]
+
+        def rotate_position(position: torch.Tensor) -> torch.Tensor:
+            return robot_base + quat_apply(yaw_quat, position - robot_base)
+
+        joint_pos = self._cur_targets[env_ids].clone()
+        joint_vel = torch.zeros_like(joint_pos)
+        joint_pos[:, arm_joint] += yaw
+        self._cur_targets[env_ids, arm_joint] += yaw
+        self._prev_targets[env_ids, arm_joint] += yaw
+        self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+        self.robot.set_joint_position_target(self._cur_targets[env_ids], env_ids=env_ids)
+
+        tool_pos = rotate_position(self.object.data.root_pos_w[env_ids])
+        tool_quat = quat_mul(yaw_quat, self.object.data.root_quat_w[env_ids])
+        self.object.write_root_pose_to_sim(
+            torch.cat((tool_pos, tool_quat), dim=-1), env_ids=env_ids
+        )
+        self.object.write_root_velocity_to_sim(
+            torch.zeros(count, 6, device=self.device), env_ids=env_ids
+        )
+
+        target_palm_pos = rotate_position(self._adjustment_target_palm_pos_w[env_ids])
+        target_palm_quat = quat_mul(
+            yaw_quat, self._adjustment_target_palm_quat_w[env_ids]
+        )
+        self._adjustment_target_palm_pos_w[env_ids] = target_palm_pos
+        self._adjustment_target_palm_quat_w[env_ids] = target_palm_quat
+        self._adjustment_initial_tool_pos[env_ids] = tool_pos
+        self._adjustment_initial_tool_quat[env_ids] = tool_quat
+        self._write_goal(env_ids, tool_pos, tool_quat, tool_pos)
+
     def _read_palm_contact(self) -> torch.Tensor:
         data = getattr(self._palm_tool_contact_sensor, "data", None)
         matrix = None if data is None else getattr(data, "force_matrix_w", None)
@@ -176,6 +241,7 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         force = torch.linalg.vector_norm(matrix.reshape(self.num_envs, -1, 3), dim=-1).sum(-1)
         if not bool(torch.isfinite(force).all()):
             raise RuntimeError("Allen-key palm-tool contact contains NaN or Inf")
+        self._allen_palm_force_n.copy_(force)
         return force >= float(self.cfg.allen_palm_contact_threshold_n)
 
     def _update_allen_metrics(self) -> None:
@@ -361,6 +427,8 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
                 self._allen_socket_tilt_error
             ).mean(),
             "allen/palm_contact_ratio": self._allen_palm_contact.float().mean(),
+            "allen/palm_force_mean_n": self._allen_palm_force_n.mean(),
+            "allen/reset_yaw_mean_deg": torch.rad2deg(self._allen_reset_yaw_rad).mean(),
             "allen/socket_valid_ratio": self._allen_socket_valid.float().mean(),
             "allen/combined_valid_ratio": self._allen_combined_valid.float().mean(),
             "allen/hold_count_mean": self._allen_hold_count.float().mean(),
@@ -370,6 +438,11 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
             "curriculum/allen_target_orbit_deg": self.cfg.adjustment_target_rotation_deg[
                 self._adjustment_curriculum_stage
             ],
+            "curriculum/allen_reset_yaw_range_deg": (
+                self.cfg.allen_reset_yaw_range_stages_deg[
+                    self._adjustment_curriculum_stage
+                ]
+            ),
         })
         log_step_metrics(self)
         return reward

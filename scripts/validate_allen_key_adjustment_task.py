@@ -18,6 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--num-envs", type=int, default=4)
     parser.add_argument("--settle-steps", type=int, default=60)
+    parser.add_argument("--reset-yaw-range-deg", type=float, default=None)
     parser.add_argument("--output", type=Path, default=None)
     AppLauncher.add_app_launcher_args(parser)
     parser.set_defaults(headless=True)
@@ -99,6 +100,10 @@ def main() -> None:
         raise ValueError("num-envs and settle-steps must be positive")
     cfg = SimToolRealAllenKeyAdjustmentEnvCfg()
     cfg.scene.num_envs = int(ARGS.num_envs)
+    if ARGS.reset_yaw_range_deg is not None:
+        cfg.allen_reset_yaw_range_stages_deg = (
+            float(ARGS.reset_yaw_range_deg),
+        ) * len(cfg.adjustment_target_rotation_deg)
     cfg.adjustment_curriculum_min_eligible_count = 1_000_000
     env = gym.make(TASK_ID, cfg=cfg)
     frames: list[dict] = []
@@ -127,9 +132,18 @@ def main() -> None:
                 f"ratio={float(inner._allen_socket_valid.float().mean().item()):.3f}"
             )
         if not bool(inner._allen_palm_contact.all()):
+            current_pos, current_quat = inner._palm_tool_relative()
+            relative_drift = torch.linalg.vector_norm(
+                current_pos - inner._inhand_bank_relative_pos[0], dim=-1
+            )
             raise RuntimeError(
                 "whole-palm tool contact was not retained during settling: "
-                f"ratio={float(inner._allen_palm_contact.float().mean().item()):.3f}"
+                f"ratio={float(inner._allen_palm_contact.float().mean().item()):.3f} "
+                f"contact={inner._allen_palm_contact.tolist()} "
+                f"force_n={inner._allen_palm_force_n.tolist()} "
+                f"yaw_deg={torch.rad2deg(inner._allen_reset_yaw_rad).tolist()} "
+                f"support={inner._stable_support_count.tolist()} "
+                f"relative_drift_m={relative_drift.tolist()}"
             )
 
         # Make the current physically settled relationship the deterministic hold target.
