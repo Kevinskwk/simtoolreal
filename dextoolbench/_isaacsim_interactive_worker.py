@@ -22,6 +22,27 @@ Z_OFFSET = 0.03
 CONTROL_DT = 1.0 / 60.0
 
 
+def _checkpoint_observation_dim(checkpoint_path: str) -> int:
+    import torch
+
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    payload = payload.get(0, payload)
+    model = payload.get("model")
+    if not isinstance(model, dict):
+        raise RuntimeError(f"checkpoint has no model state dict: {checkpoint_path}")
+    dims = {
+        int(value.numel())
+        for key, value in model.items()
+        if key.endswith("running_mean_std.running_mean") and value.ndim == 1
+    }
+    if len(dims) != 1:
+        raise RuntimeError(
+            "could not infer exactly one actor observation dimension from "
+            f"{checkpoint_path}; found {sorted(dims)}"
+        )
+    return dims.pop()
+
+
 def _write_isaac_trajectory(goals_xyzw, out_dir: Path) -> str:
     """gym-format goals ([x,y,z,qx,qy,qz,qw] list) -> fixed_trajectory_file
     format (pos (1,K,3), quat wxyz (1,K,4))."""
@@ -54,7 +75,52 @@ def _sim_get_state(inner, obs):
     return joint_pos, _pose7(inner.object), _pose7(inner.goal_viz)
 
 
-def _sim_episode(conn, env, inner, player, n_act, n_goals, rl_device):
+def _write_manual_goal(inner, pose_xyzw):
+    """Write one unrestricted env-local goal pose into the Isaac Lab scene."""
+    import torch
+
+    pose = torch.as_tensor(pose_xyzw, device=inner.device, dtype=torch.float32)
+    if pose.shape != (7,) or not bool(torch.isfinite(pose).all()):
+        raise ValueError(f"manual goal must be one finite 7D pose, got {pose_xyzw!r}")
+    quat_xyzw = pose[3:]
+    quat_norm = torch.linalg.vector_norm(quat_xyzw)
+    if float(quat_norm.item()) < 1.0e-8:
+        raise ValueError("manual goal quaternion has zero norm")
+    quat_xyzw = quat_xyzw / quat_norm
+    quat_wxyz = quat_xyzw[[3, 0, 1, 2]]
+    world_pos = pose[:3] + inner.scene.env_origins[0]
+    world_pose = torch.cat((world_pos, quat_wxyz)).unsqueeze(0)
+    env_id = torch.zeros(1, device=inner.device, dtype=torch.long)
+    inner.goal_viz.write_root_pose_to_sim(world_pose, env_ids=env_id)
+    inner.goal_viz.write_root_velocity_to_sim(
+        torch.zeros(1, 6, device=inner.device), env_ids=env_id
+    )
+
+
+def _set_manual_goal_mode(inner, enabled: bool, n_goals: int) -> None:
+    term = inner.cfg.termination
+    term.success_steps = 1_000_000_000 if enabled else 1
+    term.max_consecutive_successes = 0 if enabled else n_goals
+
+
+def _restore_task_trajectory(inner, n_goals: int) -> None:
+    import torch
+
+    from isaacsimenvs.tasks.simtoolreal.utils.reset_utils import (
+        _clear_goal_trackers,
+        _reset_goal_pose,
+    )
+
+    _set_manual_goal_mode(inner, False, n_goals)
+    env_id = torch.zeros(1, device=inner.device, dtype=torch.long)
+    _reset_goal_pose(inner, env_id, mode="absolute")
+    _clear_goal_trackers(inner, env_id)
+    inner._successes[env_id] = 0
+
+
+def _sim_episode(
+    conn, env, inner, player, n_act, n_goals, rl_device, manual_goal_pose
+):
     """Run one episode, streaming state to the parent via *conn*."""
     import time
 
@@ -62,6 +128,8 @@ def _sim_episode(conn, env, inner, player, n_act, n_goals, rl_device):
 
     player.player.init_rnn()
     obs, _ = env.reset()
+    if manual_goal_pose is not None:
+        _write_manual_goal(inner, manual_goal_pose)
     obs, _, _, _, _ = env.step(torch.zeros((1, n_act), device=inner.device))
 
     step, done, paused = 0, False, False
@@ -70,13 +138,22 @@ def _sim_episode(conn, env, inner, player, n_act, n_goals, rl_device):
     while not done:
         while conn.poll(0):
             cmd = conn.recv()
-            if cmd == "pause":
+            if isinstance(cmd, tuple) and cmd[0] == "set_goal":
+                manual_goal_pose = cmd[1]
+                _set_manual_goal_mode(inner, True, n_goals)
+                _write_manual_goal(inner, manual_goal_pose)
+                conn.send(("goal_set", manual_goal_pose))
+            elif cmd == "clear_goal":
+                manual_goal_pose = None
+                _restore_task_trajectory(inner, n_goals)
+                conn.send(("trajectory_restored",))
+            elif cmd == "pause":
                 paused = True
             elif cmd == "resume":
                 paused = False
             elif cmd == "stop":
                 conn.send(("stopped",))
-                return
+                return manual_goal_pose
 
         if paused:
             time.sleep(0.05)
@@ -95,7 +172,8 @@ def _sim_episode(conn, env, inner, player, n_act, n_goals, rl_device):
             goals_reached = max(goals_reached, int(inner._successes[0].item()))
         step += 1
 
-        conn.send(("state", state, goals_reached, n_goals, step))
+        displayed_goal_count = 0 if manual_goal_pose is not None else n_goals
+        conn.send(("state", state, goals_reached, displayed_goal_count, step))
 
         elapsed = time.time() - t0
         if (sleep := CONTROL_DT - elapsed) > 0:
@@ -103,10 +181,11 @@ def _sim_episode(conn, env, inner, player, n_act, n_goals, rl_device):
 
     goal_pct = 100 * goals_reached / n_goals
     conn.send(("done", goal_pct, step))
+    return manual_goal_pose
 
 
 def sim_worker_isaacsim(conn, category, object_name, task_name, table_urdf,
-                        config_path, checkpoint_path):
+                        config_path, checkpoint_path, table_height):
     """Child process entry-point: boots Kit, creates the env, waits for commands."""
     try:
         os.environ.setdefault("OMNI_KIT_ACCEPT_EULA", "YES")
@@ -135,7 +214,10 @@ def sim_worker_isaacsim(conn, category, object_name, task_name, table_urdf,
         )
         with open(traj_path) as f:
             traj_data = json.load(f)
-        traj_data["start_pose"][2] += Z_OFFSET
+        table_delta = float(table_height) - TABLE_Z
+        traj_data["start_pose"][2] += Z_OFFSET + table_delta
+        for goal in traj_data["goals"]:
+            goal[2] += table_delta
         n_goals = len(traj_data["goals"])
         tmp_dir = Path(tempfile.mkdtemp(prefix="dextoolbench_interactive_"))
         traj_file = _write_isaac_trajectory(traj_data["goals"], tmp_dir)
@@ -156,7 +238,7 @@ def sim_worker_isaacsim(conn, category, object_name, task_name, table_urdf,
         rs.reset_dof_pos_random_interval_arm = 0.0
         rs.reset_dof_pos_random_interval_fingers = 0.0
         rs.reset_dof_vel_random_interval = 0.0
-        rs.table_reset_z = TABLE_Z
+        rs.table_reset_z = float(table_height)
         rs.table_reset_z_range = 0.0
         rs.start_arm_higher = True
         sp = traj_data["start_pose"]
@@ -178,10 +260,21 @@ def sim_worker_isaacsim(conn, category, object_name, task_name, table_urdf,
         term.eval_success_tolerance = 0.01
         term.success_steps = 1
         term.max_consecutive_successes = n_goals
+        cfg.episode_length_s = 3600.0
 
         env = gym.make("Isaacsimenvs-SimToolReal-Direct-v0", cfg=cfg)
         inner = env.unwrapped
         inner._replay_target_lab_order = None
+
+        checkpoint_obs_dim = _checkpoint_observation_dim(checkpoint_path)
+        if checkpoint_obs_dim != int(inner.cfg.observation_space):
+            raise RuntimeError(
+                f"selected policy expects {checkpoint_obs_dim} actor observations, "
+                f"but the interactive base environment produces "
+                f"{inner.cfg.observation_space}. Select a compatible no-tactile "
+                "pose-policy checkpoint; tactile or stable-scrape checkpoints need "
+                "their task-specific evaluator."
+            )
 
         n_act = cfg.action_space
         player = RlPlayer(
@@ -200,10 +293,23 @@ def sim_worker_isaacsim(conn, category, object_name, task_name, table_urdf,
 
         conn.send(("ready", init_state))
 
+        manual_goal_pose = None
         while True:
             cmd = conn.recv()
             if cmd == "run":
-                _sim_episode(conn, env, inner, player, n_act, n_goals, rl_device)
+                manual_goal_pose = _sim_episode(
+                    conn, env, inner, player, n_act, n_goals, rl_device,
+                    manual_goal_pose,
+                )
+            elif isinstance(cmd, tuple) and cmd[0] == "set_goal":
+                manual_goal_pose = cmd[1]
+                _set_manual_goal_mode(inner, True, n_goals)
+                _write_manual_goal(inner, manual_goal_pose)
+                conn.send(("goal_set", manual_goal_pose))
+            elif cmd == "clear_goal":
+                manual_goal_pose = None
+                _restore_task_trajectory(inner, n_goals)
+                conn.send(("trajectory_restored",))
             elif cmd == "quit":
                 break
 
@@ -238,11 +344,12 @@ if __name__ == "__main__":
     parser.add_argument("--table_urdf", required=True)
     parser.add_argument("--config_path", required=True)
     parser.add_argument("--checkpoint_path", required=True)
+    parser.add_argument("--table_height", type=float, required=True)
     cli = parser.parse_args()
 
     host, port_str = cli.address.rsplit(":", 1)
     conn = Client((host, int(port_str)), authkey=bytes.fromhex(cli.authkey))
     sim_worker_isaacsim(
         conn, cli.category, cli.object_name, cli.task_name, cli.table_urdf,
-        cli.config_path, cli.checkpoint_path,
+        cli.config_path, cli.checkpoint_path, cli.table_height,
     )

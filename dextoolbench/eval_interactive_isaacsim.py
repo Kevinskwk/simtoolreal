@@ -26,10 +26,34 @@ import os
 import secrets
 import subprocess
 import sys
+from dataclasses import dataclass
 from multiprocessing.connection import Listener
 from pathlib import Path
 
 _WORKER_SCRIPT = Path(__file__).resolve().parent / "_isaacsim_interactive_worker.py"
+
+
+@dataclass(frozen=True)
+class PolicySpec:
+    checkpoint_path: str
+    config_path: str
+
+
+def _parse_policy_arg(value: str, default_config: str) -> tuple[str, PolicySpec]:
+    """Parse ``NAME=CHECKPOINT[::CONFIG]`` without splitting path colons."""
+    if "=" not in value:
+        raise argparse.ArgumentTypeError(
+            "policy must be NAME=CHECKPOINT or NAME=CHECKPOINT::CONFIG"
+        )
+    name, payload = value.split("=", 1)
+    name, payload = name.strip(), payload.strip()
+    if not name or not payload:
+        raise argparse.ArgumentTypeError("policy name and checkpoint must be non-empty")
+    checkpoint, separator, config = payload.partition("::")
+    return name, PolicySpec(
+        checkpoint_path=checkpoint.strip(),
+        config_path=config.strip() if separator else default_config,
+    )
 
 
 class _PopenProc:
@@ -53,7 +77,7 @@ class _PopenProc:
 
 
 def isaacsim_worker_factory(category, object_name, task_name, table_urdf,
-                            config_path, checkpoint_path):
+                            config_path, checkpoint_path, table_height):
     """Spawn the Kit worker as a plain subprocess; return (proc, conn)."""
     authkey = secrets.token_bytes(16)
     listener = Listener(("127.0.0.1", 0), authkey=authkey)
@@ -77,6 +101,7 @@ def isaacsim_worker_factory(category, object_name, task_name, table_urdf,
             "--table_urdf", table_urdf,
             "--config_path", str(config_path),
             "--checkpoint_path", str(checkpoint_path),
+            "--table_height", str(table_height),
         ],
         env=env,
         cwd=repo_root,
@@ -101,12 +126,35 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--checkpoint-path", type=str, default="pretrained_policy/model.pth",
-        help="Path to the policy checkpoint",
+        help="Backward-compatible checkpoint for the Original pretrained entry",
+    )
+    parser.add_argument(
+        "--policy",
+        action="append",
+        default=[],
+        metavar="NAME=CHECKPOINT[::CONFIG]",
+        help="Add a selectable policy. May be repeated.",
     )
     args = parser.parse_args()
+
+    policies = {
+        "Original pretrained": PolicySpec(args.checkpoint_path, args.config_path),
+    }
+    default_scrape = Path(
+        "outputs/2026-07-07/10-00-40/0_simtoolreal_sapg/last/model.pth"
+    )
+    if default_scrape.is_file():
+        policies["No-tactile scrape"] = PolicySpec(
+            str(default_scrape), args.config_path
+        )
+    for policy_arg in args.policy:
+        name, spec = _parse_policy_arg(policy_arg, args.config_path)
+        policies[name] = spec
+
     InteractiveDemo(
         config_path=args.config_path,
         checkpoint_path=args.checkpoint_path,
+        policies=policies,
         port=args.port,
         worker_factory=isaacsim_worker_factory,
     ).run()

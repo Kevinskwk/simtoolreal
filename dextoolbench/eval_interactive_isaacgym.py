@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import math
 import multiprocessing
 import time
 import traceback
@@ -136,6 +137,33 @@ def _snake_to_title(s: str) -> str:
 
 def quat_xyzw_to_wxyz(q):
     return (q[3], q[0], q[1], q[2])
+
+
+def quat_xyzw_to_euler_deg(q):
+    """Return intrinsic XYZ Euler angles for a normalized xyzw quaternion."""
+    x, y, z, w = np.asarray(q, dtype=float)
+    norm = np.linalg.norm((x, y, z, w))
+    if not np.isfinite(norm) or norm < 1.0e-8:
+        raise ValueError("goal quaternion must be finite and non-zero")
+    x, y, z, w = np.asarray((x, y, z, w)) / norm
+    roll = math.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+    sin_pitch = float(np.clip(2.0 * (w * y - z * x), -1.0, 1.0))
+    pitch = math.asin(sin_pitch)
+    yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    return np.rad2deg((roll, pitch, yaw))
+
+
+def euler_deg_to_quat_xyzw(euler_deg):
+    roll, pitch, yaw = np.deg2rad(np.asarray(euler_deg, dtype=float)) * 0.5
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    return np.asarray((
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+        cr * cp * cy + sr * sp * sy,
+    ))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -336,10 +364,16 @@ def sim_worker(conn, category, object_name, task_name, table_urdf,
 class InteractiveDemo:
 
     def __init__(self, config_path: str, checkpoint_path: str, port: int = 8080,
-                 worker_factory=None):
+                 worker_factory=None, policies=None):
         self.port = port
         self.config_path = config_path
         self.checkpoint_path = checkpoint_path
+        self.policies = policies or {
+            "Default": type("PolicySpec", (), {
+                "config_path": config_path,
+                "checkpoint_path": checkpoint_path,
+            })()
+        }
         # Optional alternative simulator backend hook. When set, called as
         # worker_factory(category, object_name, task_name, table_urdf,
         # config_path, checkpoint_path) and must return (proc, conn) with a
@@ -359,6 +393,8 @@ class InteractiveDemo:
 
         # Pending config (set in _load_env, consumed in _handle_ready)
         self._pending_obj_name: str = ""
+        self._last_state = None
+        self._updating_goal_controls = False
 
         # Stats
         self.ep_count = 0
@@ -393,6 +429,9 @@ class InteractiveDemo:
 
         _PH = "-- Select --"
         with self.server.gui.add_folder("Dataset Selection", expand_by_default=True):
+            self._dd_policy = self.server.gui.add_dropdown(
+                "Policy", options=list(self.policies), initial_value=next(iter(self.policies)),
+            )
             cats = [_PH] + [_snake_to_title(c) for c in sorted(DEXTOOLBENCH_DATA_STRUCTURE.keys())]
             self._dd_cat = self.server.gui.add_dropdown(
                 "Tool Category", options=cats, initial_value=_PH,
@@ -410,6 +449,36 @@ class InteractiveDemo:
             self._btn_load.on_click(lambda _: self._load_env())
             self._md_status = self.server.gui.add_markdown("**Status:** Ready")
             self._dd_cat.on_update(lambda _: self._on_cat_change())
+
+        with self.server.gui.add_folder("Environment", expand_by_default=True):
+            self._table_height = self.server.gui.add_number(
+                "Table height (m)", initial_value=TABLE_Z, min=0.0, max=1.5,
+                step=0.005,
+            )
+            self.server.gui.add_markdown("*Reload the environment after changing height.*")
+
+        with self.server.gui.add_folder("Interactive Goal", expand_by_default=True):
+            self.server.gui.add_markdown(
+                "Drag the green goal axes or enter an unrestricted pose."
+            )
+            self._goal_x = self.server.gui.add_number("X (m)", initial_value=0.0, step=0.005)
+            self._goal_y = self.server.gui.add_number("Y (m)", initial_value=0.0, step=0.005)
+            self._goal_z = self.server.gui.add_number("Z (m)", initial_value=0.75, step=0.005)
+            self._goal_roll = self.server.gui.add_number("Roll (deg)", initial_value=0.0, step=1.0)
+            self._goal_pitch = self.server.gui.add_number("Pitch (deg)", initial_value=0.0, step=1.0)
+            self._goal_yaw = self.server.gui.add_number("Yaw (deg)", initial_value=0.0, step=1.0)
+            self._goal_z_offset = self.server.gui.add_number(
+                "Tool-pose Z offset (m)", initial_value=-0.005, step=0.001,
+            )
+            self.server.gui.add_button("Apply Target Pose").on_click(
+                lambda _: self._apply_goal_controls()
+            )
+            self.server.gui.add_button("Target = Tool Pose + Z Offset").on_click(
+                lambda _: self._target_from_tool_pose()
+            )
+            self.server.gui.add_button("Use Task Trajectory").on_click(
+                lambda _: self._restore_task_trajectory()
+            )
 
         with self.server.gui.add_folder("Episode Controls", expand_by_default=True):
             self._btn_run = self.server.gui.add_button("Run Episode")
@@ -452,7 +521,9 @@ class InteractiveDemo:
         """Show a plain wooden table before any environment is loaded."""
         self._clear_dynamic()
         t = self.server.scene.add_frame(
-            "/table", position=(0, 0, TABLE_Z), wxyz=(1, 0, 0, 0), show_axes=False,
+            "/table", position=(0, 0, float(getattr(self, "_table_height", None).value)
+                                if hasattr(self, "_table_height") else TABLE_Z),
+            wxyz=(1, 0, 0, 0), show_axes=False,
         )
         self._dyn.append(t)
         self._add_box(
@@ -531,7 +602,8 @@ class InteractiveDemo:
         """Parse the per-task URDF and render coloured boxes in viser."""
         self._clear_dynamic()
         t = self.server.scene.add_frame(
-            "/table", position=(0, 0, TABLE_Z), wxyz=(1, 0, 0, 0), show_axes=False,
+            "/table", position=(0, 0, float(self._table_height.value)),
+            wxyz=(1, 0, 0, 0), show_axes=False,
         )
         self._dyn.append(t)
 
@@ -606,10 +678,11 @@ class InteractiveDemo:
         self._dyn.append(self._obj_frame)
         ViserUrdf(self.server, obj_urdf, root_node_name="/object")
 
-        self._goal_frame = self.server.scene.add_frame(
-            "/goal", show_axes=True, axes_length=0.1, axes_radius=0.001,
+        self._goal_frame = self.server.scene.add_transform_controls(
+            "/goal", scale=0.12,
         )
         self._dyn.append(self._goal_frame)
+        self._goal_frame.on_update(lambda _: self._on_goal_dragged())
         ViserUrdf(self.server, obj_urdf, root_node_name="/goal",
                   mesh_color_override=(0, 255, 0, 0.5))
 
@@ -661,9 +734,17 @@ class InteractiveDemo:
         self._md_stats.content = "**Stats:** No episodes yet"
 
         if self._worker_factory is not None:
+            selected_policy = self.policies[self._dd_policy.value]
+            checkpoint = Path(selected_policy.checkpoint_path).expanduser().resolve()
+            config = Path(selected_policy.config_path).expanduser().resolve()
+            if not checkpoint.is_file() or not config.is_file():
+                self._md_status.content = (
+                    f"**Status:** Missing policy file: {checkpoint if not checkpoint.is_file() else config}"
+                )
+                return
             self._proc, self._conn = self._worker_factory(
                 cat_key, object_name, task_name, table_urdf_rel,
-                self.config_path, self.checkpoint_path,
+                str(config), str(checkpoint), float(self._table_height.value),
             )
         else:
             ctx = multiprocessing.get_context("spawn")
@@ -715,13 +796,75 @@ class InteractiveDemo:
 
     def _update_viz(self, state_tuple):
         joint_pos, obj_pose, goal_pose = state_tuple
+        self._last_state = state_tuple
         self.robot.update_cfg(joint_pos)
         if self._obj_frame is not None:
             self._obj_frame.position = tuple(obj_pose[:3])
             self._obj_frame.wxyz = quat_xyzw_to_wxyz(obj_pose[3:7])
         if self._goal_frame is not None:
+            self._updating_goal_controls = True
             self._goal_frame.position = tuple(goal_pose[:3])
             self._goal_frame.wxyz = quat_xyzw_to_wxyz(goal_pose[3:7])
+            self._updating_goal_controls = False
+
+    def _set_goal_controls(self, pose):
+        euler = quat_xyzw_to_euler_deg(pose[3:7])
+        self._updating_goal_controls = True
+        for control, value in zip(
+            (self._goal_x, self._goal_y, self._goal_z,
+             self._goal_roll, self._goal_pitch, self._goal_yaw),
+            (*pose[:3], *euler),
+        ):
+            control.value = float(value)
+        self._updating_goal_controls = False
+
+    def _goal_from_controls(self):
+        quat = euler_deg_to_quat_xyzw(
+            (self._goal_roll.value, self._goal_pitch.value, self._goal_yaw.value)
+        )
+        return np.asarray((self._goal_x.value, self._goal_y.value,
+                           self._goal_z.value, *quat), dtype=float)
+
+    def _send_goal(self, pose):
+        if not self._env_ready:
+            self._md_status.content = "**Status:** Load an environment before setting a goal."
+            return
+        if not np.isfinite(pose).all():
+            self._md_status.content = "**Status:** Goal pose contains a non-finite value."
+            return
+        self._send(("set_goal", pose.tolist()))
+        if self._goal_frame is not None:
+            self._updating_goal_controls = True
+            self._goal_frame.position = tuple(pose[:3])
+            self._goal_frame.wxyz = quat_xyzw_to_wxyz(pose[3:])
+            self._updating_goal_controls = False
+
+    def _apply_goal_controls(self):
+        self._send_goal(self._goal_from_controls())
+
+    def _target_from_tool_pose(self):
+        if self._last_state is None:
+            self._md_status.content = "**Status:** No tool pose is available yet."
+            return
+        pose = np.asarray(self._last_state[1], dtype=float).copy()
+        pose[2] += float(self._goal_z_offset.value)
+        self._set_goal_controls(pose)
+        self._send_goal(pose)
+
+    def _on_goal_dragged(self):
+        if self._updating_goal_controls or self._goal_frame is None:
+            return
+        wxyz = np.asarray(self._goal_frame.wxyz, dtype=float)
+        pose = np.asarray((*self._goal_frame.position,
+                           wxyz[1], wxyz[2], wxyz[3], wxyz[0]), dtype=float)
+        self._set_goal_controls(pose)
+        self._send_goal(pose)
+
+    def _restore_task_trajectory(self):
+        if not self._env_ready:
+            self._md_status.content = "**Status:** Load an environment first."
+            return
+        self._send("clear_goal")
 
     # ── Message handling ───────────────────────────────────────
 
@@ -732,6 +875,7 @@ class InteractiveDemo:
             init_state = msg[1]
             self._setup_object_goal(self._pending_obj_name)
             self._update_viz(init_state)
+            self._set_goal_controls(init_state[2])
             self._env_ready = True
             self._md_status.content = "**Status:** Ready -- click **Run Episode**"
             print("[launcher] Environment ready")
@@ -770,6 +914,12 @@ class InteractiveDemo:
         elif tag == "stopped":
             self._episode_running = False
             self._md_status.content = "**Status:** Episode stopped."
+
+        elif tag == "goal_set":
+            self._md_status.content = "**Status:** Manual goal applied."
+
+        elif tag == "trajectory_restored":
+            self._md_status.content = "**Status:** Task trajectory restored."
 
         elif tag == "error":
             self._env_ready = False

@@ -76,6 +76,24 @@ Launch the web-based interactive demo (default `http://localhost:8080`): pick a 
 --checkpoint-path pretrained_policy/model.pth
 ```
 
+The local Isaac Sim demo also supports unrestricted interactive goal poses,
+virtual Z-offset targets, table-height adjustment, and policy selection. The
+repository automatically offers the original policy and the compatible
+no-tactile scrape checkpoint when both are present. Add or replace selectable
+checkpoints with repeated `--policy 'NAME=CHECKPOINT[::CONFIG]'` arguments:
+
+```
+conda run -n sharpa python dextoolbench/eval_interactive_isaacsim.py \
+  --config-path pretrained_policy/config.yaml \
+  --checkpoint-path pretrained_policy/model.pth \
+  --policy 'My no-tactile policy=outputs/<run>/0_simtoolreal_sapg/last/model.pth'
+```
+
+Table-height changes take effect on **Load Environment**. Once loaded, drag the
+green goal axes directly or use **Target = Tool Pose + Z Offset** to test a
+virtual target below the current tool pose. Manual targets are not clamped to
+the training goal volume and remain active until changed or reset.
+
 On the Isaac Gym setup, run `dextoolbench/eval_interactive_isaacgym.py` (same arguments) from the `.venv` environment instead.
 
 https://github.com/user-attachments/assets/58eb188b-662c-4190-8148-29710c9eb20f
