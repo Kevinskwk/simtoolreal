@@ -84,3 +84,43 @@ def test_v2_scenarios_require_asset_index(tmp_path):
     payload["scenarios"][0]["asset_index"] = 0
     path.write_text(json.dumps(payload))
     assert module.load_adjustment_scenarios(path)["schema_version"] == 2
+
+
+def test_allen_target_orbits_screw_axis_not_long_handle_axis():
+    # T_palm_tool identity with the palm displaced from the screw pivot in tool X.
+    current_pos = torch.tensor([[-0.10, 0.0, 0.0]])
+    current_quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    angle = torch.tensor([torch.pi / 2])
+    target_pos, target_quat = module.orbit_palm_tool_about_screw_axis(
+        current_pos,
+        current_quat,
+        angle,
+        torch.tensor([0.0, 0.0, -1.0]),
+        torch.zeros(3),
+    )
+    orbit, position, orientation = module.screw_axis_orbit_errors(
+        current_pos,
+        current_quat,
+        target_pos,
+        target_quat,
+        torch.tensor([0.0, 0.0, -1.0]),
+        torch.zeros(3),
+    )
+    assert orbit.abs().item() == pytest.approx(torch.pi / 2, rel=1e-5)
+    assert position.item() == pytest.approx(2 ** 0.5 * 0.10, rel=1e-5)
+    assert orientation.item() == pytest.approx(torch.pi / 2, rel=1e-5)
+    # An orbit about local X would leave this point unchanged, so Y motion is
+    # the regression guard against restoring screwdriver handle-axis behavior.
+    inverse_target_pos = module._quat_apply(module._quat_inv(target_quat), -target_pos)
+    assert abs(inverse_target_pos[0, 1].item()) > 0.09
+
+
+def test_allen_zero_orbit_is_identity():
+    position = torch.tensor([[0.02, -0.03, 0.18]])
+    quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    target_pos, target_quat = module.orbit_palm_tool_about_screw_axis(
+        position, quat, torch.zeros(1),
+        torch.tensor([0.0, 0.0, -1.0]), torch.tensor([0.06, 0.0, -0.03]),
+    )
+    assert torch.allclose(target_pos, position, atol=1e-6)
+    assert torch.allclose(target_quat, quat, atol=1e-6)

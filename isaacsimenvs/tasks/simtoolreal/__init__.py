@@ -24,6 +24,7 @@ from .simtoolreal_scrape_pose_env import SimToolRealTacMapScrapePoseEnv
 from .simtoolreal_stable_scrape_env import SimToolRealStableScrapeEnv
 from .simtoolreal_inhand_stable_scrape_env import SimToolRealInHandStableScrapeEnv
 from .simtoolreal_inhand_adjustment_env import SimToolRealInHandAdjustmentEnv
+from .simtoolreal_allen_key_adjustment_env import SimToolRealAllenKeyAdjustmentEnv
 from .simtoolreal_tacmap_env_cfg import (
     SimToolRealTacMapContactEnvCfg,
     SimToolRealTacMapEnvCfg,
@@ -33,6 +34,7 @@ from .simtoolreal_tacmap_env_cfg import (
     SimToolRealInHandStableScrapeEnvCfg,
     SimToolRealInHandAdjustmentEnvCfg,
     SimToolRealScrewdriverAxialAdjustmentEnvCfg,
+    SimToolRealAllenKeyAdjustmentEnvCfg,
 )
 
 __all__ = [
@@ -52,6 +54,8 @@ __all__ = [
     "SimToolRealInHandAdjustmentEnv",
     "SimToolRealInHandAdjustmentEnvCfg",
     "SimToolRealScrewdriverAxialAdjustmentEnvCfg",
+    "SimToolRealAllenKeyAdjustmentEnv",
+    "SimToolRealAllenKeyAdjustmentEnvCfg",
 ]
 
 _CFG_DIR = Path(__file__).resolve().parents[2] / "cfg"
@@ -185,6 +189,27 @@ gym.register(
         ),
         "env_cfg_yaml_entry_point": str(
             _CFG_DIR / "task" / "SimToolRealScrewdriverAxialAdjustment.yaml"
+        ),
+        "rl_games_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealSAPG.yaml"),
+        "rl_games_sapg_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealSAPG.yaml"),
+    },
+)
+
+gym.register(
+    id="Isaacsimenvs-SimToolReal-AllenKey-Adjustment-Direct-v0",
+    entry_point=(
+        "isaacsimenvs.tasks.simtoolreal.simtoolreal_allen_key_adjustment_env:"
+        "SimToolRealAllenKeyAdjustmentEnv"
+    ),
+    order_enforce=False,
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            "isaacsimenvs.tasks.simtoolreal.simtoolreal_tacmap_env_cfg:"
+            "SimToolRealAllenKeyAdjustmentEnvCfg"
+        ),
+        "env_cfg_yaml_entry_point": str(
+            _CFG_DIR / "task" / "SimToolRealAllenKeyAdjustment.yaml"
         ),
         "rl_games_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealSAPG.yaml"),
         "rl_games_sapg_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealSAPG.yaml"),

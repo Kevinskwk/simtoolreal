@@ -182,6 +182,18 @@ def hole_urdf_for_env(env, env_id: int) -> tuple[str, Path] | tuple[None, None]:
     return urdf_path.read_text(encoding="utf-8"), urdf_path
 
 
+def workpiece_urdf_for_env(env) -> tuple[str, Path] | tuple[None, None]:
+    """Return the optional task workpiece URDF (for example an Allen socket)."""
+
+    workpiece_path = getattr(env.cfg.assets, "workpiece_urdf", "")
+    if not workpiece_path:
+        return None, None
+    urdf_path = Path(workpiece_path)
+    if not urdf_path.is_file():
+        raise FileNotFoundError(f"configured workpiece URDF does not exist: {urdf_path}")
+    return urdf_path.read_text(encoding="utf-8"), urdf_path
+
+
 def capture_pose_viewer_frame(env, env_id: int) -> dict[str, Any]:
     """Capture one env-local frame from a live SimToolRealEnv."""
 
@@ -202,6 +214,7 @@ def capture_pose_viewer_frame(env, env_id: int) -> dict[str, Any]:
     goal_pos = env.goal_viz.data.root_pos_w[env_id] - origin
     table_pos = env.table.data.root_pos_w[env_id] - origin
     hole = getattr(env, "hole", None)
+    workpiece = getattr(env, "workpiece", None)
 
     frame = {
         "env_id": int(env_id),
@@ -215,6 +228,11 @@ def capture_pose_viewer_frame(env, env_id: int) -> dict[str, Any]:
     if hole is not None:
         hole_pos = hole.data.root_pos_w[env_id] - origin
         frame["hole_pose"] = _pose_xyzw(hole_pos, hole.data.root_quat_w[env_id])
+    if workpiece is not None:
+        workpiece_pos = workpiece.data.root_pos_w[env_id] - origin
+        frame["workpiece_pose"] = _pose_xyzw(
+            workpiece_pos, workpiece.data.root_quat_w[env_id]
+        )
     target_palm_pos = getattr(env, "_adjustment_target_palm_pos_w", None)
     target_palm_quat = getattr(env, "_adjustment_target_palm_quat_w", None)
     if target_palm_pos is not None and target_palm_quat is not None:
@@ -230,9 +248,11 @@ def build_pose_viewer_html(
     object_urdf_text: str,
     table_urdf_text: str,
     hole_urdf_text: str | None = None,
+    workpiece_urdf_text: str | None = None,
     object_urdf_path: Path | None = None,
     table_urdf_path: Path | None = None,
     hole_urdf_path: Path | None = None,
+    workpiece_urdf_path: Path | None = None,
     github_raw_base: str | None = None,
     url_check: str = "skip",
 ) -> str:
@@ -266,6 +286,12 @@ def build_pose_viewer_html(
             source_urdf_path=hole_urdf_path,
             raw_base=raw_base,
         )
+    if workpiece_urdf_text is not None and workpiece_urdf_path is not None:
+        workpiece_urdf_text = _rewrite_embedded_urdf_mesh_urls(
+            workpiece_urdf_text,
+            source_urdf_path=workpiece_urdf_path,
+            raw_base=raw_base,
+        )
 
     timestamps = np.arange(len(frames), dtype=np.float32) / 60.0
     robots = [
@@ -293,6 +319,15 @@ def build_pose_viewer_html(
     if hole_urdf_text is not None and all("hole_pose" in frame for frame in frames):
         robots.insert(2, make_embedded_robot(name="hole", urdf_text=hole_urdf_text))
         object_poses["hole"] = np.stack([frame["hole_pose"] for frame in frames])
+    if workpiece_urdf_text is not None and all(
+        "workpiece_pose" in frame for frame in frames
+    ):
+        robots.insert(2, make_embedded_robot(
+            name="workpiece", urdf_text=workpiece_urdf_text
+        ))
+        object_poses["workpiece"] = np.stack([
+            frame["workpiece_pose"] for frame in frames
+        ])
 
     return create_html(
         joint_names=frames[0]["robot_joint_names"],
@@ -343,6 +378,7 @@ class SimToolRealPoseViewerWrapper(gym.Wrapper):
             inner, self.env_id
         )
         self._hole_urdf_text, self._hole_urdf_path = hole_urdf_for_env(inner, self.env_id)
+        self._workpiece_urdf_text, self._workpiece_urdf_path = workpiece_urdf_for_env(inner)
 
         self._step = 0
         self._capture_index = 0
@@ -442,9 +478,11 @@ class SimToolRealPoseViewerWrapper(gym.Wrapper):
             object_urdf_text=self._object_urdf_text,
             table_urdf_text=self._table_urdf_text,
             hole_urdf_text=self._hole_urdf_text,
+            workpiece_urdf_text=self._workpiece_urdf_text,
             object_urdf_path=self._object_urdf_path,
             table_urdf_path=self._table_urdf_path,
             hole_urdf_path=self._hole_urdf_path,
+            workpiece_urdf_path=self._workpiece_urdf_path,
             github_raw_base=self.github_raw_base,
             url_check=self.url_check,
         )

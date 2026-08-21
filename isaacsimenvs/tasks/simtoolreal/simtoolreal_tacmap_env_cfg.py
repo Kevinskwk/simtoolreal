@@ -57,6 +57,13 @@ class SimToolRealTacMapEnvCfg(SimToolRealEnvCfg):
     fingertip_tool_contact_filter_paths: tuple[str, ...] = (
         "/World/envs/env_.*/Object/object_root",
     )
+    enable_palm_tool_contact_sensor: bool = False
+    palm_tool_contact_sensor_prim_path: str = (
+        "/World/envs/env_.*/Robot/iiwa14_link_7"
+    )
+    palm_tool_contact_sensor_filter_paths: tuple[str, ...] = (
+        "/World/envs/env_.*/Object/object_root",
+    )
 
     points_npy_4f: str = str(_TACMAP_ROOT / "tactileSensor_map_4F_point_origin.npy")
     normals_npy_4f: str = str(_TACMAP_ROOT / "tactileSensor_map_4F_normal_origin.npy")
@@ -497,6 +504,7 @@ class SimToolRealScrewdriverAxialAdjustmentEnvCfg(SimToolRealInHandAdjustmentEnv
     grasp_bank_min_entries: int = 4
     adjustment_finger_perturb_fractions: tuple[float, ...] = (0.0, 0.01, 0.02, 0.03)
     adjustment_target_translation_mode: str = "none"
+    # The Allen override samples about local -Z through allen_screw_pivot_tool_m.
     adjustment_target_rotation_axis: str = "tool_x"
     adjustment_target_axial_translation_m: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0)
     adjustment_target_perpendicular_translation_m: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0)
@@ -509,6 +517,72 @@ class SimToolRealScrewdriverAxialAdjustmentEnvCfg(SimToolRealInHandAdjustmentEnv
     )
     adjustment_tool_pose_delay_steps: tuple[int, ...] = (180, 150, 120, 90)
     adjustment_tool_pose_ramp_steps: tuple[int, ...] = (180, 150, 120, 90)
+
+
+@configclass
+class SimToolRealAllenKeyAdjustmentEnvCfg(SimToolRealInHandAdjustmentEnvCfg):
+    """Palm-supported Allen-key regrasp around the engaged screw axis."""
+
+    assets: AssetsCfg = AssetsCfg(
+        handle_head_types=("screwdriver",),
+        object_urdf=str(
+            Path(__file__).resolve().parents[3]
+            / "assets" / "urdf" / "objects" / "allen_key_canonical.urdf"
+        ),
+        object_scale=(3.5, 0.5, 1.5),
+        workpiece_urdf=str(
+            Path(__file__).resolve().parents[3]
+            / "assets" / "urdf" / "workpieces" / "allen_key_hex_socket.urdf"
+        ),
+    )
+    grasp_bank_path: str = str(
+        Path(__file__).resolve().parents[3]
+        / "assets" / "grasp_banks" / "allen_key_canonical_v1.json"
+    )
+    grasp_bank_min_entries: int = 1
+    episode_length_s: float = 8.0
+    enable_palm_tool_contact_sensor: bool = True
+    adjustment_terminate_on_success: bool = False
+    adjustment_finger_perturb_fractions: tuple[float, ...] = (0.0, 0.0, 0.0, 0.01, 0.02)
+    adjustment_target_translation_mode: str = "none"
+    adjustment_target_rotation_axis: str = "tool_x"
+    adjustment_target_axial_translation_m: tuple[float, ...] = (0.0,) * 5
+    adjustment_target_perpendicular_translation_m: tuple[float, ...] = (0.0,) * 5
+    adjustment_target_rotation_deg: tuple[float, ...] = (5.0, 10.0, 15.0, 20.0, 30.0)
+    adjustment_relative_position_tolerance_stages_m: tuple[float, ...] = (
+        0.008, 0.007, 0.006, 0.005, 0.004
+    )
+    adjustment_relative_rotation_tolerance_stages_deg: tuple[float, ...] = (
+        6.0, 5.0, 4.0, 3.0, 2.5
+    )
+    adjustment_tool_pose_delay_steps: tuple[int, ...] = (0,) * 5
+    adjustment_tool_pose_ramp_steps: tuple[int, ...] = (1,) * 5
+    allen_adjustment_steps: int = 360
+    allen_hold_steps: int = 120
+    allen_success_hold_steps: int = 60
+    allen_screw_axis_tool: tuple[float, float, float] = (0.0, 0.0, -1.0)
+    allen_screw_pivot_tool_m: tuple[float, float, float] = (0.192, 0.0, -0.03)
+    allen_workpiece_from_tool_m: tuple[float, float, float] = (0.192, 0.0, -0.095)
+    allen_socket_lateral_tolerance_m: float = 0.003
+    allen_socket_insertion_tolerance_m: float = 0.006
+    allen_socket_tilt_tolerance_deg: float = 5.0
+    allen_palm_contact_threshold_n: float = 0.05
+    allen_tool_position_tolerance_m: float = 0.010
+    allen_tool_rotation_tolerance_deg: float = 5.0
+    obs: ObsCfg = ObsCfg(
+        obs_list=_BASE_OBS.obs_list + (
+            "allen_current_palm_tool", "allen_target_palm_tool",
+            "allen_target_error", "allen_geometry", "allen_socket_state",
+            "allen_phase",
+        ),
+        state_list=_BASE_OBS.state_list + (
+            "stable_support_count", "stable_relative_linear_speed",
+            "stable_relative_angular_speed", "allen_current_palm_tool",
+            "allen_target_palm_tool", "allen_target_error", "allen_geometry",
+            "allen_socket_state", "allen_phase", "allen_validity",
+        ),
+        clamp_abs_observations=_BASE_OBS.clamp_abs_observations,
+    )
 
 @configclass
 class SimToolRealFixedGraspNormalForceEnvCfg(SimToolRealTacMapScrapePoseEnvCfg):

@@ -14,7 +14,7 @@ SCHEMA_VERSION = 2
 MULTI_ASSET_SCHEMA_VERSION = 3
 JOINT_COUNT = 29
 SUPPORTED_TOOL_TYPES = frozenset(
-    ("hammer", "screwdriver", "eraser", "spatula", "marker", "brush")
+    ("hammer", "screwdriver", "eraser", "spatula", "marker", "brush", "allen_key")
 )
 
 

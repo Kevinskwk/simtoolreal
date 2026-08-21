@@ -76,6 +76,13 @@ OBS_FIELD_SIZES: dict[str, int] = {
     "adjustment_pose_error": 2,
     "adjustment_phase": 1,
     "adjustment_table": 4,
+    "allen_current_palm_tool": 7,
+    "allen_target_palm_tool": 7,
+    "allen_target_error": 5,
+    "allen_geometry": 9,
+    "allen_socket_state": 4,
+    "allen_phase": 2,
+    "allen_validity": 5,
 }
 
 SCRAPE_CONTACT_FIELDS: set[str] = {
@@ -108,6 +115,34 @@ ADJUSTMENT_FIELDS: set[str] = {
     "adjustment_pose_error",
     "adjustment_phase", "adjustment_table",
 }
+
+ALLEN_KEY_FIELDS: set[str] = {
+    "allen_current_palm_tool", "allen_target_palm_tool", "allen_target_error",
+    "allen_geometry", "allen_socket_state", "allen_phase", "allen_validity",
+}
+
+
+def _allen_key_obs(env) -> dict[str, torch.Tensor]:
+    required = (
+        "_allen_current_palm_tool_obs", "_allen_target_palm_tool_obs",
+        "_allen_target_error_obs", "_allen_geometry_obs",
+        "_allen_socket_state_obs", "_allen_phase_obs", "_allen_validity_obs",
+    )
+    missing = [name for name in required if not hasattr(env, name)]
+    if missing:
+        raise RuntimeError(
+            "Allen-key observations were requested before task initialization: "
+            + ", ".join(missing)
+        )
+    return {
+        "allen_current_palm_tool": env._allen_current_palm_tool_obs,
+        "allen_target_palm_tool": env._allen_target_palm_tool_obs,
+        "allen_target_error": env._allen_target_error_obs,
+        "allen_geometry": env._allen_geometry_obs,
+        "allen_socket_state": env._allen_socket_state_obs,
+        "allen_phase": env._allen_phase_obs,
+        "allen_validity": env._allen_validity_obs,
+    }
 
 
 def register_obs_field_size(name: str, size: int) -> None:
@@ -510,6 +545,8 @@ def build_observations(env) -> dict[str, torch.Tensor]:
         obs_clean.update(_stable_scrape_obs(env))
     if requested_fields & ADJUSTMENT_FIELDS:
         obs_clean.update(_adjustment_obs(env))
+    if requested_fields & ALLEN_KEY_FIELDS:
+        obs_clean.update(_allen_key_obs(env))
 
     obs_noisy = dict(obs_clean)
     obs_noisy["object_rot"] = noisy_obj_rot_xyzw

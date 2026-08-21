@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<robot name="allen_key_hex_socket">
+  <link name="workpiece_root">
+    <visual>
+      <origin xyz="0 0 0.015" rpy="0 0 0"/>
+      <geometry><box size="0.15 0.15 0.03"/></geometry>
+      <material name="workpiece"><color rgba="0.32 0.36 0.40 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.015" rpy="0 0 0"/>
+      <geometry><box size="0.15 0.15 0.03"/></geometry>
+    </collision>
+    <!-- Six tangent walls form a 24 mm across-flats opening. The 2 mm radial
+         clearance prevents reset impulses while retaining lateral support. -->
+    <visual><origin xyz="0.016 0 0.0425" rpy="0 0 0"/><geometry><box size="0.008 0.030 0.025"/></geometry><material name="socket"><color rgba="0.55 0.58 0.62 1"/></material></visual>
+    <collision><origin xyz="0.016 0 0.0425" rpy="0 0 0"/><geometry><box size="0.008 0.030 0.025"/></geometry></collision>
+    <visual><origin xyz="-0.016 0 0.0425" rpy="0 0 0"/><geometry><box size="0.008 0.030 0.025"/></geometry><material name="socket"/></visual>
+    <collision><origin xyz="-0.016 0 0.0425" rpy="0 0 0"/><geometry><box size="0.008 0.030 0.025"/></geometry></collision>
+    <visual><origin xyz="0.008 0.013856 0.0425" rpy="0 0 1.0471975512"/><geometry><box size="0.008 0.030 0.025"/></geometry><material name="socket"/></visual>
+    <collision><origin xyz="0.008 0.013856 0.0425" rpy="0 0 1.0471975512"/><geometry><box size="0.008 0.030 0.025"/></geometry></collision>
+    <visual><origin xyz="-0.008 -0.013856 0.0425" rpy="0 0 1.0471975512"/><geometry><box size="0.008 0.030 0.025"/></geometry><material name="socket"/></visual>
+    <collision><origin xyz="-0.008 -0.013856 0.0425" rpy="0 0 1.0471975512"/><geometry><box size="0.008 0.030 0.025"/></geometry></collision>
+    <visual><origin xyz="-0.008 0.013856 0.0425" rpy="0 0 -1.0471975512"/><geometry><box size="0.008 0.030 0.025"/></geometry><material name="socket"/></visual>
+    <collision><origin xyz="-0.008 0.013856 0.0425" rpy="0 0 -1.0471975512"/><geometry><box size="0.008 0.030 0.025"/></geometry></collision>
+    <visual><origin xyz="0.008 -0.013856 0.0425" rpy="0 0 -1.0471975512"/><geometry><box size="0.008 0.030 0.025"/></geometry><material name="socket"/></visual>
+    <collision><origin xyz="0.008 -0.013856 0.0425" rpy="0 0 -1.0471975512"/><geometry><box size="0.008 0.030 0.025"/></geometry></collision>
+    <inertial>
+      <origin xyz="0 0 0.02" rpy="0 0 0"/>
+      <mass value="5.0"/>
+      <inertia ixx="0.01" iyy="0.01" izz="0.018" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+</robot>

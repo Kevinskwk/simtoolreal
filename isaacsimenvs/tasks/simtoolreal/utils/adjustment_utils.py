@@ -12,6 +12,106 @@ import torch
 SCENARIO_KINDS = ("nominal", "fixed_pose_hard")
 
 
+def _quat_mul(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
+    w1, x1, y1, z1 = first.unbind(-1)
+    w2, x2, y2, z2 = second.unbind(-1)
+    return torch.stack((
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ), dim=-1)
+
+
+def _quat_inv(value: torch.Tensor) -> torch.Tensor:
+    result = value.clone()
+    result[..., 1:] *= -1.0
+    return result / value.square().sum(-1, keepdim=True).clamp_min(1.0e-12)
+
+
+def _quat_apply(quat: torch.Tensor, vector: torch.Tensor) -> torch.Tensor:
+    pure = torch.cat((torch.zeros_like(vector[..., :1]), vector), dim=-1)
+    return _quat_mul(_quat_mul(quat, pure), _quat_inv(quat))[..., 1:]
+
+
+def _quat_from_angle_axis(angle: torch.Tensor, axis: torch.Tensor) -> torch.Tensor:
+    half = 0.5 * angle
+    return torch.cat((torch.cos(half).unsqueeze(-1), axis * torch.sin(half).unsqueeze(-1)), -1)
+
+
+def orbit_palm_tool_about_screw_axis(
+    palm_to_tool_pos: torch.Tensor,
+    palm_to_tool_quat: torch.Tensor,
+    angle_rad: torch.Tensor,
+    screw_axis_tool: torch.Tensor,
+    screw_pivot_tool: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Orbit the palm around a tool-frame screw axis and return target T_palm_tool."""
+    if palm_to_tool_pos.ndim != 2 or palm_to_tool_pos.shape[-1] != 3:
+        raise ValueError("palm_to_tool_pos must have shape (N, 3)")
+    count = palm_to_tool_pos.shape[0]
+    if palm_to_tool_quat.shape != (count, 4) or angle_rad.shape != (count,):
+        raise ValueError("Allen-key orbit inputs have incompatible shapes")
+    for name, value in (
+        ("screw_axis_tool", screw_axis_tool),
+        ("screw_pivot_tool", screw_pivot_tool),
+    ):
+        if value.shape not in ((3,), (count, 3)):
+            raise ValueError(f"{name} must have shape (3,) or (N, 3)")
+    axis = screw_axis_tool.expand(count, -1) if screw_axis_tool.ndim == 1 else screw_axis_tool
+    pivot = screw_pivot_tool.expand(count, -1) if screw_pivot_tool.ndim == 1 else screw_pivot_tool
+    axis = torch.nn.functional.normalize(axis, dim=-1)
+    tool_to_palm_quat = _quat_inv(palm_to_tool_quat)
+    tool_to_palm_pos = _quat_apply(tool_to_palm_quat, -palm_to_tool_pos)
+    orbit_quat = _quat_from_angle_axis(angle_rad, axis)
+    target_tool_to_palm_pos = pivot + _quat_apply(orbit_quat, tool_to_palm_pos - pivot)
+    target_tool_to_palm_quat = _quat_mul(orbit_quat, tool_to_palm_quat)
+    target_palm_to_tool_quat = _quat_inv(target_tool_to_palm_quat)
+    target_palm_to_tool_pos = _quat_apply(
+        target_palm_to_tool_quat, -target_tool_to_palm_pos
+    )
+    return target_palm_to_tool_pos, target_palm_to_tool_quat
+
+
+def screw_axis_orbit_errors(
+    current_palm_to_tool_pos: torch.Tensor,
+    current_palm_to_tool_quat: torch.Tensor,
+    target_palm_to_tool_pos: torch.Tensor,
+    target_palm_to_tool_quat: torch.Tensor,
+    screw_axis_tool: torch.Tensor,
+    screw_pivot_tool: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return signed orbital, palm-position, and palm-orientation errors."""
+    count = current_palm_to_tool_pos.shape[0]
+    axis = screw_axis_tool.expand(count, -1) if screw_axis_tool.ndim == 1 else screw_axis_tool
+    pivot = screw_pivot_tool.expand(count, -1) if screw_pivot_tool.ndim == 1 else screw_pivot_tool
+    axis = torch.nn.functional.normalize(axis, dim=-1)
+
+    def tool_to_palm(pos, quat):
+        inverse = _quat_inv(quat)
+        return _quat_apply(inverse, -pos), inverse
+
+    current_pos, current_quat = tool_to_palm(
+        current_palm_to_tool_pos, current_palm_to_tool_quat
+    )
+    target_pos, target_quat = tool_to_palm(
+        target_palm_to_tool_pos, target_palm_to_tool_quat
+    )
+    current_radial = current_pos - pivot
+    target_radial = target_pos - pivot
+    current_radial -= (current_radial * axis).sum(-1, keepdim=True) * axis
+    target_radial -= (target_radial * axis).sum(-1, keepdim=True) * axis
+    current_unit = torch.nn.functional.normalize(current_radial, dim=-1)
+    target_unit = torch.nn.functional.normalize(target_radial, dim=-1)
+    sine = (axis * torch.linalg.cross(current_unit, target_unit, dim=-1)).sum(-1)
+    cosine = (current_unit * target_unit).sum(-1).clamp(-1.0, 1.0)
+    orbit_error = torch.atan2(sine, cosine)
+    position_error = torch.linalg.vector_norm(current_pos - target_pos, dim=-1)
+    alignment = torch.abs((current_quat * target_quat).sum(-1)).clamp(0.0, 1.0)
+    orientation_error = 2.0 * torch.acos(alignment)
+    return orbit_error, position_error, orientation_error
+
+
 def load_adjustment_scenarios(path: str | Path) -> dict:
     path = Path(path)
     if not path.is_file():
@@ -138,4 +238,5 @@ def adjustment_reward_terms(
 __all__ = [
     "SCENARIO_KINDS", "adjustment_reward_terms", "arm_controllability_metrics",
     "controllability_score", "load_adjustment_scenarios",
+    "orbit_palm_tool_about_screw_axis", "screw_axis_orbit_errors",
 ]

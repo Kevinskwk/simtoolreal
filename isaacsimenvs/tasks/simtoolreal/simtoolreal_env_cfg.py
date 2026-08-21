@@ -58,6 +58,8 @@ class AssetsCfg:
         "assets/urdf/kuka_sharpa_description/iiwa14_left_sharpa_adjusted_restricted.urdf"
     )
     table_urdf: str = "assets/urdf/table_narrow.urdf"
+    # Optional task-owned kinematic workpiece, such as an Allen-key socket.
+    workpiece_urdf: str = ""
     # Per-env scale ranges applied to the table mesh at scene-build time.
     # Sampled independently per env: sx ~ U(table_scale_range_x), sy ~ U(table_scale_range_y).
     # Z is held at 1.0 so the table surface height stays at table_reset_z (which the

@@ -1621,7 +1621,7 @@ def apply_physx_material_properties(env) -> None:
 
     robot_view.set_material_properties(robot_materials, env_ids)
 
-    for name in ("table", "object", "goal_viz", "hole"):
+    for name in ("table", "object", "goal_viz", "hole", "workpiece"):
         if not hasattr(env, name):
             continue
         view = getattr(env, name).root_physx_view
@@ -1827,6 +1827,19 @@ def setup_scene(env) -> None:
             f"baked {len(table_usd_paths)} scaled table USD variants "
             f"x_range={scale_range_x} y_range={scale_range_y}",
         )
+    workpiece_usd_paths = None
+    if assets_cfg.workpiece_urdf:
+        workpiece_urdf = Path(assets_cfg.workpiece_urdf)
+        if not workpiece_urdf.is_file():
+            raise FileNotFoundError(f"workpiece_urdf not found: {workpiece_urdf}")
+        env._workpiece_urdf_paths = [str(workpiece_urdf)]
+        workpiece_usd_paths = [_bake_usd(
+            _convert_urdf_to_usd(str(workpiece_urdf), usd_work_dir, fix_base=False),
+            bake_root, "workpiece",
+            props=dict(
+                kinematic_enabled=True, disable_gravity=True, articulation_enabled=False,
+            ),
+        )]
     _log_scene_step(setup_t0, "resolved baked USDs")
 
     # 3. Pre-create env roots so regex spawns resolve to every env.
@@ -1836,11 +1849,14 @@ def setup_scene(env) -> None:
     activate_fingertip_tool_contact_sensors = bool(
         getattr(env.cfg, "enable_fingertip_tool_contact_sensors", False)
     )
+    activate_robot_contact_sensors = activate_fingertip_tool_contact_sensors or bool(
+        getattr(env.cfg, "enable_palm_tool_contact_sensor", False)
+    )
     env.robot = Articulation(build_robot_articulation_usd_cfg(
         robot_usd_path,
         start_arm_higher=getattr(env.cfg.reset, "start_arm_higher", False),
         arm_damping_scale=float(getattr(env.cfg, "arm_drive_damping_scale", 1.0)),
-        activate_contact_sensors=activate_fingertip_tool_contact_sensors,
+        activate_contact_sensors=activate_robot_contact_sensors,
     ))
     activate_tool_table_contact_sensors = bool(
         getattr(env.cfg, "enable_tool_table_contact_force_reward", False)
@@ -1858,11 +1874,16 @@ def setup_scene(env) -> None:
             object_usd_paths,
             activate_contact_sensors=(
                 activate_tool_table_contact_sensors
-                or activate_fingertip_tool_contact_sensors
+                or activate_robot_contact_sensors
             ),
         )
     )
     env.goal_viz = RigidObject(build_rigid_object_cfg("/World/envs/env_.*/GoalViz", goalviz_usd_paths))
+    if workpiece_usd_paths is not None:
+        env.workpiece = RigidObject(build_rigid_object_cfg(
+            "/World/envs/env_.*/Workpiece", workpiece_usd_paths,
+            activate_contact_sensors=True,
+        ))
     _log_scene_step(setup_t0, "spawned robot/table/object/goalviz")
 
     # 5. Ground plane + dome light (global, outside env_*).
@@ -1878,6 +1899,8 @@ def setup_scene(env) -> None:
     env.scene.rigid_objects["table"] = env.table
     env.scene.rigid_objects["object"] = env.object
     env.scene.rigid_objects["goal_viz"] = env.goal_viz
+    if hasattr(env, "workpiece"):
+        env.scene.rigid_objects["workpiece"] = env.workpiece
     hide_goal_viz_for_student_camera(env)
     setup_student_camera(env)
     _log_scene_step(setup_t0, "registered assets with scene")
