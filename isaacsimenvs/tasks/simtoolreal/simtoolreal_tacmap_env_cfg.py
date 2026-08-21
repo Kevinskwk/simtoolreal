@@ -40,6 +40,24 @@ class SimToolRealTacMapEnvCfg(SimToolRealEnvCfg):
     # PhysX to resolve non-physics scopes such as `/Object/Looks`.
     vbts_target_rigid_expr: str = "/World/envs/env_.*/Object/object_root"
 
+    # Optional pair-filtered PhysX measurements used by the wrench
+    # observability gate. A separate sensor is required for every finger:
+    # Isaac Lab does not guarantee correct pair filtering when one sensor
+    # expression resolves to multiple bodies in an environment.
+    enable_fingertip_tool_contact_sensors: bool = False
+    fingertip_tool_contact_sensor_update_period: float = 0.0
+    fingertip_tool_contact_max_data_count: int = 16
+    fingertip_tool_contact_prim_paths: tuple[str, ...] = (
+        "/World/envs/env_.*/Robot/left_thumb_DP",
+        "/World/envs/env_.*/Robot/left_index_DP",
+        "/World/envs/env_.*/Robot/left_middle_DP",
+        "/World/envs/env_.*/Robot/left_ring_DP",
+        "/World/envs/env_.*/Robot/left_pinky_DP",
+    )
+    fingertip_tool_contact_filter_paths: tuple[str, ...] = (
+        "/World/envs/env_.*/Object/object_root",
+    )
+
     points_npy_4f: str = str(_TACMAP_ROOT / "tactileSensor_map_4F_point_origin.npy")
     normals_npy_4f: str = str(_TACMAP_ROOT / "tactileSensor_map_4F_normal_origin.npy")
     points_npy_th: str = str(_TACMAP_ROOT / "tactileSensor_map_TH_point.npy")
@@ -393,6 +411,104 @@ class SimToolRealInHandStableScrapeEnvCfg(SimToolRealStableScrapeEnvCfg):
     inhand_target_max_rotation_deg: float = 30.0
     inhand_target_sampling_attempts: int = 32
     grasp_loss_grace_steps: int = 15
+
+
+@configclass
+class SimToolRealInHandAdjustmentEnvCfg(SimToolRealInHandStableScrapeEnvCfg):
+    """Extrinsic in-hand grasp adjustment toward a palm-to-tool target."""
+
+    episode_length_s: float = 8.0
+    obs: ObsCfg = ObsCfg(
+        obs_list=_BASE_OBS.obs_list + (
+            "adjustment_target_error", "adjustment_target_palm_error",
+            "adjustment_pose_error",
+            "adjustment_phase", "adjustment_table",
+        ),
+        state_list=_BASE_OBS.state_list + (
+            "stable_support_count", "stable_relative_linear_speed",
+            "stable_relative_angular_speed", "adjustment_target_error",
+            "adjustment_target_palm_error", "adjustment_pose_error",
+            "adjustment_phase", "adjustment_table",
+        ),
+        clamp_abs_observations=_BASE_OBS.clamp_abs_observations,
+    )
+
+    adjustment_success_steps: int = 20
+    adjustment_relative_position_tolerance_m: float = 0.002
+    adjustment_relative_rotation_tolerance_deg: float = 2.0
+    adjustment_relative_position_tolerance_stages_m: tuple[float, ...] = (
+        0.005, 0.004, 0.003, 0.0025, 0.002
+    )
+    adjustment_relative_rotation_tolerance_stages_deg: tuple[float, ...] = (
+        5.0, 4.0, 3.0, 2.5, 2.0
+    )
+    adjustment_tool_position_tolerance_m: float = 0.02
+    adjustment_tool_rotation_tolerance_deg: float = 10.0
+    adjustment_tool_position_hard_limit_m: float = 0.15
+    adjustment_tool_rotation_hard_limit_deg: float = 75.0
+    adjustment_pose_failure_steps: int = 15
+    adjustment_terminate_on_success: bool = True
+    adjustment_min_fingertip_support: int = 2
+    adjustment_table_clearance_range_m: tuple[float, float] = (0.002, 0.03)
+    adjustment_curriculum_success_threshold: float = 0.80
+    adjustment_curriculum_min_eligible_count: int = 256
+    adjustment_finger_perturb_fractions: tuple[float, ...] = (0.0, 0.01, 0.02, 0.03, 0.05)
+    adjustment_target_translation_mode: str = "anisotropic"  # anisotropic | none
+    adjustment_target_rotation_axis: str = "random"  # random | tool_x
+    adjustment_target_axial_translation_m: tuple[float, ...] = (0.008, 0.015, 0.025, 0.035, 0.045)
+    adjustment_target_perpendicular_translation_m: tuple[float, ...] = (0.002, 0.003, 0.005, 0.0075, 0.010)
+    adjustment_target_rotation_deg: tuple[float, ...] = (10.0, 20.0, 30.0, 45.0, 60.0)
+    adjustment_target_axial_fraction_of_tool_length: float = 0.25
+    adjustment_target_perpendicular_fraction_of_tool_thickness: float = 0.30
+    adjustment_target_total_translation_max_m: float = 0.05
+    adjustment_tool_pose_delay_steps: tuple[int, ...] = (180, 150, 120, 90, 60)
+    adjustment_tool_pose_ramp_steps: tuple[int, ...] = (180, 150, 120, 90, 60)
+    adjustment_relative_position_reward_weight: float = 2.0
+    adjustment_relative_rotation_reward_weight: float = 1.0
+    adjustment_relative_position_reward_sigma_m: float = 0.015
+    adjustment_relative_rotation_reward_sigma_deg: float = 10.0
+    adjustment_tool_position_penalty_weight: float = 20.0
+    adjustment_tool_rotation_penalty_weight: float = 0.5
+    adjustment_fingertip_support_reward_weight: float = 0.25
+    adjustment_action_rate_penalty_weight: float = 0.01
+    adjustment_success_bonus: float = 10.0
+
+
+@configclass
+class SimToolRealScrewdriverAxialAdjustmentEnvCfg(SimToolRealInHandAdjustmentEnvCfg):
+    """Screwdriver regrasp with rotation only about the tool-local handle axis."""
+
+    assets: AssetsCfg = AssetsCfg(
+        handle_head_types=("screwdriver",),
+        object_urdf="",
+        object_scale=None,
+        num_assets_per_type=20,
+        procedural_asset_seed=42,
+        shuffle_assets=True,
+        object_pool_limit=0,
+    )
+    grasp_bank_path: str = str(
+        Path(__file__).resolve().parents[3]
+        / "outputs"
+        / "inhand_adjustment_cache"
+        / "screwdriver_seed42_n20"
+        / "grasps.json"
+    )
+    grasp_bank_min_entries: int = 4
+    adjustment_finger_perturb_fractions: tuple[float, ...] = (0.0, 0.01, 0.02, 0.03)
+    adjustment_target_translation_mode: str = "none"
+    adjustment_target_rotation_axis: str = "tool_x"
+    adjustment_target_axial_translation_m: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0)
+    adjustment_target_perpendicular_translation_m: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0)
+    adjustment_target_rotation_deg: tuple[float, ...] = (10.0, 20.0, 30.0, 45.0)
+    adjustment_relative_position_tolerance_stages_m: tuple[float, ...] = (
+        0.005, 0.004, 0.003, 0.002
+    )
+    adjustment_relative_rotation_tolerance_stages_deg: tuple[float, ...] = (
+        5.0, 4.0, 3.0, 2.0
+    )
+    adjustment_tool_pose_delay_steps: tuple[int, ...] = (180, 150, 120, 90)
+    adjustment_tool_pose_ramp_steps: tuple[int, ...] = (180, 150, 120, 90)
 
 @configclass
 class SimToolRealFixedGraspNormalForceEnvCfg(SimToolRealTacMapScrapePoseEnvCfg):

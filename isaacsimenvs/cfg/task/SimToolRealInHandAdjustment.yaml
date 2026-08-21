@@ -1,0 +1,84 @@
+# Extrinsic grasp adjustment toward sampled palm-to-tool relationships.
+use_tacmap: false
+enable_vbts: false
+include_tacmap_in_policy: false
+enable_tool_table_contact_force_reward: false
+enable_tool_table_contact_sensor: false
+
+assets:
+  object_urdf: ""
+  object_scale: null
+  handle_head_types: [hammer, screwdriver, marker, spatula, eraser, brush]
+  num_assets_per_type: 20
+  procedural_asset_seed: 42
+  shuffle_assets: true
+  object_pool_limit: 0
+
+grasp_bank_min_entries: 2
+grasp_bank_joint_limit_tolerance_rad: 0.0005
+
+adjustment_success_steps: 20
+adjustment_relative_position_tolerance_m: 0.002
+adjustment_relative_rotation_tolerance_deg: 2.0
+adjustment_relative_position_tolerance_stages_m: [0.005, 0.004, 0.003, 0.0025, 0.002]
+adjustment_relative_rotation_tolerance_stages_deg: [5.0, 4.0, 3.0, 2.5, 2.0]
+adjustment_tool_position_tolerance_m: 0.02
+adjustment_tool_rotation_tolerance_deg: 10.0
+adjustment_tool_position_hard_limit_m: 0.15
+adjustment_tool_rotation_hard_limit_deg: 75.0
+adjustment_pose_failure_steps: 15
+adjustment_terminate_on_success: true
+adjustment_min_fingertip_support: 2
+adjustment_table_clearance_range_m: [0.002, 0.03]
+adjustment_curriculum_success_threshold: 0.80
+adjustment_curriculum_min_eligible_count: 256
+adjustment_finger_perturb_fractions: [0.0, 0.01, 0.02, 0.03, 0.05]
+adjustment_target_axial_translation_m: [0.008, 0.015, 0.025, 0.035, 0.045]
+adjustment_target_perpendicular_translation_m: [0.002, 0.003, 0.005, 0.0075, 0.010]
+adjustment_target_rotation_deg: [10.0, 20.0, 30.0, 45.0, 60.0]
+adjustment_target_axial_fraction_of_tool_length: 0.25
+adjustment_target_perpendicular_fraction_of_tool_thickness: 0.30
+adjustment_target_total_translation_max_m: 0.05
+adjustment_tool_pose_delay_steps: [180, 150, 120, 90, 60]
+adjustment_tool_pose_ramp_steps: [180, 150, 120, 90, 60]
+adjustment_relative_position_reward_weight: 2.0
+adjustment_relative_rotation_reward_weight: 1.0
+adjustment_relative_position_reward_sigma_m: 0.015
+adjustment_relative_rotation_reward_sigma_deg: 10.0
+adjustment_tool_position_penalty_weight: 20.0
+adjustment_tool_rotation_penalty_weight: 0.5
+adjustment_fingertip_support_reward_weight: 0.25
+adjustment_action_rate_penalty_weight: 0.01
+adjustment_success_bonus: 10.0
+
+episode_length_s: 8.0
+scene:
+  num_envs: 12288
+domain_randomization:
+  use_obs_delay: false
+  use_action_delay: false
+  use_object_state_delay_noise: false
+  joint_velocity_obs_noise_std: 0.0
+  force_scale: 0.0
+  torque_scale: 0.0
+  force_prob_range: [1.0e-12, 1.0e-12]
+  torque_prob_range: [1.0e-12, 1.0e-12]
+termination:
+  episode_length: 480
+  max_consecutive_successes: 0
+
+obs:
+  state_list: [joint_pos, joint_vel, prev_action_targets, palm_pos, palm_rot, palm_vel,
+               object_rot, object_vel, fingertip_pos_rel_palm, keypoints_rel_palm,
+               keypoints_rel_goal, object_scales, closest_keypoint_max_dist,
+               closest_fingertip_dist, lifted_object, progress, successes, reward,
+               stable_support_count, stable_relative_linear_speed,
+               stable_relative_angular_speed, adjustment_target_error,
+               adjustment_target_palm_error,
+               adjustment_pose_error, adjustment_phase, adjustment_table]
+  obs_list: [joint_pos, joint_vel, prev_action_targets, palm_pos, palm_rot,
+             object_rot, fingertip_pos_rel_palm, keypoints_rel_palm,
+             keypoints_rel_goal, object_scales, adjustment_target_error,
+             adjustment_target_palm_error,
+             adjustment_pose_error, adjustment_phase, adjustment_table]
+  clamp_abs_observations: 10.0

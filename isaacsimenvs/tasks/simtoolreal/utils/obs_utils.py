@@ -71,6 +71,11 @@ OBS_FIELD_SIZES: dict[str, int] = {
     "stable_relative_linear_speed": 1,
     "stable_relative_angular_speed": 1,
     "stable_over_force": 1,
+    "adjustment_target_error": 6,
+    "adjustment_target_palm_error": 6,
+    "adjustment_pose_error": 2,
+    "adjustment_phase": 1,
+    "adjustment_table": 4,
 }
 
 SCRAPE_CONTACT_FIELDS: set[str] = {
@@ -96,6 +101,12 @@ STABLE_SCRAPE_FIELDS: set[str] = {
     "stable_support_count", "stable_contact_persistence",
     "stable_relative_linear_speed", "stable_relative_angular_speed",
     "stable_over_force",
+}
+
+ADJUSTMENT_FIELDS: set[str] = {
+    "adjustment_target_error", "adjustment_target_palm_error",
+    "adjustment_pose_error",
+    "adjustment_phase", "adjustment_table",
 }
 
 
@@ -206,6 +217,26 @@ def _stable_scrape_obs(env) -> dict[str, torch.Tensor]:
         if not torch.isfinite(value).all():
             raise RuntimeError(f"env.{attr} contains NaN or Inf")
         out[field] = value if value.ndim == 2 else value.unsqueeze(-1)
+    return out
+
+
+def _adjustment_obs(env) -> dict[str, torch.Tensor]:
+    required = {
+        "adjustment_target_error": "_adjustment_target_error_obs",
+        "adjustment_target_palm_error": "_adjustment_target_palm_error_obs",
+        "adjustment_pose_error": "_adjustment_pose_error_obs",
+        "adjustment_phase": "_adjustment_phase_obs",
+        "adjustment_table": "_adjustment_table_obs",
+    }
+    out = {}
+    for field, attr in required.items():
+        value = getattr(env, attr, None)
+        expected = (env.num_envs, OBS_FIELD_SIZES[field])
+        if not isinstance(value, torch.Tensor) or value.shape != expected:
+            raise RuntimeError(f"Adjustment observation {field} requires env.{attr} with shape {expected}")
+        if not torch.isfinite(value).all():
+            raise RuntimeError(f"env.{attr} contains NaN or Inf")
+        out[field] = value
     return out
 
 
@@ -477,6 +508,8 @@ def build_observations(env) -> dict[str, torch.Tensor]:
         obs_clean.update(_fixed_force_obs(env))
     if requested_fields & STABLE_SCRAPE_FIELDS:
         obs_clean.update(_stable_scrape_obs(env))
+    if requested_fields & ADJUSTMENT_FIELDS:
+        obs_clean.update(_adjustment_obs(env))
 
     obs_noisy = dict(obs_clean)
     obs_noisy["object_rot"] = noisy_obj_rot_xyzw

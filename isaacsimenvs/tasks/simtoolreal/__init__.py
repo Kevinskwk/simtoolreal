@@ -23,6 +23,7 @@ from .simtoolreal_tacmap_env import SimToolRealTacMapEnv
 from .simtoolreal_scrape_pose_env import SimToolRealTacMapScrapePoseEnv
 from .simtoolreal_stable_scrape_env import SimToolRealStableScrapeEnv
 from .simtoolreal_inhand_stable_scrape_env import SimToolRealInHandStableScrapeEnv
+from .simtoolreal_inhand_adjustment_env import SimToolRealInHandAdjustmentEnv
 from .simtoolreal_tacmap_env_cfg import (
     SimToolRealTacMapContactEnvCfg,
     SimToolRealTacMapEnvCfg,
@@ -30,6 +31,8 @@ from .simtoolreal_tacmap_env_cfg import (
     SimToolRealTacMapScrapePoseEnvCfg,
     SimToolRealStableScrapeEnvCfg,
     SimToolRealInHandStableScrapeEnvCfg,
+    SimToolRealInHandAdjustmentEnvCfg,
+    SimToolRealScrewdriverAxialAdjustmentEnvCfg,
 )
 
 __all__ = [
@@ -46,6 +49,9 @@ __all__ = [
     "SimToolRealStableScrapeEnvCfg",
     "SimToolRealInHandStableScrapeEnv",
     "SimToolRealInHandStableScrapeEnvCfg",
+    "SimToolRealInHandAdjustmentEnv",
+    "SimToolRealInHandAdjustmentEnvCfg",
+    "SimToolRealScrewdriverAxialAdjustmentEnvCfg",
 ]
 
 _CFG_DIR = Path(__file__).resolve().parents[2] / "cfg"
@@ -137,6 +143,48 @@ gym.register(
         ),
         "env_cfg_yaml_entry_point": str(
             _CFG_DIR / "task" / "SimToolRealStableScrapeInHand.yaml"
+        ),
+        "rl_games_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealSAPG.yaml"),
+        "rl_games_sapg_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealSAPG.yaml"),
+    },
+)
+
+gym.register(
+    id="Isaacsimenvs-SimToolReal-InHand-Adjustment-Direct-v0",
+    entry_point=(
+        "isaacsimenvs.tasks.simtoolreal.simtoolreal_inhand_adjustment_env:"
+        "SimToolRealInHandAdjustmentEnv"
+    ),
+    order_enforce=False,
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            "isaacsimenvs.tasks.simtoolreal.simtoolreal_tacmap_env_cfg:"
+            "SimToolRealInHandAdjustmentEnvCfg"
+        ),
+        "env_cfg_yaml_entry_point": str(
+            _CFG_DIR / "task" / "SimToolRealInHandAdjustment.yaml"
+        ),
+        "rl_games_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealSAPG.yaml"),
+        "rl_games_sapg_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealSAPG.yaml"),
+    },
+)
+
+gym.register(
+    id="Isaacsimenvs-SimToolReal-Screwdriver-Axial-Adjustment-Direct-v0",
+    entry_point=(
+        "isaacsimenvs.tasks.simtoolreal.simtoolreal_inhand_adjustment_env:"
+        "SimToolRealInHandAdjustmentEnv"
+    ),
+    order_enforce=False,
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            "isaacsimenvs.tasks.simtoolreal.simtoolreal_tacmap_env_cfg:"
+            "SimToolRealScrewdriverAxialAdjustmentEnvCfg"
+        ),
+        "env_cfg_yaml_entry_point": str(
+            _CFG_DIR / "task" / "SimToolRealScrewdriverAxialAdjustment.yaml"
         ),
         "rl_games_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealSAPG.yaml"),
         "rl_games_sapg_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealSAPG.yaml"),

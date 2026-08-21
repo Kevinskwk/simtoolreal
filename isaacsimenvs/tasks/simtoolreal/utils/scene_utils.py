@@ -149,7 +149,8 @@ _PHYSICS_SPECS: dict[str, tuple[str, str, str]] = {
 
 
 def build_robot_articulation_usd_cfg(
-    usd_path: str, *, start_arm_higher: bool = False, arm_damping_scale: float = 1.0
+    usd_path: str, *, start_arm_higher: bool = False, arm_damping_scale: float = 1.0,
+    activate_contact_sensors: bool = False,
 ) -> ArticulationCfg:
     if float(arm_damping_scale) <= 0.0:
         raise ValueError("arm_damping_scale must be positive")
@@ -160,7 +161,10 @@ def build_robot_articulation_usd_cfg(
         arm_default["iiwa14_joint_4"] += math.radians(10.0)
     return ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
-        spawn=UsdFileCfg(usd_path=usd_path),
+        spawn=UsdFileCfg(
+            usd_path=usd_path,
+            activate_contact_sensors=bool(activate_contact_sensors),
+        ),
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(0.0, 0.8, 0.0),
             rot=(1.0, 0.0, 0.0, 0.0),
@@ -1694,6 +1698,7 @@ def setup_scene(env) -> None:
             handle_head_types=tuple(assets_cfg.handle_head_types),
             num_per_type=assets_cfg.num_assets_per_type,
             out_dir=env._tmp_asset_dir,
+            seed=int(assets_cfg.procedural_asset_seed),
             shuffle=assets_cfg.shuffle_assets,
         )
         pool_limit = int(assets_cfg.object_pool_limit)
@@ -1828,10 +1833,14 @@ def setup_scene(env) -> None:
     _materialize_env_prims(env)
 
     # 4. Spawn assets.
+    activate_fingertip_tool_contact_sensors = bool(
+        getattr(env.cfg, "enable_fingertip_tool_contact_sensors", False)
+    )
     env.robot = Articulation(build_robot_articulation_usd_cfg(
         robot_usd_path,
         start_arm_higher=getattr(env.cfg.reset, "start_arm_higher", False),
         arm_damping_scale=float(getattr(env.cfg, "arm_drive_damping_scale", 1.0)),
+        activate_contact_sensors=activate_fingertip_tool_contact_sensors,
     ))
     activate_tool_table_contact_sensors = bool(
         getattr(env.cfg, "enable_tool_table_contact_force_reward", False)
@@ -1847,7 +1856,10 @@ def setup_scene(env) -> None:
         build_rigid_object_cfg(
             "/World/envs/env_.*/Object",
             object_usd_paths,
-            activate_contact_sensors=activate_tool_table_contact_sensors,
+            activate_contact_sensors=(
+                activate_tool_table_contact_sensors
+                or activate_fingertip_tool_contact_sensors
+            ),
         )
     )
     env.goal_viz = RigidObject(build_rigid_object_cfg("/World/envs/env_.*/GoalViz", goalviz_usd_paths))

@@ -85,6 +85,7 @@ class AssetsCfg:
         "brush",
     )
     num_assets_per_type: int = 100
+    procedural_asset_seed: int = 42
 
     # Optional deterministic prefix of the generated pool. Zero keeps the full
     # pool. Grasp-bank tasks set this to one so every bank entry is tied to the

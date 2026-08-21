@@ -26,6 +26,20 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 REMOTE_ASSET_BASE_MAIN = "https://cdn.jsdelivr.net/gh/tylerlum/simtoolreal@main/"
 ROBOT_URDF_RELATIVE_PATH = "assets/urdf/kuka_sharpa_description/iiwa14_left_sharpa_adjusted_restricted.urdf"
 TABLE_URDF_PATH = REPO_ROOT / "assets" / "urdf" / "table_narrow.urdf"
+TARGET_PALM_MARKER_URDF = """<?xml version="1.0"?>
+<robot name="target_palm_marker">
+  <link name="target_palm_frame">
+    <visual><origin xyz="0 0 0"/><geometry><sphere radius="0.012"/></geometry>
+      <material name="white"><color rgba="1 1 1 0.9"/></material></visual>
+    <visual><origin xyz="0.04 0 0" rpy="0 1.5707963 0"/><geometry><cylinder radius="0.004" length="0.08"/></geometry>
+      <material name="red"><color rgba="1 0.1 0.1 0.95"/></material></visual>
+    <visual><origin xyz="0 0.04 0" rpy="-1.5707963 0 0"/><geometry><cylinder radius="0.004" length="0.08"/></geometry>
+      <material name="green"><color rgba="0.1 1 0.1 0.95"/></material></visual>
+    <visual><origin xyz="0 0 0.04"/><geometry><cylinder radius="0.004" length="0.08"/></geometry>
+      <material name="blue"><color rgba="0.1 0.3 1 0.95"/></material></visual>
+  </link>
+</robot>
+"""
 
 
 def _to_numpy(value: Any) -> np.ndarray:
@@ -201,6 +215,12 @@ def capture_pose_viewer_frame(env, env_id: int) -> dict[str, Any]:
     if hole is not None:
         hole_pos = hole.data.root_pos_w[env_id] - origin
         frame["hole_pose"] = _pose_xyzw(hole_pos, hole.data.root_quat_w[env_id])
+    target_palm_pos = getattr(env, "_adjustment_target_palm_pos_w", None)
+    target_palm_quat = getattr(env, "_adjustment_target_palm_quat_w", None)
+    if target_palm_pos is not None and target_palm_quat is not None:
+        frame["target_palm_pose"] = _pose_xyzw(
+            target_palm_pos[env_id] - origin, target_palm_quat[env_id]
+        )
     return frame
 
 
@@ -263,6 +283,13 @@ def build_pose_viewer_html(
         "object": np.stack([frame["object_pose"] for frame in frames]),
         "goal": np.stack([frame["goal_pose"] for frame in frames]),
     }
+    if all("target_palm_pose" in frame for frame in frames):
+        robots.append(make_embedded_robot(
+            name="target_palm", urdf_text=TARGET_PALM_MARKER_URDF
+        ))
+        object_poses["target_palm"] = np.stack([
+            frame["target_palm_pose"] for frame in frames
+        ])
     if hole_urdf_text is not None and all("hole_pose" in frame for frame in frames):
         robots.insert(2, make_embedded_robot(name="hole", urdf_text=hole_urdf_text))
         object_poses["hole"] = np.stack([frame["hole_pose"] for frame in frames])

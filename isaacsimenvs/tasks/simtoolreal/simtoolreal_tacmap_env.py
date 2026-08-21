@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from isaaclab.sensors import ContactSensor, ContactSensorCfg
+
 from isaacsimenvs.sensors.tacmap import SharpaTacmap
 
 from .simtoolreal_env import SimToolRealEnv
@@ -70,6 +72,40 @@ class SimToolRealTacMapEnv(SimToolRealEnv):
 
     def _setup_scene(self) -> None:
         super()._setup_scene()
+        self._fingertip_tool_contact_sensors: list[ContactSensor] = []
+        if bool(getattr(self.cfg, "enable_fingertip_tool_contact_sensors", False)):
+            prim_paths = tuple(self.cfg.fingertip_tool_contact_prim_paths)
+            if len(prim_paths) != 5 or len(set(prim_paths)) != 5:
+                raise ValueError(
+                    "fingertip_tool_contact_prim_paths must contain five unique distal links"
+                )
+            filters = list(self.cfg.fingertip_tool_contact_filter_paths)
+            if filters != [self.cfg.vbts_target_rigid_expr]:
+                raise ValueError(
+                    "finger-tool contact filters must exactly match the TacMap target rigid body: "
+                    f"filters={filters}, target={self.cfg.vbts_target_rigid_expr!r}"
+                )
+            for sensor_id, prim_path in enumerate(prim_paths):
+                sensor = ContactSensor(
+                    ContactSensorCfg(
+                        prim_path=prim_path,
+                        update_period=float(
+                            self.cfg.fingertip_tool_contact_sensor_update_period
+                        ),
+                        history_length=0,
+                        debug_vis=False,
+                        track_pose=False,
+                        track_contact_points=False,
+                        track_friction_forces=True,
+                        track_air_time=False,
+                        filter_prim_paths_expr=filters,
+                        max_contact_data_count_per_prim=int(
+                            self.cfg.fingertip_tool_contact_max_data_count
+                        ),
+                    )
+                )
+                self._fingertip_tool_contact_sensors.append(sensor)
+                self.scene.sensors[f"fingertip_tool_contact_{sensor_id}"] = sensor
         self._vbts_sensor: list[SharpaTacmap] = []
         if not getattr(self.cfg, "enable_vbts", False):
             return
