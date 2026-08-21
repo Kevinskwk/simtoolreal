@@ -76,6 +76,13 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
             raise ValueError("Allen-key reset yaw curriculum length is inconsistent")
         if any(not math.isfinite(value) or not 0.0 <= value <= 45.0 for value in yaw_ranges):
             raise ValueError("Allen-key reset yaw ranges must be finite and in [0, 45]")
+        if any(
+            not 0.0 < float(value) <= 30.0
+            for value in cfg.adjustment_target_rotation_deg
+        ):
+            raise ValueError(
+                "Allen-key target rotations must stay in the prevalidated (0, 30] degree interval"
+            )
         for name in (
             "allen_socket_lateral_tolerance_m", "allen_socket_insertion_tolerance_m",
             "allen_socket_tilt_tolerance_deg", "allen_palm_contact_threshold_n",
@@ -114,9 +121,6 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
             self.cfg.adjustment_target_rotation_deg[self._adjustment_curriculum_stage]
         ))
         angle = torch.empty(relative_pos.shape[0], device=self.device).uniform_(0.5 * limit, limit)
-        angle *= torch.where(
-            torch.rand_like(angle) < 0.5, -torch.ones_like(angle), torch.ones_like(angle)
-        )
         target_pos, target_quat = orbit_palm_tool_about_screw_axis(
             relative_pos, relative_quat, angle,
             torch.tensor(self.cfg.allen_screw_axis_tool, device=self.device),
@@ -396,9 +400,14 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
             self._stable_support_count >= int(self.cfg.adjustment_min_fingertip_support)
         )
         weighted = {
-            "position_progress_rew": 2.0 * progress[:, 0],
-            "screw_axis_orbit_progress_rew": 6.0 * progress[:, 1],
-            "palm_orientation_progress_rew": 3.0 * progress[:, 2],
+            # Absolute target rewards prevent a stationary policy from matching
+            # the return of one that reaches and holds the requested grasp.
+            "palm_position_target_rew": 2.0 * potentials[:, 0],
+            "screw_axis_orbit_target_rew": 4.0 * potentials[:, 1],
+            "palm_orientation_target_rew": 2.0 * potentials[:, 2],
+            "palm_target_progress_rew": torch.stack((
+                progress[:, 0], 2.0 * progress[:, 1], progress[:, 2]
+            ), dim=-1).sum(-1),
             "support_or_socket_penalty": -0.5 * (~(support_valid & self._allen_socket_valid)).float(),
             "tool_position_penalty": -0.5 * (
                 self._adjustment_tool_position_error
@@ -421,6 +430,14 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
             "allen/palm_orientation_error_mean_deg": torch.rad2deg(
                 self._allen_orientation_error
             ).mean(),
+            "allen/world_palm_position_error_mean_m": (
+                self._adjustment_target_palm_position_error.mean()
+            ),
+            "allen/world_palm_rotation_error_mean_deg": torch.rad2deg(
+                self._adjustment_target_palm_rotation_error
+            ).mean(),
+            "allen/target_position_valid_ratio": self._allen_validity_obs[:, 0].mean(),
+            "allen/target_orientation_valid_ratio": self._allen_validity_obs[:, 1].mean(),
             "allen/socket_lateral_error_mean_m": self._allen_socket_lateral_error.mean(),
             "allen/socket_insertion_error_mean_m": self._allen_socket_insertion_error.mean(),
             "allen/socket_tilt_error_mean_deg": torch.rad2deg(

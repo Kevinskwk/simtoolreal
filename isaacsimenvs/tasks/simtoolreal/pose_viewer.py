@@ -28,16 +28,30 @@ REMOTE_ASSET_BASE_MAIN = "https://cdn.jsdelivr.net/gh/tylerlum/simtoolreal@main/
 MAX_EMBEDDED_MESH_BYTES = 256 * 1024
 ROBOT_URDF_RELATIVE_PATH = "assets/urdf/kuka_sharpa_description/iiwa14_left_sharpa_adjusted_restricted.urdf"
 TABLE_URDF_PATH = REPO_ROOT / "assets" / "urdf" / "table_narrow.urdf"
+CURRENT_PALM_MARKER_URDF = """<?xml version="1.0"?>
+<robot name="current_palm_marker">
+  <link name="current_palm_frame">
+    <visual><geometry><box size="0.065 0.045 0.008"/></geometry>
+      <material name="cyan"><color rgba="0.05 0.9 1 0.75"/></material></visual>
+    <visual><origin xyz="0.035 0 0" rpy="0 1.5707963 0"/><geometry><cylinder radius="0.0025" length="0.07"/></geometry>
+      <material name="red"><color rgba="1 0.1 0.1 1"/></material></visual>
+    <visual><origin xyz="0 0.035 0" rpy="-1.5707963 0 0"/><geometry><cylinder radius="0.0025" length="0.07"/></geometry>
+      <material name="green"><color rgba="0.1 1 0.1 1"/></material></visual>
+    <visual><origin xyz="0 0 0.035"/><geometry><cylinder radius="0.0025" length="0.07"/></geometry>
+      <material name="blue"><color rgba="0.1 0.3 1 1"/></material></visual>
+  </link>
+</robot>
+"""
 TARGET_PALM_MARKER_URDF = """<?xml version="1.0"?>
 <robot name="target_palm_marker">
   <link name="target_palm_frame">
-    <visual><origin xyz="0 0 0"/><geometry><sphere radius="0.012"/></geometry>
-      <material name="white"><color rgba="1 1 1 0.9"/></material></visual>
-    <visual><origin xyz="0.04 0 0" rpy="0 1.5707963 0"/><geometry><cylinder radius="0.004" length="0.08"/></geometry>
+    <visual><geometry><box size="0.08 0.06 0.012"/></geometry>
+      <material name="magenta"><color rgba="1 0.1 0.75 0.7"/></material></visual>
+    <visual><origin xyz="0.05 0 0" rpy="0 1.5707963 0"/><geometry><cylinder radius="0.004" length="0.10"/></geometry>
       <material name="red"><color rgba="1 0.1 0.1 0.95"/></material></visual>
-    <visual><origin xyz="0 0.04 0" rpy="-1.5707963 0 0"/><geometry><cylinder radius="0.004" length="0.08"/></geometry>
+    <visual><origin xyz="0 0.05 0" rpy="-1.5707963 0 0"/><geometry><cylinder radius="0.004" length="0.10"/></geometry>
       <material name="green"><color rgba="0.1 1 0.1 0.95"/></material></visual>
-    <visual><origin xyz="0 0 0.04"/><geometry><cylinder radius="0.004" length="0.08"/></geometry>
+    <visual><origin xyz="0 0 0.05"/><geometry><cylinder radius="0.004" length="0.10"/></geometry>
       <material name="blue"><color rgba="0.1 0.3 1 0.95"/></material></visual>
   </link>
 </robot>
@@ -252,6 +266,11 @@ def capture_pose_viewer_frame(env, env_id: int) -> dict[str, Any]:
     target_palm_pos = getattr(env, "_adjustment_target_palm_pos_w", None)
     target_palm_quat = getattr(env, "_adjustment_target_palm_quat_w", None)
     if target_palm_pos is not None and target_palm_quat is not None:
+        current_palm_pos = env.robot.data.body_link_pos_w[env_id, env._palm_body_id]
+        current_palm_quat = env.robot.data.body_link_quat_w[env_id, env._palm_body_id]
+        frame["current_palm_pose"] = _pose_xyzw(
+            current_palm_pos - origin, current_palm_quat
+        )
         frame["target_palm_pose"] = _pose_xyzw(
             target_palm_pos[env_id] - origin, target_palm_quat[env_id]
         )
@@ -326,9 +345,17 @@ def build_pose_viewer_html(
         "goal": np.stack([frame["goal_pose"] for frame in frames]),
     }
     if all("target_palm_pose" in frame for frame in frames):
+        if not all("current_palm_pose" in frame for frame in frames):
+            raise ValueError("target palm frames require matching current palm frames")
+        robots.append(make_embedded_robot(
+            name="current_palm", urdf_text=CURRENT_PALM_MARKER_URDF
+        ))
         robots.append(make_embedded_robot(
             name="target_palm", urdf_text=TARGET_PALM_MARKER_URDF
         ))
+        object_poses["current_palm"] = np.stack([
+            frame["current_palm_pose"] for frame in frames
+        ])
         object_poses["target_palm"] = np.stack([
             frame["target_palm_pose"] for frame in frames
         ])

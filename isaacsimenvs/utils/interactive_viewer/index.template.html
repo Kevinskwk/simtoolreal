@@ -147,6 +147,31 @@
         white-space: pre-wrap;
       }
 
+      #palm-legend {
+        position: absolute;
+        top: 20px;
+        right: 20px;
+        display: none;
+        gap: 8px;
+        padding: 10px 12px;
+        border: 1px solid var(--panel-border);
+        border-radius: 8px;
+        background: var(--panel);
+        font-size: 12px;
+      }
+
+      .legend-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .legend-swatch {
+        width: 12px;
+        height: 12px;
+        border: 1px solid rgba(255, 255, 255, 0.5);
+      }
+
       @media (max-width: 720px) {
         #hud {
           left: 12px;
@@ -175,6 +200,10 @@
     <div id="app">
       <div id="viewer"></div>
       <div id="error"></div>
+      <div id="palm-legend">
+        <div class="legend-row"><span class="legend-swatch" style="background:#0de6ff"></span>Current palm</div>
+        <div class="legend-row"><span class="legend-swatch" style="background:#ff1abf"></span>Target palm</div>
+      </div>
       <div id="hud">
         <div id="titlebar">
           <div>
@@ -219,6 +248,12 @@
       const sceneConfig = JSON.parse(document.getElementById("scene-json").textContent);
       const trajectory = sceneConfig.trajectory;
       const robotConfigs = sceneConfig.robots;
+      if (
+        robotConfigs.some((config) => config.name === "current_palm")
+        && robotConfigs.some((config) => config.name === "target_palm")
+      ) {
+        document.getElementById("palm-legend").style.display = "grid";
+      }
 
       const timestamps = trajectory.timestamps;
       const positions = trajectory.positions;

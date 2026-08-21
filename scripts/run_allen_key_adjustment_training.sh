@@ -33,6 +33,8 @@ for index, entry in enumerate(entries):
 print(f"[allen-key] using {len(entries)} physically validated grasp(s) from {path}")
 PY
 
+python scripts/validate_allen_key_target_sampling.py --grasp-bank "${GRASP_BANK}"
+
 python isaacsimenvs/train.py \
   --task Isaacsimenvs-SimToolReal-AllenKey-Adjustment-Direct-v0 \
   --agent rl_games_sapg_cfg_entry_point \
