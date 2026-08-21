@@ -7,6 +7,7 @@ Three.js/URDF HTML viewer that can be opened locally or logged to WandB.
 
 from __future__ import annotations
 
+import base64
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -24,6 +25,7 @@ from .utils.scene_utils import JOINT_NAMES_CANONICAL
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 REMOTE_ASSET_BASE_MAIN = "https://cdn.jsdelivr.net/gh/tylerlum/simtoolreal@main/"
+MAX_EMBEDDED_MESH_BYTES = 256 * 1024
 ROBOT_URDF_RELATIVE_PATH = "assets/urdf/kuka_sharpa_description/iiwa14_left_sharpa_adjusted_restricted.urdf"
 TABLE_URDF_PATH = REPO_ROOT / "assets" / "urdf" / "table_narrow.urdf"
 TARGET_PALM_MARKER_URDF = """<?xml version="1.0"?>
@@ -108,6 +110,25 @@ def _rewrite_embedded_urdf_mesh_urls(
         return urdf_text
 
     changed = False
+    # The Allen-key mesh is a unit prism used only to author simple swept
+    # segments. Convert it to its exact bounding box in the viewer copy so a
+    # newly added local asset never depends on a remote branch being published.
+    for geometry_elem in root.findall(".//geometry"):
+        mesh_elem = geometry_elem.find("mesh")
+        if mesh_elem is None:
+            continue
+        filename = mesh_elem.get("filename", "")
+        if Path(filename).name != "unit_hex_prism_x.obj":
+            continue
+        scale = [float(value) for value in mesh_elem.get("scale", "1 1 1").split()]
+        if len(scale) != 3:
+            raise ValueError("unit_hex_prism_x.obj scale must have three values")
+        geometry_elem.remove(mesh_elem)
+        ET.SubElement(geometry_elem, "box", {
+            "size": f"{scale[0]} {2.0 * 0.866025 * scale[1]} {2.0 * scale[2]}"
+        })
+        changed = True
+
     for mesh_elem in root.findall(".//mesh"):
         filename = mesh_elem.get("filename")
         if not filename:
@@ -126,6 +147,20 @@ def _rewrite_embedded_urdf_mesh_urls(
                 mesh_path = REPO_ROOT / filename
             else:
                 mesh_path = source_urdf_path.parent / filename
+
+        suffix = mesh_path.suffix.lower()
+        if (
+            mesh_path.is_file()
+            and suffix in {".obj", ".stl"}
+            and mesh_path.stat().st_size <= MAX_EMBEDDED_MESH_BYTES
+        ):
+            mime = "text/plain" if suffix == ".obj" else "model/stl"
+            encoded = base64.b64encode(mesh_path.read_bytes()).decode("ascii")
+            mesh_elem.set(
+                "filename", f"data:{mime};base64,{encoded}#ext={suffix}"
+            )
+            changed = True
+            continue
 
         mesh_url = _raw_url_for_repo_path(mesh_path, raw_base)
         if mesh_url is None:

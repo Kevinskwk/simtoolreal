@@ -479,6 +479,18 @@
 
           if (meshFormat === "obj") {
             const objLoader = new OBJLoader(loadingManager);
+            if (path.startsWith("data:")) {
+              fetch(path)
+                .then((response) => {
+                  if (!response.ok) {
+                    throw new Error(`Failed to decode embedded OBJ: ${response.status}`);
+                  }
+                  return response.text();
+                })
+                .then((objText) => completeWithOverride(objLoader.parse(objText)))
+                .catch((error) => completeWithOverride(null, error));
+              return;
+            }
             const meshUrl = new URL(path, window.location.href);
             const baseUrl = new URL("./", meshUrl).toString();
 
