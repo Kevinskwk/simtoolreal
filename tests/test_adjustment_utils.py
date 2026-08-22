@@ -124,3 +124,20 @@ def test_allen_zero_orbit_is_identity():
     )
     assert torch.allclose(target_pos, position, atol=1e-6)
     assert torch.allclose(target_quat, quat, atol=1e-6)
+
+
+def test_palm_keypoint_error_couples_translation_and_rotation():
+    position = torch.zeros(1, 3)
+    identity = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    keypoints = torch.tensor([
+        [0.0, 0.0, 0.0], [0.05, 0.0, 0.0], [-0.05, 0.0, 0.0],
+    ])
+    translated = module.palm_keypoint_error(
+        position, identity, torch.tensor([[0.01, 0.0, 0.0]]), identity, keypoints
+    )
+    rotated_quat = torch.tensor([[2 ** -0.5, 0.0, 0.0, 2 ** -0.5]])
+    rotated = module.palm_keypoint_error(
+        position, identity, position, rotated_quat, keypoints
+    )
+    assert translated.item() == pytest.approx(0.01, rel=1e-5)
+    assert rotated.item() == pytest.approx(2 ** 0.5 * 0.05, rel=1e-5)

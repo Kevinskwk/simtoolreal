@@ -34,8 +34,8 @@ def parse_args() -> argparse.Namespace:
         "--grasp-bank", type=Path,
         default=ROOT / "assets/grasp_banks/allen_key_canonical_v1.json",
     )
-    parser.add_argument("--minimum-angle-deg", type=float, default=2.5)
-    parser.add_argument("--maximum-angle-deg", type=float, default=30.0)
+    parser.add_argument("--minimum-angle-deg", type=float, default=15.0)
+    parser.add_argument("--maximum-angle-deg", type=float, default=60.0)
     parser.add_argument("--angle-step-deg", type=float, default=0.5)
     parser.add_argument("--maximum-reset-yaw-deg", type=float, default=30.0)
     parser.add_argument("--position-tolerance-m", type=float, default=0.003)

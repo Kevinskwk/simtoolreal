@@ -112,6 +112,40 @@ def screw_axis_orbit_errors(
     return orbit_error, position_error, orientation_error
 
 
+def palm_keypoint_error(
+    current_palm_to_tool_pos: torch.Tensor,
+    current_palm_to_tool_quat: torch.Tensor,
+    target_palm_to_tool_pos: torch.Tensor,
+    target_palm_to_tool_quat: torch.Tensor,
+    palm_keypoints: torch.Tensor,
+) -> torch.Tensor:
+    """Return the maximum corresponding palm-keypoint error in the tool frame."""
+    count = current_palm_to_tool_pos.shape[0]
+    if current_palm_to_tool_pos.shape != (count, 3):
+        raise ValueError("palm-to-tool positions must have shape (N, 3)")
+    if current_palm_to_tool_quat.shape != (count, 4):
+        raise ValueError("current palm-to-tool quaternions must have shape (N, 4)")
+    if target_palm_to_tool_pos.shape != (count, 3):
+        raise ValueError("target palm-to-tool positions must have shape (N, 3)")
+    if target_palm_to_tool_quat.shape != (count, 4):
+        raise ValueError("target palm-to-tool quaternions must have shape (N, 4)")
+    if palm_keypoints.ndim != 2 or palm_keypoints.shape[-1] != 3:
+        raise ValueError("palm_keypoints must have shape (K, 3)")
+
+    def points_in_tool(pos: torch.Tensor, quat: torch.Tensor) -> torch.Tensor:
+        tool_to_palm_quat = _quat_inv(quat)
+        tool_to_palm_pos = _quat_apply(tool_to_palm_quat, -pos)
+        expanded_quat = tool_to_palm_quat[:, None, :].expand(-1, palm_keypoints.shape[0], -1)
+        expanded_points = palm_keypoints[None, :, :].expand(count, -1, -1)
+        return tool_to_palm_pos[:, None, :] + _quat_apply(
+            expanded_quat.reshape(-1, 4), expanded_points.reshape(-1, 3)
+        ).reshape(count, palm_keypoints.shape[0], 3)
+
+    current = points_in_tool(current_palm_to_tool_pos, current_palm_to_tool_quat)
+    target = points_in_tool(target_palm_to_tool_pos, target_palm_to_tool_quat)
+    return torch.linalg.vector_norm(current - target, dim=-1).amax(dim=-1)
+
+
 def load_adjustment_scenarios(path: str | Path) -> dict:
     path = Path(path)
     if not path.is_file():
@@ -238,5 +272,6 @@ def adjustment_reward_terms(
 __all__ = [
     "SCENARIO_KINDS", "adjustment_reward_terms", "arm_controllability_metrics",
     "controllability_score", "load_adjustment_scenarios",
-    "orbit_palm_tool_about_screw_axis", "screw_axis_orbit_errors",
+    "orbit_palm_tool_about_screw_axis", "palm_keypoint_error",
+    "screw_axis_orbit_errors",
 ]

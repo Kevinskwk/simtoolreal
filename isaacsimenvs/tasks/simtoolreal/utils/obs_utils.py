@@ -81,8 +81,8 @@ OBS_FIELD_SIZES: dict[str, int] = {
     "allen_target_error": 5,
     "allen_geometry": 9,
     "allen_socket_state": 4,
-    "allen_phase": 2,
-    "allen_validity": 5,
+    "allen_phase": 3,
+    "allen_validity": 7,
 }
 
 SCRAPE_CONTACT_FIELDS: set[str] = {

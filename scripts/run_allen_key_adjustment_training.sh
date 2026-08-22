@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Finetune palm-supported Allen-key adjustment about the engaged screw axis.
+# Finetune fixture-supported Allen-key palm-to-tool adjustment.
 
 set -euo pipefail
 
@@ -34,6 +34,10 @@ print(f"[allen-key] using {len(entries)} physically validated grasp(s) from {pat
 PY
 
 python scripts/validate_allen_key_target_sampling.py --grasp-bank "${GRASP_BANK}"
+python scripts/validate_allen_key_adjustment_task.py \
+  --grasp-bank "${GRASP_BANK}" \
+  --num-envs 4 \
+  --headless
 
 python isaacsimenvs/train.py \
   --task Isaacsimenvs-SimToolReal-AllenKey-Adjustment-Direct-v0 \
@@ -44,7 +48,7 @@ python isaacsimenvs/train.py \
   --checkpoint_load_mode "${CHECKPOINT_LOAD_MODE}" \
   --wandb_activate \
   --wandb_project simtoolreal \
-  --wandb_name "allen_key_palm_supported_adjustment_${STAMP}" \
+  --wandb_name "allen_key_fixture_regrasp_${STAMP}" \
   "env.grasp_bank_path=${GRASP_BANK}" \
   "env.grasp_bank_source_checkpoint_path=${GRASP_BANK_SOURCE_CHECKPOINT}" \
   env.scene.num_envs="${NUM_ENVS}" \

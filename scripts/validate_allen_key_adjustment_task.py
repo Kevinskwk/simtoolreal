@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate Allen-key grasp, socket support, target reachability, and episode logic."""
+"""Validate Allen-key fixture, contacts, target reachability, and episode logic."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--num-envs", type=int, default=4)
     parser.add_argument("--settle-steps", type=int, default=60)
+    parser.add_argument("--grasp-bank", type=Path, default=None)
     parser.add_argument("--reset-yaw-range-deg", type=float, default=None)
     parser.add_argument("--output", type=Path, default=None)
     AppLauncher.add_app_launcher_args(parser)
@@ -100,6 +101,8 @@ def main() -> None:
         raise ValueError("num-envs and settle-steps must be positive")
     cfg = SimToolRealAllenKeyAdjustmentEnvCfg()
     cfg.scene.num_envs = int(ARGS.num_envs)
+    if ARGS.grasp_bank is not None:
+        cfg.grasp_bank_path = str(ARGS.grasp_bank.resolve())
     if ARGS.reset_yaw_range_deg is not None:
         cfg.allen_reset_yaw_range_stages_deg = (
             float(ARGS.reset_yaw_range_deg),
@@ -145,6 +148,20 @@ def main() -> None:
                 f"support={inner._stable_support_count.tolist()} "
                 f"relative_drift_m={relative_drift.tolist()}"
             )
+        if len(inner._fingertip_tool_contact_sensors) != 5:
+            raise RuntimeError("five fingertip-tool contact sensors were not created")
+
+        fixture_position = inner._allen_fixture_tool_pos.clone()
+        fixture_position_error = torch.linalg.vector_norm(
+            inner.object.data.root_pos_w - fixture_position, dim=-1
+        )
+        if float(fixture_position_error.max().item()) > float(
+            cfg.allen_socket_lateral_tolerance_m
+        ):
+            raise RuntimeError(
+                "fixture did not preserve tool position during adjustment: "
+                f"max_error={float(fixture_position_error.max().item()):.6f}m"
+            )
 
         # Make the current physically settled relationship the deterministic hold target.
         current_pos, current_quat = inner._palm_tool_relative()
@@ -153,16 +170,40 @@ def main() -> None:
         inner._adjustment_initial_tool_pos.copy_(inner.object.data.root_pos_w)
         inner._adjustment_initial_tool_quat.copy_(inner.object.data.root_quat_w)
         inner.episode_length_buf[:] = int(cfg.allen_adjustment_steps)
-        for step in range(int(cfg.allen_success_hold_steps)):
+        for step in range(int(cfg.allen_closure_steps)):
             observation, reward, terminated, truncated, _ = env.step(actions)
             require_finite(ARGS.settle_steps + step, observation, reward)
             frames.append(capture_pose_viewer_frame(inner, 0))
             if bool(terminated.any()) or bool(truncated.any()):
-                raise RuntimeError("episode ended before the post-adjustment hold completed")
-        if int(inner._allen_hold_count.min().item()) < int(cfg.allen_success_hold_steps):
+                raise RuntimeError("episode ended before the closure phase completed")
+        if not bool((inner._allen_phase_obs[:, 2] > 0.5).all()):
+            raise RuntimeError("task did not enter release validation after closure")
+        # The release phase proves that the fixture is removed and the settled
+        # bank grasp satisfies the same dynamic hold gate used by training.
+        for step in range(int(cfg.allen_release_steps) - 1):
+            observation, reward, terminated, truncated, _ = env.step(actions)
+            require_finite(ARGS.settle_steps + int(cfg.allen_closure_steps) + step, observation, reward)
+            frames.append(capture_pose_viewer_frame(inner, 0))
+            if bool(terminated.any()) or bool(truncated.any()):
+                raise RuntimeError("episode ended early during release validation")
+        if not bool(inner._allen_combined_valid.all()) or not bool(
+            (inner._allen_hold_count >= int(cfg.allen_success_hold_steps)).all()
+        ):
             raise RuntimeError(
-                "deterministic valid target did not satisfy the post-adjustment hold gate"
+                "settled bank grasp did not pass dynamic release validation: "
+                f"valid={inner._allen_combined_valid.tolist()} "
+                f"hold={inner._allen_hold_count.tolist()} "
+                f"contacts={inner._allen_fingertip_contact_count.tolist()} "
+                f"support={inner._stable_support_count.tolist()} "
+                f"flexion_closure={inner._allen_flexion_closure.tolist()} "
+                f"palm={inner._allen_palm_contact.tolist()} "
+                f"tool_position_error={inner._adjustment_tool_position_error.tolist()} "
+                f"relative_speed={inner._stable_relative_linear_speed.tolist()}"
             )
+        observation, reward, terminated, truncated, _ = env.step(actions)
+        require_finite(480, observation, reward)
+        if not bool(truncated.all()):
+            raise RuntimeError("dynamic release episode did not end at its fixed timeout")
 
         # A separate reset audits that only the fixed 480-step timeout ends episodes.
         env.reset()
@@ -201,7 +242,11 @@ def main() -> None:
             "critic_observation_dim": expected_critic[1],
             "sampled_target_ik_position_error_m": ik_position,
             "sampled_target_ik_rotation_error_deg": ik_rotation,
-            "hold_steps": int(cfg.allen_success_hold_steps),
+            "closure_steps": int(cfg.allen_closure_steps),
+            "release_steps": int(cfg.allen_release_steps),
+            "fingertip_contact_count_mean": float(
+                inner._allen_fingertip_contact_count.float().mean().item()
+            ),
             "episode_steps": 480,
             "viewer": str(output.resolve()),
         }
