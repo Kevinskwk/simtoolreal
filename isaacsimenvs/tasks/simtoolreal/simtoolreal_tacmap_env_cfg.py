@@ -526,7 +526,7 @@ class SimToolRealAllenKeyAdjustmentEnvCfg(SimToolRealInHandAdjustmentEnvCfg):
     assets: AssetsCfg = AssetsCfg(
         table_urdf=str(
             Path(__file__).resolve().parents[3]
-            / "assets" / "urdf" / "table_allen_compact.urdf"
+            / "assets" / "urdf" / "table_allen_disabled.urdf"
         ),
         handle_head_types=("screwdriver",),
         object_urdf=str(
@@ -583,7 +583,7 @@ class SimToolRealAllenKeyAdjustmentEnvCfg(SimToolRealInHandAdjustmentEnvCfg):
     allen_screw_axis_tool: tuple[float, float, float] = (0.0, 0.0, -1.0)
     allen_screw_pivot_tool_m: tuple[float, float, float] = (0.192, 0.0, -0.03)
     allen_workpiece_from_tool_m: tuple[float, float, float] = (0.192, 0.0, -0.095)
-    allen_table_half_height_m: float = 0.060
+    allen_hidden_table_offset_m: float = 1.0
     allen_socket_lateral_tolerance_m: float = 0.006
     allen_socket_insertion_tolerance_m: float = 0.008
     allen_socket_tilt_tolerance_deg: float = 5.0

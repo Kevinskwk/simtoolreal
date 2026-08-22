@@ -34,7 +34,7 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         self._allen_target_error_obs = torch.zeros(n, 5, device=device)
         self._allen_geometry_obs = torch.zeros(n, 9, device=device)
         geometry = torch.tensor(
-            (0.360, 0.06, 0.010, *cfg.allen_screw_axis_tool, *cfg.allen_screw_pivot_tool_m),
+            (0.264, 0.06, 0.010, *cfg.allen_screw_axis_tool, *cfg.allen_screw_pivot_tool_m),
             device=device,
         )
         self._allen_geometry_obs[:] = geometry
@@ -64,6 +64,9 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         self._allen_fixture_tool_pos = torch.zeros(n, 3, device=device)
         self._allen_fixture_tool_quat = torch.zeros(n, 4, device=device)
         self._allen_fixture_tool_quat[:, 0] = 1.0
+        self._allen_fixture_workpiece_pos = torch.zeros(n, 3, device=device)
+        self._allen_fixture_workpiece_quat = torch.zeros(n, 4, device=device)
+        self._allen_fixture_workpiece_quat[:, 0] = 1.0
         self._allen_reset_yaw_rad = torch.zeros(n, device=device)
         self._allen_target_bank_index = torch.zeros(n, dtype=torch.long, device=device)
         self._allen_curriculum_eligible = 0
@@ -129,7 +132,7 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
             "allen_release_angular_speed_tolerance_radps",
             "allen_closure_flexion_fraction",
             "allen_min_flexion_closure_fraction",
-            "allen_table_half_height_m",
+            "allen_hidden_table_offset_m",
         ):
             if not math.isfinite(float(getattr(cfg, name))) or float(getattr(cfg, name)) <= 0:
                 raise ValueError(f"{name} must be finite and positive")
@@ -252,16 +255,15 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         self.workpiece.write_root_velocity_to_sim(
             torch.zeros(count, 6, device=self.device), env_ids=env_ids
         )
-        normal = quat_apply(
-            workpiece_quat,
-            torch.tensor((0.0, 0.0, 1.0), device=self.device).expand(count, -1),
-        )
-        table_pos = workpiece_pos - normal * float(self.cfg.allen_table_half_height_m)
+        table_pos = self.scene.env_origins[env_ids].clone()
+        table_pos[:, 2] -= float(self.cfg.allen_hidden_table_offset_m)
+        table_quat = torch.zeros(count, 4, device=self.device)
+        table_quat[:, 0] = 1.0
         self.table.write_root_pose_to_sim(
-            torch.cat((table_pos, workpiece_quat), dim=-1), env_ids=env_ids
+            torch.cat((table_pos, table_quat), dim=-1), env_ids=env_ids
         )
         self._table_z_per_env[env_ids] = table_pos[:, 2] - self.scene.env_origins[env_ids, 2]
-        self._table_quat_wxyz_per_env[env_ids] = workpiece_quat
+        self._table_quat_wxyz_per_env[env_ids] = table_quat
         if getattr(self, "_allen_ready", False):
             self._allen_hold_count[env_ids] = 0
             self._allen_succeeded[env_ids] = False
@@ -269,6 +271,8 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
             self._allen_previous_pose_potential[env_ids] = 0.0
             self._allen_fixture_tool_pos[env_ids] = self.object.data.root_pos_w[env_ids]
             self._allen_fixture_tool_quat[env_ids] = self.object.data.root_quat_w[env_ids]
+            self._allen_fixture_workpiece_pos[env_ids] = workpiece_pos
+            self._allen_fixture_workpiece_quat[env_ids] = workpiece_quat
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         super()._pre_physics_step(actions)
@@ -306,6 +310,17 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
 
     def _apply_action(self) -> None:
         super()._apply_action()
+        all_env_ids = torch.arange(self.num_envs, device=self.device)
+        self.workpiece.write_root_pose_to_sim(
+            torch.cat((
+                self._allen_fixture_workpiece_pos,
+                self._allen_fixture_workpiece_quat,
+            ), dim=-1),
+            env_ids=all_env_ids,
+        )
+        self.workpiece.write_root_velocity_to_sim(
+            torch.zeros(self.num_envs, 6, device=self.device), env_ids=all_env_ids
+        )
         release_start = int(self.cfg.allen_adjustment_steps) + int(self.cfg.allen_closure_steps)
         fixture_ids = torch.nonzero(
             self.episode_length_buf < release_start, as_tuple=False
@@ -567,6 +582,38 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         ), dim=-1).float()
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        # Pose writes in _apply_action happen before the final physics substep.
+        # Reassert the kinematic fixture before reading state so contact impulses
+        # cannot leak a one-substep socket/tool displacement into RL metrics.
+        all_env_ids = torch.arange(self.num_envs, device=self.device)
+        self.workpiece.write_root_pose_to_sim(
+            torch.cat((
+                self._allen_fixture_workpiece_pos,
+                self._allen_fixture_workpiece_quat,
+            ), dim=-1),
+            env_ids=all_env_ids,
+        )
+        self.workpiece.write_root_velocity_to_sim(
+            torch.zeros(self.num_envs, 6, device=self.device), env_ids=all_env_ids
+        )
+        release_start = int(self.cfg.allen_adjustment_steps) + int(
+            self.cfg.allen_closure_steps
+        )
+        fixture_ids = torch.nonzero(
+            self.episode_length_buf < release_start, as_tuple=False
+        ).squeeze(-1)
+        if fixture_ids.numel():
+            self.object.write_root_pose_to_sim(
+                torch.cat((
+                    self._allen_fixture_tool_pos[fixture_ids],
+                    self._allen_fixture_tool_quat[fixture_ids],
+                ), dim=-1),
+                env_ids=fixture_ids,
+            )
+            self.object.write_root_velocity_to_sim(
+                torch.zeros(fixture_ids.numel(), 6, device=self.device),
+                env_ids=fixture_ids,
+            )
         self._frame_counter += 1
         compute_intermediate_values(self)
         self._stable_support_count.copy_((

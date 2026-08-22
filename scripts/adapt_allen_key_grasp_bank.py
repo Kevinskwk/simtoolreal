@@ -60,6 +60,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--settle-steps", type=int, default=60)
     parser.add_argument("--hold-steps", type=int, default=120)
     parser.add_argument("--desired-entries", type=int, default=8)
+    parser.add_argument(
+        "--tool-position", type=float, nargs=3, default=(0.0, 0.08, 0.58),
+        metavar=("X", "Y", "Z"),
+        help="Engaged Allen-key position in the environment-local frame.",
+    )
     AppLauncher.add_app_launcher_args(parser)
     parser.set_defaults(headless=True)
     return parser.parse_args()
@@ -113,14 +118,16 @@ def provisional_entries(
     palm_axial_shifts_m: tuple[float, ...],
     palm_shift_radii_m: tuple[float, ...], palm_shift_angles_deg: tuple[float, ...],
     palm_rotation_angles_deg: tuple[float, ...], tool_yaw_angles_deg: tuple[float, ...],
-    max_source_entries: int,
+    max_source_entries: int, desired_tool_position: tuple[float, float, float],
 ) -> list[tuple[dict, dict]]:
     robot = ROOT / "assets/urdf/kuka_sharpa_description/iiwa14_left_sharpa_adjusted_restricted.urdf"
     kinematics = UrdfKinematics(robot)
     thresholds = GraspEvaluatorThresholds(
         ik_position_m=0.003, ik_orientation_deg=3.0, max_ik_iterations=300
     )
-    desired_tool_position = np.asarray((0.0, 0.08, 0.70))
+    desired_tool_position = np.asarray(desired_tool_position, dtype=np.float64)
+    if desired_tool_position.shape != (3,) or not np.isfinite(desired_tool_position).all():
+        raise ValueError("tool position must contain three finite values")
     robot_base = np.eye(4)
     robot_base[1, 3] = 0.8
     if "assets" in source:
@@ -281,6 +288,7 @@ def main() -> None:
         tuple(float(value) for value in ARGS.palm_rotation_angles_deg),
         tuple(float(value) for value in ARGS.tool_yaw_angles_deg),
         int(ARGS.max_source_entries),
+        tuple(float(value) for value in ARGS.tool_position),
     )
     expanded_entries: list[dict] = []
     metadata: list[dict] = []
