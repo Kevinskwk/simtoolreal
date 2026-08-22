@@ -4,11 +4,11 @@
     <visual>
       <material name="wood"><color rgba="0.82 0.56 0.35 1.0"/></material>
       <origin xyz="0 0 0"/>
-      <geometry><box size="0.30 0.25 0.30"/></geometry>
+      <geometry><box size="0.18 0.16 0.30"/></geometry>
     </visual>
     <collision>
       <origin xyz="0 0 0"/>
-      <geometry><box size="0.30 0.25 0.30"/></geometry>
+      <geometry><box size="0.18 0.16 0.30"/></geometry>
     </collision>
     <inertial>
       <mass value="500"/>
