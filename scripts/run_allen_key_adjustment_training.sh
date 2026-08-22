@@ -11,6 +11,7 @@ CHECKPOINT="${CHECKPOINT:-${VANILLA_CHECKPOINT}}"
 GRASP_BANK_SOURCE_CHECKPOINT="${GRASP_BANK_SOURCE_CHECKPOINT:-${VANILLA_CHECKPOINT}}"
 CHECKPOINT_LOAD_MODE="${CHECKPOINT_LOAD_MODE:-expand_obs}"
 GRASP_BANK="${GRASP_BANK:-${ROOT}/assets/grasp_banks/allen_key_manipulation_v2.json}"
+GRASP_BANK_ENTRIES="$(python -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["entries"]))' "${GRASP_BANK}")"
 NUM_ENVS="${NUM_ENVS:-12288}"
 MAX_EPOCHS="${MAX_EPOCHS:-12000}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
@@ -36,7 +37,7 @@ PY
 python scripts/validate_allen_key_target_sampling.py --grasp-bank "${GRASP_BANK}"
 python scripts/validate_allen_key_adjustment_task.py \
   --grasp-bank "${GRASP_BANK}" \
-  --num-envs 8 \
+  --num-envs "${GRASP_BANK_ENTRIES}" \
   --headless
 
 python isaacsimenvs/train.py \

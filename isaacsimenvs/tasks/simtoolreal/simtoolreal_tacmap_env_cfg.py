@@ -575,7 +575,7 @@ class SimToolRealAllenKeyAdjustmentEnvCfg(SimToolRealInHandAdjustmentEnvCfg):
     allen_target_pair_rotation_range_deg: tuple[float, float] = (18.0, 100.0)
     allen_require_valid_target_pairs: bool = True
     allen_pose_sigma_stages_m: tuple[float, ...] = (0.060, 0.040, 0.025, 0.015, 0.010)
-    allen_reset_yaw_range_stages_deg: tuple[float, ...] = (5.0, 10.0, 15.0, 20.0, 30.0)
+    allen_reset_yaw_range_stages_deg: tuple[float, ...] = (20.0, 35.0, 50.0, 65.0, 80.0)
     allen_palm_keypoints_m: tuple[tuple[float, float, float], ...] = (
         (0.0, 0.0, 0.0), (0.05, 0.0, 0.0), (-0.05, 0.0, 0.0),
         (0.0, 0.035, 0.0), (0.0, -0.035, 0.0), (0.0, 0.0, 0.03),
@@ -583,6 +583,7 @@ class SimToolRealAllenKeyAdjustmentEnvCfg(SimToolRealInHandAdjustmentEnvCfg):
     allen_screw_axis_tool: tuple[float, float, float] = (0.0, 0.0, -1.0)
     allen_screw_pivot_tool_m: tuple[float, float, float] = (0.192, 0.0, -0.03)
     allen_workpiece_from_tool_m: tuple[float, float, float] = (0.192, 0.0, -0.095)
+    allen_table_half_height_m: float = 0.060
     allen_socket_lateral_tolerance_m: float = 0.006
     allen_socket_insertion_tolerance_m: float = 0.008
     allen_socket_tilt_tolerance_deg: float = 5.0

@@ -33,9 +33,19 @@ def parse_args() -> argparse.Namespace:
         help="Optional explicit source grasps; otherwise sample diverse robust entries.",
     )
     parser.add_argument(
+        "--palm-axial-shifts-m", type=float, nargs="+",
+        default=(0.0, -0.03, -0.06, -0.09),
+        help="Palm-to-tool shifts along the shaft; negative values move the palm toward the bend.",
+    )
+    parser.add_argument(
         "--palm-shift-radii-m", type=float, nargs="+",
         default=(0.004, 0.005, 0.006, 0.007, 0.008, 0.009),
         help="Tool-frame radial shifts searched around the long handle axis.",
+    )
+    parser.add_argument(
+        "--tool-yaw-angles-deg", type=float, nargs="+",
+        default=(-50.0, -25.0, 0.0, 25.0, 50.0),
+        help="Engaged Allen-key world orientations represented in the bank.",
     )
     parser.add_argument(
         "--palm-shift-angles-deg", type=float, nargs="+",
@@ -100,17 +110,17 @@ def quaternion_wxyz(matrix: np.ndarray) -> list[float]:
 
 def provisional_entries(
     source: dict, count_assets: int, source_entry_indices: list[int] | None,
+    palm_axial_shifts_m: tuple[float, ...],
     palm_shift_radii_m: tuple[float, ...], palm_shift_angles_deg: tuple[float, ...],
-    palm_rotation_angles_deg: tuple[float, ...], max_source_entries: int,
+    palm_rotation_angles_deg: tuple[float, ...], tool_yaw_angles_deg: tuple[float, ...],
+    max_source_entries: int,
 ) -> list[tuple[dict, dict]]:
     robot = ROOT / "assets/urdf/kuka_sharpa_description/iiwa14_left_sharpa_adjusted_restricted.urdf"
     kinematics = UrdfKinematics(robot)
     thresholds = GraspEvaluatorThresholds(
         ik_position_m=0.003, ik_orientation_deg=3.0, max_ik_iterations=300
     )
-    desired_tool = pose_matrix(
-        np.asarray((0.0, 0.08, 0.70)), np.asarray((1.0, 0.0, 0.0, 0.0))
-    )
+    desired_tool_position = np.asarray((0.0, 0.08, 0.70))
     robot_base = np.eye(4)
     robot_base[1, 3] = 0.8
     if "assets" in source:
@@ -138,19 +148,25 @@ def provisional_entries(
                 )
                 indexed = [indexed[int(index)] for index in selected]
         assets = [{"asset_index": 0, "indexed_entries": indexed}]
-    shifts_tool = [np.zeros(3)]
-    for radius in palm_shift_radii_m:
-        if not math.isfinite(float(radius)) or float(radius) < 0.0:
-            raise ValueError("palm shift radii must be finite and non-negative")
-        if float(radius) == 0.0:
-            continue
-        for angle_deg in palm_shift_angles_deg:
-            if not math.isfinite(float(angle_deg)):
-                raise ValueError("palm shift angles must be finite")
-            angle = math.radians(float(angle_deg))
-            shifts_tool.append(np.asarray(
-                (0.0, float(radius) * math.cos(angle), float(radius) * math.sin(angle))
-            ))
+    shifts_tool = []
+    for axial in palm_axial_shifts_m:
+        if not math.isfinite(float(axial)):
+            raise ValueError("palm axial shifts must be finite")
+        shifts_tool.append(np.asarray((float(axial), 0.0, 0.0)))
+    for axial in palm_axial_shifts_m:
+        for radius in palm_shift_radii_m:
+            if not math.isfinite(float(radius)) or float(radius) < 0.0:
+                raise ValueError("palm shift radii must be finite and non-negative")
+            if float(radius) == 0.0:
+                continue
+            for angle_deg in palm_shift_angles_deg:
+                if not math.isfinite(float(angle_deg)):
+                    raise ValueError("palm shift angles must be finite")
+                angle = math.radians(float(angle_deg))
+                shifts_tool.append(np.asarray((
+                    float(axial), float(radius) * math.cos(angle),
+                    float(radius) * math.sin(angle),
+                )))
     candidates: list[tuple[dict, dict]] = []
     for asset in assets:
         for source_index, source_entry in asset["indexed_entries"]:
@@ -169,55 +185,62 @@ def provisional_entries(
                     ).as_matrix()
                     tool_to_palm[:3, :3] = screw_rotation @ tool_to_palm[:3, :3]
                     palm_to_tool = np.linalg.inv(tool_to_palm)
-                    target_palm = desired_tool @ tool_to_palm
-                    original = np.asarray(source_entry["joint_pos_canonical"], dtype=np.float64)
-                    arm, pos_error, rot_error, _, _ = solve_arm_ik(
-                        kinematics, target_palm, original[:7], original[7:],
-                        robot_base, thresholds,
-                    )
-                    if (
-                        pos_error > thresholds.ik_position_m
-                        or rot_error > thresholds.ik_orientation_deg
-                    ):
-                        continue
-                    entry = copy.deepcopy(source_entry)
-                    joints = np.concatenate((arm, original[7:]))
-                    targets = np.asarray(
-                        source_entry["joint_targets_canonical"], dtype=np.float64
-                    )
-                    targets[:7] = arm
-                    entry.update({
-                    "joint_pos_canonical": joints.tolist(),
-                    "joint_vel_canonical": [0.0] * 29,
-                    "joint_targets_canonical": targets.tolist(),
-                    "object_pos_local": desired_tool[:3, 3].tolist(),
-                    "object_quat_wxyz": quaternion_wxyz(desired_tool),
-                    "object_velocity": [0.0] * 6,
-                    "palm_to_tool_pos": palm_to_tool[:3, 3].tolist(),
-                    "palm_to_tool_quat_wxyz": quaternion_wxyz(palm_to_tool),
-                    "reference_contact_quat_wxyz": quaternion_wxyz(desired_tool),
-                    "reference_edge_yaw_rad": 0.0,
-                    "reference_edge_tilt_rad": math.radians(45.0),
-                    })
-                    verification = dict(entry["verification"])
-                    verification.update({
-                    "edge_clearance_m": 0.04,
-                    "table_force_n": 0.0,
-                    "pickup_orientation_error_deg": 0.0,
-                    "tactile_finger_count_min": 0,
-                    "tactile_contact_area_mean": 0.0,
-                    "tactile_depth_mean": 0.0,
-                    "tactile_depth_max": 0.0,
-                    })
-                    entry["verification"] = verification
-                    candidates.append((entry, {
-                        "source_asset_index": int(asset["asset_index"]),
-                        "source_entry_index": source_index,
-                        "palm_shift_tool_m": shift_tool.tolist(),
-                        "palm_rotation_about_screw_deg": float(palm_rotation_deg),
-                        "ik_position_error_m": pos_error,
-                        "ik_rotation_error_deg": rot_error,
-                    }))
+                    for tool_yaw_deg in tool_yaw_angles_deg:
+                        desired_tool = np.eye(4)
+                        desired_tool[:3, :3] = Rotation.from_euler(
+                            "z", float(tool_yaw_deg), degrees=True
+                        ).as_matrix()
+                        desired_tool[:3, 3] = desired_tool_position
+                        target_palm = desired_tool @ tool_to_palm
+                        original = np.asarray(source_entry["joint_pos_canonical"], dtype=np.float64)
+                        arm, pos_error, rot_error, _, _ = solve_arm_ik(
+                            kinematics, target_palm, original[:7], original[7:],
+                            robot_base, thresholds,
+                        )
+                        if (
+                            pos_error > thresholds.ik_position_m
+                            or rot_error > thresholds.ik_orientation_deg
+                        ):
+                            continue
+                        entry = copy.deepcopy(source_entry)
+                        joints = np.concatenate((arm, original[7:]))
+                        targets = np.asarray(
+                            source_entry["joint_targets_canonical"], dtype=np.float64
+                        ).copy()
+                        targets[:7] = arm
+                        entry.update({
+                            "joint_pos_canonical": joints.tolist(),
+                            "joint_vel_canonical": [0.0] * 29,
+                            "joint_targets_canonical": targets.tolist(),
+                            "object_pos_local": desired_tool[:3, 3].tolist(),
+                            "object_quat_wxyz": quaternion_wxyz(desired_tool),
+                            "object_velocity": [0.0] * 6,
+                            "palm_to_tool_pos": palm_to_tool[:3, 3].tolist(),
+                            "palm_to_tool_quat_wxyz": quaternion_wxyz(palm_to_tool),
+                            "reference_contact_quat_wxyz": quaternion_wxyz(desired_tool),
+                            "reference_edge_yaw_rad": 0.0,
+                            "reference_edge_tilt_rad": math.radians(45.0),
+                        })
+                        verification = dict(entry["verification"])
+                        verification.update({
+                            "edge_clearance_m": 0.04,
+                            "table_force_n": 0.0,
+                            "pickup_orientation_error_deg": 0.0,
+                            "tactile_finger_count_min": 0,
+                            "tactile_contact_area_mean": 0.0,
+                            "tactile_depth_mean": 0.0,
+                            "tactile_depth_max": 0.0,
+                        })
+                        entry["verification"] = verification
+                        candidates.append((entry, {
+                            "source_asset_index": int(asset["asset_index"]),
+                            "source_entry_index": source_index,
+                            "palm_shift_tool_m": shift_tool.tolist(),
+                            "palm_rotation_about_screw_deg": float(palm_rotation_deg),
+                            "tool_yaw_deg": float(tool_yaw_deg),
+                            "ik_position_error_m": pos_error,
+                            "ik_rotation_error_deg": rot_error,
+                        }))
     if not candidates:
         raise RuntimeError("no screwdriver grasp candidate has a reachable engaged Allen-key pose")
     return candidates
@@ -252,9 +275,11 @@ def main() -> None:
         source,
         int(ARGS.source_assets),
         ARGS.source_entry_indices,
+        tuple(float(value) for value in ARGS.palm_axial_shifts_m),
         tuple(float(value) for value in ARGS.palm_shift_radii_m),
         tuple(float(value) for value in ARGS.palm_shift_angles_deg),
         tuple(float(value) for value in ARGS.palm_rotation_angles_deg),
+        tuple(float(value) for value in ARGS.tool_yaw_angles_deg),
         int(ARGS.max_source_entries),
     )
     expanded_entries: list[dict] = []
@@ -302,7 +327,9 @@ def main() -> None:
         targets = inner._inhand_bank_joint_targets[:, inner._perm_canon_to_lab]
         inner._replay_target_lab_order = targets
         action = inner._inhand_bank_last_action.clone()
-        initial_pos, initial_quat = inner._palm_tool_relative()
+        restored_pos, restored_quat = inner._palm_tool_relative()
+        hold_reference_pos = restored_pos.clone()
+        hold_reference_quat = restored_quat.clone()
         min_support = torch.full((inner.num_envs,), 99, device=inner.device, dtype=torch.long)
         palm_contact_steps = torch.zeros(inner.num_envs, device=inner.device)
         socket_valid_steps = torch.zeros_like(palm_contact_steps)
@@ -314,10 +341,10 @@ def main() -> None:
             if step == 0:
                 current_pos, current_quat = inner._palm_tool_relative()
                 initial_position_error = torch.linalg.vector_norm(
-                    current_pos - initial_pos, dim=-1
+                    current_pos - restored_pos, dim=-1
                 )
                 initial_alignment = torch.abs(
-                    (current_quat * initial_quat).sum(-1)
+                    (current_quat * restored_quat).sum(-1)
                 ).clamp(0, 1)
                 print(
                     "[adapt] first-step diagnostics: "
@@ -331,11 +358,17 @@ def main() -> None:
                 )
             if (step + 1) % 30 == 0:
                 print(f"[adapt] validation step {step + 1}/{total}", flush=True)
+            if step == int(ARGS.settle_steps) - 1:
+                hold_reference_pos, hold_reference_quat = inner._palm_tool_relative()
             if step < int(ARGS.settle_steps):
                 continue
             current_pos, current_quat = inner._palm_tool_relative()
-            drift = torch.linalg.vector_norm(current_pos - initial_pos, dim=-1)
-            alignment = torch.abs((current_quat * initial_quat).sum(-1)).clamp(0, 1)
+            drift = torch.linalg.vector_norm(
+                current_pos - hold_reference_pos, dim=-1
+            )
+            alignment = torch.abs(
+                (current_quat * hold_reference_quat).sum(-1)
+            ).clamp(0, 1)
             rotation = torch.rad2deg(2.0 * torch.acos(alignment))
             max_drift.copy_(torch.maximum(max_drift, drift))
             max_rotation.copy_(torch.maximum(max_rotation, rotation))
@@ -411,6 +444,7 @@ def main() -> None:
                 metadata[index]["source_entry_index"],
                 *tuple(round(float(v), 6) for v in metadata[index]["palm_shift_tool_m"]),
                 round(float(metadata[index]["palm_rotation_about_screw_deg"]), 3),
+                round(float(metadata[index]["tool_yaw_deg"]), 3),
             )
             if transform_id not in best_by_transform:
                 best_by_transform[transform_id] = (row[:-1], index)
@@ -448,18 +482,30 @@ def main() -> None:
             raise RuntimeError(
                 "physically stable grasps contain no non-trivial manipulation pair"
             )
+        pose_buckets: dict[tuple[float, float], list[int]] = {}
+        for ranked_index, candidate_index in enumerate(ranked):
+            if not bool(adjacency[ranked_index].any()):
+                continue
+            yaw = round(float(metadata[candidate_index]["tool_yaw_deg"]), 3)
+            palm_rotation = round(float(
+                metadata[candidate_index]["palm_rotation_about_screw_deg"]
+            ), 3)
+            pose_buckets.setdefault((yaw, palm_rotation), []).append(ranked_index)
+        candidate_order: list[int] = []
+        while any(pose_buckets.values()):
+            for pose_group in sorted(pose_buckets):
+                if pose_buckets[pose_group]:
+                    candidate_order.append(pose_buckets[pose_group].pop(0))
+
         chosen: list[int] = []
-        for i, j in np.argwhere(np.triu(adjacency, 1)):
-            for candidate in (int(i), int(j)):
-                if candidate not in chosen:
-                    chosen.append(candidate)
+        for candidate in candidate_order:
             if len(chosen) >= int(ARGS.desired_entries):
                 break
-        for candidate in range(len(ranked)):
-            if len(chosen) >= int(ARGS.desired_entries):
-                break
-            if candidate not in chosen and bool(adjacency[candidate, chosen].any()):
+            if not chosen or bool(adjacency[candidate, chosen].any()):
                 chosen.append(candidate)
+        # Ensure the first selected grasp also has a selected manipulation edge.
+        if len(chosen) > 1 and not bool(adjacency[chosen[0], chosen[1:]].any()):
+            chosen = chosen[1:]
         chosen = chosen[:int(ARGS.desired_entries)]
         chosen_adjacency = adjacency[np.ix_(chosen, chosen)]
         if len(chosen) < int(ARGS.desired_entries) or bool(

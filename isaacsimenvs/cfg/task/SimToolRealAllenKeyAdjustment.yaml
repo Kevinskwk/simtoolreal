@@ -27,6 +27,8 @@ adjustment_target_rotation_axis: tool_x
 adjustment_target_axial_translation_m: [0.0, 0.0, 0.0, 0.0, 0.0]
 adjustment_target_perpendicular_translation_m: [0.0, 0.0, 0.0, 0.0, 0.0]
 adjustment_target_rotation_deg: [5.0, 10.0, 15.0, 20.0, 30.0]
+allen_reset_yaw_range_stages_deg: [20.0, 35.0, 50.0, 65.0, 80.0]
+allen_table_half_height_m: 0.060
 adjustment_relative_position_tolerance_stages_m: [0.008, 0.007, 0.006, 0.005, 0.004]
 adjustment_relative_rotation_tolerance_stages_deg: [6.0, 5.0, 4.0, 3.0, 2.5]
 adjustment_tool_pose_delay_steps: [0, 0, 0, 0, 0]

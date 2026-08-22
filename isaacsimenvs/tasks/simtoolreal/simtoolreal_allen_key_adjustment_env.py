@@ -16,7 +16,6 @@ from .utils.adjustment_utils import (
 )
 from .utils.logging_utils import log_step_metrics
 from .utils.obs_utils import compute_intermediate_values
-from .utils.scrape_pose_utils import TABLE_HALF_HEIGHT
 from .utils.stable_scrape_utils import consecutive_counter, quaternion_distance_rad
 
 
@@ -35,7 +34,7 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         self._allen_target_error_obs = torch.zeros(n, 5, device=device)
         self._allen_geometry_obs = torch.zeros(n, 9, device=device)
         geometry = torch.tensor(
-            (0.264, 0.06, 0.010, *cfg.allen_screw_axis_tool, *cfg.allen_screw_pivot_tool_m),
+            (0.360, 0.06, 0.010, *cfg.allen_screw_axis_tool, *cfg.allen_screw_pivot_tool_m),
             device=device,
         )
         self._allen_geometry_obs[:] = geometry
@@ -96,8 +95,8 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         yaw_ranges = tuple(float(value) for value in cfg.allen_reset_yaw_range_stages_deg)
         if len(yaw_ranges) != len(cfg.adjustment_target_rotation_deg):
             raise ValueError("Allen-key reset yaw curriculum length is inconsistent")
-        if any(not math.isfinite(value) or not 0.0 <= value <= 45.0 for value in yaw_ranges):
-            raise ValueError("Allen-key reset yaw ranges must be finite and in [0, 45]")
+        if any(not math.isfinite(value) or not 0.0 <= value <= 90.0 for value in yaw_ranges):
+            raise ValueError("Allen-key reset yaw ranges must be finite and in [0, 90]")
         translation_range = tuple(
             float(value) for value in cfg.allen_target_pair_translation_range_m
         )
@@ -130,6 +129,7 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
             "allen_release_angular_speed_tolerance_radps",
             "allen_closure_flexion_fraction",
             "allen_min_flexion_closure_fraction",
+            "allen_table_half_height_m",
         ):
             if not math.isfinite(float(getattr(cfg, name))) or float(getattr(cfg, name)) <= 0:
                 raise ValueError(f"{name} must be finite and positive")
@@ -256,7 +256,7 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
             workpiece_quat,
             torch.tensor((0.0, 0.0, 1.0), device=self.device).expand(count, -1),
         )
-        table_pos = workpiece_pos - normal * TABLE_HALF_HEIGHT
+        table_pos = workpiece_pos - normal * float(self.cfg.allen_table_half_height_m)
         self.table.write_root_pose_to_sim(
             torch.cat((table_pos, workpiece_quat), dim=-1), env_ids=env_ids
         )
@@ -332,7 +332,7 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         arm_joint = int(self._arm_joint_ids[0])
         current_targets = self._cur_targets[env_ids, arm_joint]
         low = torch.maximum(
-            torch.zeros_like(current_targets),
+            torch.full_like(current_targets, -limit),
             self._arm_lower[env_ids, 0] - current_targets,
         )
         high = torch.minimum(

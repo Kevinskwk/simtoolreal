@@ -130,7 +130,21 @@ def main() -> None:
             frame = capture_pose_viewer_frame(inner, entry_id)
             frame["target_palm_pose"] = target_palm_pose(inner, entry_id, entry_id)
             entry_frames.append(frame)
-            entry_index.append({"frame": entry_id, "grasp_id": entry_id})
+            relative_pos = inner._inhand_bank_relative_pos[entry_id : entry_id + 1]
+            relative_quat = inner._inhand_bank_relative_quat[entry_id : entry_id + 1]
+            tool_to_palm_position = quat_apply(
+                quat_inv(relative_quat), -relative_pos
+            )[0].detach().cpu().tolist()
+            verification = entries[entry_id].get("verification", {})
+            entry_index.append({
+                "frame": entry_id,
+                "grasp_id": entry_id,
+                "tool_yaw_deg": verification.get("tool_yaw_deg"),
+                "tool_to_palm_position_tool_m": tool_to_palm_position,
+                "palm_rotation_about_screw_deg": verification.get(
+                    "palm_rotation_about_screw_deg"
+                ),
+            })
 
         pair_frames = []
         pair_index = []
