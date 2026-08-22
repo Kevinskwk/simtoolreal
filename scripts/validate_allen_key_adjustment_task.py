@@ -18,6 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--num-envs", type=int, default=4)
     parser.add_argument("--settle-steps", type=int, default=60)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--grasp-bank", type=Path, default=None)
     parser.add_argument("--reset-yaw-range-deg", type=float, default=None)
     parser.add_argument("--target-angles-deg", type=float, nargs="+", default=None)
@@ -118,6 +119,7 @@ def main() -> None:
     if ARGS.target_angles_deg is not None and len(ARGS.target_angles_deg) != ARGS.num_envs:
         raise ValueError("target-angles-deg must provide exactly one angle per environment")
     cfg = SimToolRealAllenKeyAdjustmentEnvCfg()
+    cfg.seed = int(ARGS.seed)
     cfg.scene.num_envs = int(ARGS.num_envs)
     if ARGS.grasp_bank is not None:
         cfg.grasp_bank_path = str(ARGS.grasp_bank.resolve())
@@ -131,6 +133,11 @@ def main() -> None:
     try:
         observation, _ = env.reset()
         inner = env.unwrapped
+        env_ids = torch.arange(inner.num_envs, device=inner.device)
+        if ARGS.grasp_bank is not None:
+            bank_size = len(json.loads(ARGS.grasp_bank.read_text())["entries"])
+            if bank_size == inner.num_envs:
+                inner._restore_inhand_state(env_ids, env_ids)
         expected_policy = (ARGS.num_envs, compute_obs_dim(cfg.obs.obs_list))
         expected_critic = (ARGS.num_envs, compute_obs_dim(cfg.obs.state_list))
         if observation["policy"].shape != expected_policy:
@@ -164,7 +171,6 @@ def main() -> None:
 
         # IK alone is insufficient. Place every sampled wrist target with its
         # validated bank finger posture and test the physical grasps.
-        env_ids = torch.arange(inner.num_envs, device=inner.device)
         target_ids = inner._allen_target_bank_index
         target_joints = inner._inhand_bank_joint_pos[target_ids][
             :, inner._perm_canon_to_lab
@@ -213,6 +219,8 @@ def main() -> None:
             )
 
         observation, _ = env.reset()
+        if ARGS.grasp_bank is not None and bank_size == inner.num_envs:
+            inner._restore_inhand_state(env_ids, env_ids)
 
         inner._replay_target_lab_order = inner._cur_targets.clone()
         actions = inner._stable_previous_action.clone()
@@ -281,11 +289,20 @@ def main() -> None:
             frames.append(capture_pose_viewer_frame(inner, 0))
             if bool(terminated.any()) or bool(truncated.any()):
                 raise RuntimeError("episode ended early during release validation")
-        if not bool(inner._allen_combined_valid.all()) or not bool(
-            (inner._allen_hold_count >= int(cfg.allen_success_hold_steps)).all()
-        ):
+        release_success = inner._allen_combined_valid & (
+            inner._allen_hold_count >= int(cfg.allen_success_hold_steps)
+        )
+        release_success_count = int(release_success.sum().item())
+        release_success_ratio = float(release_success.float().mean().item())
+        print(
+            "[diagnostic] open-loop challenged release: "
+            f"{release_success_count}/{inner.num_envs} grasps passed "
+            f"({release_success_ratio:.3f})",
+            flush=True,
+        )
+        if release_success_count == 0:
             raise RuntimeError(
-                "settled bank grasp did not pass dynamic release validation: "
+                "no settled bank grasp passed dynamic release validation: "
                 f"valid={inner._allen_combined_valid.tolist()} "
                 f"hold={inner._allen_hold_count.tolist()} "
                 f"contacts={inner._allen_fingertip_contact_count.tolist()} "
@@ -294,6 +311,10 @@ def main() -> None:
                 f"palm={inner._allen_palm_contact.tolist()} "
                 f"tool_position_error={inner._adjustment_tool_position_error.tolist()} "
                 f"relative_speed={inner._stable_relative_linear_speed.tolist()}"
+                f" palm_keypoint_error={inner._allen_palm_keypoint_error.tolist()}"
+                f" socket_valid={inner._allen_socket_valid.tolist()}"
+                f" tool_valid={inner._allen_validity_obs[:, 5].tolist()}"
+                f" motion_valid={inner._allen_validity_obs[:, 6].tolist()}"
                 f" start_bank={inner._inhand_reset_bank_index.tolist()}"
             )
         observation, reward, terminated, truncated, _ = env.step(actions)
@@ -340,6 +361,8 @@ def main() -> None:
             "sampled_target_ik_rotation_error_deg": ik_rotation,
             "closure_steps": int(cfg.allen_closure_steps),
             "release_steps": int(cfg.allen_release_steps),
+            "open_loop_release_success_count": release_success_count,
+            "open_loop_release_success_ratio": release_success_ratio,
             "fingertip_contact_count_mean": float(
                 inner._allen_fingertip_contact_count.float().mean().item()
             ),

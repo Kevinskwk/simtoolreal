@@ -36,7 +36,7 @@ PY
 python scripts/validate_allen_key_target_sampling.py --grasp-bank "${GRASP_BANK}"
 python scripts/validate_allen_key_adjustment_task.py \
   --grasp-bank "${GRASP_BANK}" \
-  --num-envs 4 \
+  --num-envs 8 \
   --headless
 
 python isaacsimenvs/train.py \
