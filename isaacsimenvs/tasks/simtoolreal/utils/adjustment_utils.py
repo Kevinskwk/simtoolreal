@@ -73,6 +73,33 @@ def orbit_palm_tool_about_screw_axis(
     return target_palm_to_tool_pos, target_palm_to_tool_quat
 
 
+def rotate_palm_about_tool_axis_in_place(
+    palm_to_tool_pos: torch.Tensor,
+    palm_to_tool_quat: torch.Tensor,
+    angle_rad: torch.Tensor,
+    axis_tool: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate palm orientation about a tool axis without moving its tool-frame center."""
+    if palm_to_tool_pos.ndim != 2 or palm_to_tool_pos.shape[-1] != 3:
+        raise ValueError("palm_to_tool_pos must have shape (N, 3)")
+    count = palm_to_tool_pos.shape[0]
+    if palm_to_tool_quat.shape != (count, 4) or angle_rad.shape != (count,):
+        raise ValueError("in-place palm rotation inputs have incompatible shapes")
+    if axis_tool.shape not in ((3,), (count, 3)):
+        raise ValueError("axis_tool must have shape (3,) or (N, 3)")
+    axis = axis_tool.expand(count, -1) if axis_tool.ndim == 1 else axis_tool
+    axis = torch.nn.functional.normalize(axis, dim=-1)
+    tool_to_palm_quat = _quat_inv(palm_to_tool_quat)
+    tool_to_palm_pos = _quat_apply(tool_to_palm_quat, -palm_to_tool_pos)
+    rotation = _quat_from_angle_axis(angle_rad, axis)
+    target_tool_to_palm_quat = _quat_mul(rotation, tool_to_palm_quat)
+    target_palm_to_tool_quat = _quat_inv(target_tool_to_palm_quat)
+    target_palm_to_tool_pos = _quat_apply(
+        target_palm_to_tool_quat, -tool_to_palm_pos
+    )
+    return target_palm_to_tool_pos, target_palm_to_tool_quat
+
+
 def screw_axis_orbit_errors(
     current_palm_to_tool_pos: torch.Tensor,
     current_palm_to_tool_quat: torch.Tensor,
@@ -273,5 +300,6 @@ __all__ = [
     "SCENARIO_KINDS", "adjustment_reward_terms", "arm_controllability_metrics",
     "controllability_score", "load_adjustment_scenarios",
     "orbit_palm_tool_about_screw_axis", "palm_keypoint_error",
+    "rotate_palm_about_tool_axis_in_place",
     "screw_axis_orbit_errors",
 ]

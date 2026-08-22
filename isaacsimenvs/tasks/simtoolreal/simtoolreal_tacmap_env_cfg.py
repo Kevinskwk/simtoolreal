@@ -564,6 +564,8 @@ class SimToolRealAllenKeyAdjustmentEnvCfg(SimToolRealInHandAdjustmentEnvCfg):
     allen_closure_steps: int = 120
     allen_release_steps: int = 80
     allen_success_hold_steps: int = 45
+    # Rotate the palm orientation about the socket axis while retaining the
+    # validated tool-frame wrist center; do not orbit it away from the handle.
     allen_target_orbit_range_deg: tuple[float, float] = (15.0, 60.0)
     allen_pose_sigma_stages_m: tuple[float, ...] = (0.060, 0.040, 0.025, 0.015, 0.010)
     allen_reset_yaw_range_stages_deg: tuple[float, ...] = (30.0,) * 5

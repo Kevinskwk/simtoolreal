@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail unless every Allen-key target in the training range is arm-reachable."""
+"""Validate Allen-key targets retain the grasp center and are arm-reachable."""
 
 from __future__ import annotations
 
@@ -110,13 +110,27 @@ def main() -> None:
         )
         original = np.asarray(entry["joint_pos_canonical"], dtype=np.float64)
         for angle_deg in angles:
-            target_pos, target_quat = adjustment.orbit_palm_tool_about_screw_axis(
+            target_pos, target_quat = adjustment.rotate_palm_about_tool_axis_in_place(
                 palm_to_tool_pos,
                 palm_to_tool_quat,
                 torch.tensor([math.radians(float(angle_deg))], dtype=torch.float64),
                 torch.tensor((0.0, 0.0, -1.0), dtype=torch.float64),
-                torch.tensor((0.192, 0.0, -0.03), dtype=torch.float64),
             )
+            current_center = adjustment._quat_apply(
+                adjustment._quat_inv(palm_to_tool_quat), -palm_to_tool_pos
+            )
+            target_center = adjustment._quat_apply(
+                adjustment._quat_inv(target_quat), -target_pos
+            )
+            center_drift = float(torch.linalg.vector_norm(
+                target_center - current_center, dim=-1
+            )[0].item())
+            if center_drift > 1.0e-8:
+                failures.append(
+                    f"entry={entry_index} angle={angle_deg:.2f}deg "
+                    f"grasp_center_drift={center_drift:.9f}m"
+                )
+                continue
             palm_to_tool = pose_from_wxyz(
                 target_pos[0].numpy(), target_quat[0].numpy()
             )

@@ -11,8 +11,8 @@ from isaaclab.utils.math import quat_apply, quat_from_angle_axis, quat_mul
 from .simtoolreal_inhand_adjustment_env import SimToolRealInHandAdjustmentEnv
 from .simtoolreal_tacmap_env_cfg import SimToolRealAllenKeyAdjustmentEnvCfg
 from .utils.adjustment_utils import (
-    orbit_palm_tool_about_screw_axis,
     palm_keypoint_error,
+    rotate_palm_about_tool_axis_in_place,
     screw_axis_orbit_errors,
 )
 from .utils.logging_utils import log_step_metrics
@@ -162,10 +162,9 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         angle = torch.empty(relative_pos.shape[0], device=self.device).uniform_(
             math.radians(float(low)), math.radians(float(high))
         )
-        target_pos, target_quat = orbit_palm_tool_about_screw_axis(
+        target_pos, target_quat = rotate_palm_about_tool_axis_in_place(
             relative_pos, relative_quat, angle,
             torch.tensor(self.cfg.allen_screw_axis_tool, device=self.device),
-            torch.tensor(self.cfg.allen_screw_pivot_tool_m, device=self.device),
         )
         return target_pos, target_quat, angle.abs(), torch.zeros_like(angle)
 

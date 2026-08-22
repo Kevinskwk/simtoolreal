@@ -141,3 +141,19 @@ def test_palm_keypoint_error_couples_translation_and_rotation():
     )
     assert translated.item() == pytest.approx(0.01, rel=1e-5)
     assert rotated.item() == pytest.approx(2 ** 0.5 * 0.05, rel=1e-5)
+
+
+def test_in_place_palm_rotation_preserves_grasp_center_in_tool_frame():
+    position = torch.tensor([[0.03, -0.02, 0.10]])
+    quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    target_pos, target_quat = module.rotate_palm_about_tool_axis_in_place(
+        position,
+        quat,
+        torch.tensor([torch.pi / 3]),
+        torch.tensor([0.0, 0.0, -1.0]),
+    )
+    current_center = module._quat_apply(module._quat_inv(quat), -position)
+    target_center = module._quat_apply(module._quat_inv(target_quat), -target_pos)
+    assert torch.allclose(target_center, current_center, atol=1e-6)
+    alignment = torch.abs((quat * target_quat).sum(-1)).clamp(0.0, 1.0)
+    assert (2.0 * torch.acos(alignment)).item() == pytest.approx(torch.pi / 3, rel=1e-5)
