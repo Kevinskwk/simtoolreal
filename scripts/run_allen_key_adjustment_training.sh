@@ -10,7 +10,7 @@ VANILLA_CHECKPOINT="${ROOT}/pretrained_policy/model.pth"
 CHECKPOINT="${CHECKPOINT:-${VANILLA_CHECKPOINT}}"
 GRASP_BANK_SOURCE_CHECKPOINT="${GRASP_BANK_SOURCE_CHECKPOINT:-${VANILLA_CHECKPOINT}}"
 CHECKPOINT_LOAD_MODE="${CHECKPOINT_LOAD_MODE:-expand_obs}"
-GRASP_BANK="${GRASP_BANK:-${ROOT}/assets/grasp_banks/allen_key_canonical_v1.json}"
+GRASP_BANK="${GRASP_BANK:-${ROOT}/assets/grasp_banks/allen_key_manipulation_v2.json}"
 NUM_ENVS="${NUM_ENVS:-12288}"
 MAX_EPOCHS="${MAX_EPOCHS:-12000}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
@@ -22,8 +22,8 @@ if not path.is_file():
     raise SystemExit(f"ERROR: Allen-key grasp bank does not exist: {path}")
 payload = json.loads(path.read_text())
 entries = payload.get("entries", [])
-if payload.get("tool_type") != "allen_key" or not entries:
-    raise SystemExit("ERROR: grasp bank is not a non-empty Allen-key bank")
+if payload.get("tool_type") != "allen_key" or len(entries) < 6:
+    raise SystemExit("ERROR: manipulation bank requires at least six Allen-key grasps")
 for index, entry in enumerate(entries):
     metrics = entry.get("verification", {})
     if metrics.get("palm_contact_ratio", 0.0) < 0.95:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Adapt a validated screwdriver grasp to the thin, socket-engaged Allen key."""
+"""Build a physically validated Allen-key manipulation-grasp bank."""
 
 from __future__ import annotations
 
@@ -20,32 +20,36 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--source-bank", type=Path,
-        default=ROOT
-        / "outputs/multitool_grasp_banks/20260818_123726"
-        / "long_screwdriver_seed0/robust.json",
+        default=ROOT / "assets/grasp_banks/allen_key_canonical_v1.json",
     )
     parser.add_argument(
         "--output", type=Path,
-        default=ROOT / "assets/grasp_banks/allen_key_canonical_v1.json",
+        default=ROOT / "assets/grasp_banks/allen_key_manipulation_v2.json",
     )
     parser.add_argument("--source-assets", type=int, default=256)
+    parser.add_argument("--max-source-entries", type=int, default=24)
     parser.add_argument(
-        "--source-entry-indices", type=int, nargs="+", default=(201,),
-        help="Source grasps to adapt; entry 201 is the validated thin-key seed.",
+        "--source-entry-indices", type=int, nargs="+", default=None,
+        help="Optional explicit source grasps; otherwise sample diverse robust entries.",
     )
     parser.add_argument(
         "--palm-shift-radii-m", type=float, nargs="+",
-        default=(0.004, 0.008, 0.012, 0.016),
+        default=(0.004, 0.005, 0.006, 0.007, 0.008, 0.009),
         help="Tool-frame radial shifts searched around the long handle axis.",
     )
     parser.add_argument(
         "--palm-shift-angles-deg", type=float, nargs="+",
-        default=(0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0),
+        default=(210.0, 225.0, 240.0, 255.0, 270.0, 285.0, 300.0, 315.0, 330.0),
         help="Tool-frame radial shift angles searched around the handle.",
+    )
+    parser.add_argument(
+        "--palm-rotation-angles-deg", type=float, nargs="+",
+        default=(0.0, 5.0, 10.0, 15.0, 20.0, 25.0),
+        help="Physically validate palm orientations about the engaged screw axis.",
     )
     parser.add_argument("--settle-steps", type=int, default=60)
     parser.add_argument("--hold-steps", type=int, default=120)
-    parser.add_argument("--desired-entries", type=int, default=1)
+    parser.add_argument("--desired-entries", type=int, default=8)
     AppLauncher.add_app_launcher_args(parser)
     parser.set_defaults(headless=True)
     return parser.parse_args()
@@ -97,6 +101,7 @@ def quaternion_wxyz(matrix: np.ndarray) -> list[float]:
 def provisional_entries(
     source: dict, count_assets: int, source_entry_indices: list[int] | None,
     palm_shift_radii_m: tuple[float, ...], palm_shift_angles_deg: tuple[float, ...],
+    palm_rotation_angles_deg: tuple[float, ...], max_source_entries: int,
 ) -> list[tuple[dict, dict]]:
     robot = ROOT / "assets/urdf/kuka_sharpa_description/iiwa14_left_sharpa_adjusted_restricted.urdf"
     kinematics = UrdfKinematics(robot)
@@ -127,6 +132,11 @@ def provisional_entries(
                 raise ValueError(f"source entry indices are out of range: {sorted(missing)}")
         else:
             indexed = indexed[:count_assets]
+            if len(indexed) > max_source_entries:
+                selected = np.linspace(
+                    0, len(indexed) - 1, max_source_entries, dtype=np.int64
+                )
+                indexed = [indexed[int(index)] for index in selected]
         assets = [{"asset_index": 0, "indexed_entries": indexed}]
     shifts_tool = [np.zeros(3)]
     for radius in palm_shift_radii_m:
@@ -149,21 +159,34 @@ def provisional_entries(
                 np.asarray(source_entry["palm_to_tool_quat_wxyz"]),
             )
             for shift_tool in shifts_tool:
-                palm_to_tool = source_palm_to_tool.copy()
-                palm_to_tool[:3, 3] += palm_to_tool[:3, :3] @ shift_tool
-                target_palm = desired_tool @ np.linalg.inv(palm_to_tool)
-                original = np.asarray(source_entry["joint_pos_canonical"], dtype=np.float64)
-                arm, pos_error, rot_error, _, _ = solve_arm_ik(
-                    kinematics, target_palm, original[:7], original[7:],
-                    robot_base, thresholds,
-                )
-                if pos_error > thresholds.ik_position_m or rot_error > thresholds.ik_orientation_deg:
-                    continue
-                entry = copy.deepcopy(source_entry)
-                joints = np.concatenate((arm, original[7:]))
-                targets = np.asarray(source_entry["joint_targets_canonical"], dtype=np.float64)
-                targets[:7] = arm
-                entry.update({
+                shifted = source_palm_to_tool.copy()
+                shifted[:3, 3] += shifted[:3, :3] @ shift_tool
+                for palm_rotation_deg in palm_rotation_angles_deg:
+                    tool_to_palm = np.linalg.inv(shifted)
+                    screw_rotation = Rotation.from_rotvec(
+                        np.asarray((0.0, 0.0, -1.0))
+                        * math.radians(float(palm_rotation_deg))
+                    ).as_matrix()
+                    tool_to_palm[:3, :3] = screw_rotation @ tool_to_palm[:3, :3]
+                    palm_to_tool = np.linalg.inv(tool_to_palm)
+                    target_palm = desired_tool @ tool_to_palm
+                    original = np.asarray(source_entry["joint_pos_canonical"], dtype=np.float64)
+                    arm, pos_error, rot_error, _, _ = solve_arm_ik(
+                        kinematics, target_palm, original[:7], original[7:],
+                        robot_base, thresholds,
+                    )
+                    if (
+                        pos_error > thresholds.ik_position_m
+                        or rot_error > thresholds.ik_orientation_deg
+                    ):
+                        continue
+                    entry = copy.deepcopy(source_entry)
+                    joints = np.concatenate((arm, original[7:]))
+                    targets = np.asarray(
+                        source_entry["joint_targets_canonical"], dtype=np.float64
+                    )
+                    targets[:7] = arm
+                    entry.update({
                     "joint_pos_canonical": joints.tolist(),
                     "joint_vel_canonical": [0.0] * 29,
                     "joint_targets_canonical": targets.tolist(),
@@ -175,9 +198,9 @@ def provisional_entries(
                     "reference_contact_quat_wxyz": quaternion_wxyz(desired_tool),
                     "reference_edge_yaw_rad": 0.0,
                     "reference_edge_tilt_rad": math.radians(45.0),
-                })
-                verification = dict(entry["verification"])
-                verification.update({
+                    })
+                    verification = dict(entry["verification"])
+                    verification.update({
                     "edge_clearance_m": 0.04,
                     "table_force_n": 0.0,
                     "pickup_orientation_error_deg": 0.0,
@@ -185,15 +208,16 @@ def provisional_entries(
                     "tactile_contact_area_mean": 0.0,
                     "tactile_depth_mean": 0.0,
                     "tactile_depth_max": 0.0,
-                })
-                entry["verification"] = verification
-                candidates.append((entry, {
-                    "source_asset_index": int(asset["asset_index"]),
-                    "source_entry_index": source_index,
-                    "palm_shift_tool_m": shift_tool.tolist(),
-                    "ik_position_error_m": pos_error,
-                    "ik_rotation_error_deg": rot_error,
-                }))
+                    })
+                    entry["verification"] = verification
+                    candidates.append((entry, {
+                        "source_asset_index": int(asset["asset_index"]),
+                        "source_entry_index": source_index,
+                        "palm_shift_tool_m": shift_tool.tolist(),
+                        "palm_rotation_about_screw_deg": float(palm_rotation_deg),
+                        "ik_position_error_m": pos_error,
+                        "ik_rotation_error_deg": rot_error,
+                    }))
     if not candidates:
         raise RuntimeError("no screwdriver grasp candidate has a reachable engaged Allen-key pose")
     return candidates
@@ -230,6 +254,8 @@ def main() -> None:
         ARGS.source_entry_indices,
         tuple(float(value) for value in ARGS.palm_shift_radii_m),
         tuple(float(value) for value in ARGS.palm_shift_angles_deg),
+        tuple(float(value) for value in ARGS.palm_rotation_angles_deg),
+        int(ARGS.max_source_entries),
     )
     expanded_entries: list[dict] = []
     metadata: list[dict] = []
@@ -259,6 +285,10 @@ def main() -> None:
     cfg = SimToolRealAllenKeyAdjustmentEnvCfg()
     cfg.grasp_bank_path = str(provisional_path)
     cfg.grasp_bank_min_entries = 1
+    cfg.allen_require_valid_target_pairs = False
+    cfg.allen_reset_yaw_range_stages_deg = (0.0,) * len(
+        cfg.adjustment_target_rotation_deg
+    )
     cfg.scene.num_envs = len(expanded_entries)
     cfg.episode_length_s = max(8.0, (ARGS.settle_steps + ARGS.hold_steps + 30) / 60.0)
     cfg.adjustment_curriculum_min_eligible_count = 1_000_000
@@ -321,6 +351,30 @@ def main() -> None:
             & (max_drift <= 0.005)
             & (max_rotation <= 2.0)
         )
+        # A fixture-supported settle is not enough. Close around the settled
+        # relationship, release the fixture, and apply the same wrench challenge
+        # used by the RL endpoint gate.
+        settled_pos, settled_quat = inner._palm_tool_relative()
+        inner._adjustment_target_relative_pos.copy_(settled_pos)
+        inner._adjustment_target_relative_quat.copy_(settled_quat)
+        inner._adjustment_initial_tool_pos.copy_(inner.object.data.root_pos_w)
+        inner._adjustment_initial_tool_quat.copy_(inner.object.data.root_quat_w)
+        inner.episode_length_buf[:] = int(cfg.allen_adjustment_steps)
+        release_validation_steps = (
+            int(cfg.allen_closure_steps) + int(cfg.allen_release_steps) - 1
+        )
+        for step in range(release_validation_steps):
+            env.step(action)
+            if (step + 1) % 50 == 0:
+                print(
+                    f"[adapt] release validation step {step + 1}/"
+                    f"{release_validation_steps}", flush=True
+                )
+        release_passing = (
+            inner._allen_combined_valid
+            & (inner._allen_hold_count >= int(cfg.allen_success_hold_steps))
+        )
+        passing &= release_passing
         diagnostic_rows = []
         for index in range(inner.num_envs):
             diagnostic_rows.append((
@@ -341,18 +395,83 @@ def main() -> None:
                 f"tighten={levels[index]:.2f} support={support} "
                 f"palm={palm_ratio:.3f} socket={socket_ratio:.3f} "
                 f"drift={-neg_drift:.4f}m rotation={-neg_rotation:.2f}deg "
+                f"release_hold={int(inner._allen_hold_count[index].item())} "
                 f"pass={bool(passing[index])}",
                 flush=True,
             )
-        selected: list[dict] = []
-        used_sources: set[tuple[int, int]] = set()
-        for index in range(inner.num_envs):
-            source_id = (
+        # Keep the strongest tightening level for each distinct palm transform,
+        # then select connected start/target pairs under the runtime bounds.
+        best_by_transform: dict[tuple, tuple[tuple, int]] = {}
+        for row in diagnostic_rows:
+            index = row[-1]
+            if not bool(passing[index]):
+                continue
+            transform_id = (
                 metadata[index]["source_asset_index"],
                 metadata[index]["source_entry_index"],
+                *tuple(round(float(v), 6) for v in metadata[index]["palm_shift_tool_m"]),
+                round(float(metadata[index]["palm_rotation_about_screw_deg"]), 3),
             )
-            if source_id in used_sources or not bool(passing[index]):
-                continue
+            if transform_id not in best_by_transform:
+                best_by_transform[transform_id] = (row[:-1], index)
+        ranked = [value[1] for value in sorted(
+            best_by_transform.values(), key=lambda value: value[0], reverse=True
+        )]
+        if len(ranked) < int(ARGS.desired_entries):
+            raise RuntimeError(
+                f"only {len(ranked)} distinct Allen-key transforms passed physical validation"
+            )
+
+        centers = []
+        quaternions = []
+        for index in ranked:
+            entry = expanded_entries[index]
+            palm_to_tool = pose_matrix(
+                np.asarray(entry["palm_to_tool_pos"]),
+                np.asarray(entry["palm_to_tool_quat_wxyz"]),
+            )
+            tool_to_palm = np.linalg.inv(palm_to_tool)
+            centers.append(tool_to_palm[:3, 3])
+            quaternions.append(Rotation.from_matrix(palm_to_tool[:3, :3]))
+        adjacency = np.zeros((len(ranked), len(ranked)), dtype=bool)
+        for i in range(len(ranked)):
+            for j in range(i + 1, len(ranked)):
+                translation = float(np.linalg.norm(centers[i] - centers[j]))
+                rotation = float((quaternions[i].inv() * quaternions[j]).magnitude())
+                rotation = math.degrees(rotation)
+                valid = (
+                    translation <= 0.090 and rotation <= 100.0
+                    and (translation >= 0.012 or rotation >= 18.0)
+                )
+                adjacency[i, j] = adjacency[j, i] = valid
+        if not bool(adjacency.any()):
+            raise RuntimeError(
+                "physically stable grasps contain no non-trivial manipulation pair"
+            )
+        chosen: list[int] = []
+        for i, j in np.argwhere(np.triu(adjacency, 1)):
+            for candidate in (int(i), int(j)):
+                if candidate not in chosen:
+                    chosen.append(candidate)
+            if len(chosen) >= int(ARGS.desired_entries):
+                break
+        for candidate in range(len(ranked)):
+            if len(chosen) >= int(ARGS.desired_entries):
+                break
+            if candidate not in chosen and bool(adjacency[candidate, chosen].any()):
+                chosen.append(candidate)
+        chosen = chosen[:int(ARGS.desired_entries)]
+        chosen_adjacency = adjacency[np.ix_(chosen, chosen)]
+        if len(chosen) < int(ARGS.desired_entries) or bool(
+            (chosen_adjacency.sum(axis=1) == 0).any()
+        ):
+            raise RuntimeError(
+                f"could not select {ARGS.desired_entries} mutually useful manipulation grasps"
+            )
+
+        selected: list[dict] = []
+        for ranked_index in chosen:
+            index = ranked[ranked_index]
             entry = copy.deepcopy(expanded_entries[index])
             verification = entry["verification"]
             verification.update({
@@ -368,14 +487,6 @@ def main() -> None:
                 **metadata[index],
             })
             selected.append(entry)
-            used_sources.add(source_id)
-            if len(selected) >= int(ARGS.desired_entries):
-                break
-        if len(selected) < int(ARGS.desired_entries):
-            raise RuntimeError(
-                f"only {len(selected)}/{ARGS.desired_entries} Allen-key grasps passed "
-                "tightening and physical hold validation"
-            )
         payload = bank_payload(source, selected)
         validate_grasp_bank(payload, minimum_entries=int(ARGS.desired_entries))
         ARGS.output.write_text(json.dumps(payload, indent=2))

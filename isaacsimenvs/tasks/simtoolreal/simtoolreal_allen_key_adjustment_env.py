@@ -6,13 +6,12 @@ import math
 
 import torch
 from isaaclab.sensors import ContactSensor, ContactSensorCfg
-from isaaclab.utils.math import quat_apply, quat_from_angle_axis, quat_mul
+from isaaclab.utils.math import quat_apply, quat_from_angle_axis, quat_inv, quat_mul
 
 from .simtoolreal_inhand_adjustment_env import SimToolRealInHandAdjustmentEnv
 from .simtoolreal_tacmap_env_cfg import SimToolRealAllenKeyAdjustmentEnvCfg
 from .utils.adjustment_utils import (
     palm_keypoint_error,
-    rotate_palm_about_tool_axis_in_place,
     screw_axis_orbit_errors,
 )
 from .utils.logging_utils import log_step_metrics
@@ -67,6 +66,7 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         self._allen_fixture_tool_quat = torch.zeros(n, 4, device=device)
         self._allen_fixture_tool_quat[:, 0] = 1.0
         self._allen_reset_yaw_rad = torch.zeros(n, device=device)
+        self._allen_target_bank_index = torch.zeros(n, dtype=torch.long, device=device)
         self._allen_curriculum_eligible = 0
         self._allen_curriculum_successes = 0
         self._allen_curriculum_success_mean = 0.0
@@ -98,14 +98,20 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
             raise ValueError("Allen-key reset yaw curriculum length is inconsistent")
         if any(not math.isfinite(value) or not 0.0 <= value <= 45.0 for value in yaw_ranges):
             raise ValueError("Allen-key reset yaw ranges must be finite and in [0, 45]")
-        target_angles = tuple(float(value) for value in cfg.allen_target_angles_deg)
-        if not target_angles or any(
-            not math.isfinite(value) or not 0.0 < value <= 25.0
-            for value in target_angles
+        translation_range = tuple(
+            float(value) for value in cfg.allen_target_pair_translation_range_m
+        )
+        rotation_range = tuple(
+            float(value) for value in cfg.allen_target_pair_rotation_range_deg
+        )
+        for name, values in (
+            ("translation", translation_range), ("rotation", rotation_range)
         ):
-            raise ValueError(
-                "Allen-key target angles must use the physically validated (0, 25] set"
-            )
+            if (
+                len(values) != 2 or not all(math.isfinite(value) for value in values)
+                or values[0] <= 0.0 or values[1] <= values[0]
+            ):
+                raise ValueError(f"Allen-key target pair {name} range is invalid")
         sigma = tuple(float(value) for value in cfg.allen_pose_sigma_stages_m)
         if len(sigma) != len(cfg.adjustment_target_rotation_deg):
             raise ValueError("Allen-key pose sigma curriculum length is inconsistent")
@@ -137,6 +143,42 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
 
+    def _materialize_grasp_bank(self) -> None:
+        """Materialize bank tensors and require a useful target for every start."""
+        super()._materialize_grasp_bank()
+        relative_pos = self._inhand_bank_relative_pos
+        relative_quat = self._inhand_bank_relative_quat
+        tool_to_palm_quat = quat_inv(relative_quat)
+        tool_to_palm_pos = quat_apply(tool_to_palm_quat, -relative_pos)
+        translation = torch.cdist(tool_to_palm_pos, tool_to_palm_pos)
+        alignment = torch.abs(relative_quat @ relative_quat.T).clamp(0.0, 1.0)
+        rotation_deg = torch.rad2deg(2.0 * torch.acos(alignment))
+        translation_low, translation_high = (
+            float(value) for value in self.cfg.allen_target_pair_translation_range_m
+        )
+        rotation_low, rotation_high = (
+            float(value) for value in self.cfg.allen_target_pair_rotation_range_deg
+        )
+        distinct = ~torch.eye(
+            self._inhand_bank_size, dtype=torch.bool, device=self.device
+        )
+        meaningful = (translation >= translation_low) | (rotation_deg >= rotation_low)
+        bounded = (translation <= translation_high) & (rotation_deg <= rotation_high)
+        self._allen_target_pair_valid = distinct & meaningful & bounded
+        candidates_per_start = self._allen_target_pair_valid.sum(dim=-1)
+        if bool(self.cfg.allen_require_valid_target_pairs) and bool(
+            (candidates_per_start == 0).any()
+        ):
+            invalid = torch.nonzero(
+                candidates_per_start == 0, as_tuple=False
+            ).squeeze(-1).tolist()
+            raise RuntimeError(
+                "Allen-key grasp bank has no valid manipulation target for start entries "
+                f"{invalid}; regenerate the bank instead of using a synthetic fallback"
+            )
+        self._allen_pair_translation_m = translation
+        self._allen_pair_rotation_deg = rotation_deg
+
     def _setup_scene(self) -> None:
         super()._setup_scene()
         if not hasattr(self, "workpiece"):
@@ -163,18 +205,21 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         self, env_ids: torch.Tensor, relative_pos: torch.Tensor,
         relative_quat: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        choices = torch.tensor(
-            self.cfg.allen_target_angles_deg, device=self.device, dtype=relative_pos.dtype
-        )
-        choice_ids = torch.randint(
-            0, choices.numel(), (relative_pos.shape[0],), device=self.device
-        )
-        angle = torch.deg2rad(choices[choice_ids])
-        target_pos, target_quat = rotate_palm_about_tool_axis_in_place(
-            relative_pos, relative_quat, angle,
-            torch.tensor(self.cfg.allen_screw_axis_tool, device=self.device),
-        )
-        return target_pos, target_quat, angle.abs(), torch.zeros_like(angle)
+        source_ids = self._inhand_reset_bank_index[env_ids]
+        weights = self._allen_target_pair_valid[source_ids].float()
+        missing = weights.sum(dim=-1) == 0
+        if bool(self.cfg.allen_require_valid_target_pairs) and bool(missing.any()):
+            raise RuntimeError("Allen-key reset selected a start without a valid target")
+        if bool(missing.any()):
+            weights[missing, source_ids[missing]] = 1.0
+        target_ids = torch.multinomial(weights, 1).squeeze(-1)
+        if hasattr(self, "_allen_target_bank_index"):
+            self._allen_target_bank_index[env_ids] = target_ids
+        target_pos = self._inhand_bank_relative_pos[target_ids]
+        target_quat = self._inhand_bank_relative_quat[target_ids]
+        rotation = torch.deg2rad(self._allen_pair_rotation_deg[source_ids, target_ids])
+        translation = self._allen_pair_translation_m[source_ids, target_ids]
+        return target_pos, target_quat, rotation, translation
 
     def _sample_nearby_contact_target(
         self, env_ids: torch.Tensor, bank_ids: torch.Tensor,
@@ -435,6 +480,9 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
             self._allen_fingertip_contact_count.float()
             / float(self.cfg.allen_fingertip_contact_quality_saturation_count)
         ).clamp(0.0, 1.0)
+        geometric_support_quality = (
+            self._stable_support_count.float() / 3.0
+        ).clamp(0.0, 1.0)
         flexion_ids = self._allen_flexion_joint_ids
         limits = self.robot.data.joint_pos_limits[:, flexion_ids]
         closure = (
@@ -443,12 +491,18 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         ).mean(-1).clamp(0.0, 1.0)
         self._allen_flexion_closure.copy_(closure)
         self._allen_contact_quality.copy_(
-            0.40 * closure + 0.25 * fingertip_force_quality
-            + 0.35 * self._allen_palm_contact.float()
+            0.35 * closure + 0.20 * fingertip_force_quality
+            + 0.25 * self._allen_palm_contact.float()
+            + 0.20 * geometric_support_quality
+        )
+        multi_contact_support = (
+            self._allen_palm_contact
+            | (self._allen_fingertip_contact_count >= 2)
+            | (self._stable_support_count >= 3)
         )
         self._allen_final_grasp_valid.copy_(
             (closure >= float(self.cfg.allen_min_flexion_closure_fraction))
-            & self._allen_palm_contact
+            & multi_contact_support
         )
         self._allen_socket_valid.copy_(
             (lateral <= float(self.cfg.allen_socket_lateral_tolerance_m))
@@ -636,8 +690,18 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
             "curriculum/allen_stage": self._adjustment_curriculum_stage,
             "curriculum/allen_success_mean": self._allen_curriculum_success_mean,
             "curriculum/allen_palm_pose_sigma_m": pose_sigma,
-            "curriculum/allen_target_angle_min_deg": min(self.cfg.allen_target_angles_deg),
-            "curriculum/allen_target_angle_max_deg": max(self.cfg.allen_target_angles_deg),
+            "curriculum/allen_target_translation_min_m": (
+                self.cfg.allen_target_pair_translation_range_m[0]
+            ),
+            "curriculum/allen_target_translation_max_m": (
+                self.cfg.allen_target_pair_translation_range_m[1]
+            ),
+            "curriculum/allen_target_rotation_min_deg": (
+                self.cfg.allen_target_pair_rotation_range_deg[0]
+            ),
+            "curriculum/allen_target_rotation_max_deg": (
+                self.cfg.allen_target_pair_rotation_range_deg[1]
+            ),
             "curriculum/allen_reset_yaw_range_deg": (
                 self.cfg.allen_reset_yaw_range_stages_deg[
                     self._adjustment_curriculum_stage

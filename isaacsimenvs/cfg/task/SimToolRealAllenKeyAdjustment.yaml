@@ -7,21 +7,22 @@ enable_tool_table_contact_sensor: false
 enable_palm_tool_contact_sensor: true
 
 assets:
+  table_urdf: assets/urdf/table_allen_compact.urdf
   object_urdf: assets/urdf/objects/allen_key_canonical.urdf
   object_scale: [3.5, 0.5, 1.5]
   workpiece_urdf: assets/urdf/workpieces/allen_key_hex_socket.urdf
   handle_head_types: [screwdriver]
   object_pool_limit: 0
 
-grasp_bank_path: assets/grasp_banks/allen_key_canonical_v1.json
-grasp_bank_min_entries: 1
+grasp_bank_path: assets/grasp_banks/allen_key_manipulation_v2.json
+grasp_bank_min_entries: 6
 grasp_bank_joint_limit_tolerance_rad: 0.0005
 adjustment_terminate_on_success: false
 adjustment_curriculum_success_threshold: 0.80
 adjustment_curriculum_min_eligible_count: 256
 adjustment_finger_perturb_fractions: [0.0, 0.0, 0.0, 0.01, 0.02]
 adjustment_target_translation_mode: none
-# Runtime sampling uses the configured local -Z screw axis and pivot.
+# Runtime samples distinct, physically validated start/target bank entries.
 adjustment_target_rotation_axis: tool_x
 adjustment_target_axial_translation_m: [0.0, 0.0, 0.0, 0.0, 0.0]
 adjustment_target_perpendicular_translation_m: [0.0, 0.0, 0.0, 0.0, 0.0]

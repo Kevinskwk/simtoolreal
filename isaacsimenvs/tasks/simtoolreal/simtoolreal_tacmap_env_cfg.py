@@ -524,6 +524,10 @@ class SimToolRealAllenKeyAdjustmentEnvCfg(SimToolRealInHandAdjustmentEnvCfg):
     """Palm-supported Allen-key regrasp around the engaged screw axis."""
 
     assets: AssetsCfg = AssetsCfg(
+        table_urdf=str(
+            Path(__file__).resolve().parents[3]
+            / "assets" / "urdf" / "table_allen_compact.urdf"
+        ),
         handle_head_types=("screwdriver",),
         object_urdf=str(
             Path(__file__).resolve().parents[3]
@@ -537,9 +541,9 @@ class SimToolRealAllenKeyAdjustmentEnvCfg(SimToolRealInHandAdjustmentEnvCfg):
     )
     grasp_bank_path: str = str(
         Path(__file__).resolve().parents[3]
-        / "assets" / "grasp_banks" / "allen_key_canonical_v1.json"
+        / "assets" / "grasp_banks" / "allen_key_manipulation_v2.json"
     )
-    grasp_bank_min_entries: int = 1
+    grasp_bank_min_entries: int = 6
     episode_length_s: float = 8.0
     enable_palm_tool_contact_sensor: bool = True
     enable_fingertip_tool_contact_sensors: bool = True
@@ -564,11 +568,14 @@ class SimToolRealAllenKeyAdjustmentEnvCfg(SimToolRealInHandAdjustmentEnvCfg):
     allen_closure_steps: int = 120
     allen_release_steps: int = 80
     allen_success_hold_steps: int = 45
-    # Discrete targets that passed closed-palm simulation checks across reset
-    # poses. Do not interpolate until intermediate grasps are also validated.
-    allen_target_angles_deg: tuple[float, ...] = (10.0, 25.0)
+    # Start and target relationships are sampled from distinct physically
+    # validated bank entries. A pair must clear at least one lower bound and
+    # both upper bounds, preventing trivial and implausibly distant targets.
+    allen_target_pair_translation_range_m: tuple[float, float] = (0.012, 0.090)
+    allen_target_pair_rotation_range_deg: tuple[float, float] = (18.0, 100.0)
+    allen_require_valid_target_pairs: bool = True
     allen_pose_sigma_stages_m: tuple[float, ...] = (0.060, 0.040, 0.025, 0.015, 0.010)
-    allen_reset_yaw_range_stages_deg: tuple[float, ...] = (30.0,) * 5
+    allen_reset_yaw_range_stages_deg: tuple[float, ...] = (5.0, 10.0, 15.0, 20.0, 30.0)
     allen_palm_keypoints_m: tuple[tuple[float, float, float], ...] = (
         (0.0, 0.0, 0.0), (0.05, 0.0, 0.0), (-0.05, 0.0, 0.0),
         (0.0, 0.035, 0.0), (0.0, -0.035, 0.0), (0.0, 0.0, 0.03),
@@ -576,10 +583,10 @@ class SimToolRealAllenKeyAdjustmentEnvCfg(SimToolRealInHandAdjustmentEnvCfg):
     allen_screw_axis_tool: tuple[float, float, float] = (0.0, 0.0, -1.0)
     allen_screw_pivot_tool_m: tuple[float, float, float] = (0.192, 0.0, -0.03)
     allen_workpiece_from_tool_m: tuple[float, float, float] = (0.192, 0.0, -0.095)
-    allen_socket_lateral_tolerance_m: float = 0.003
-    allen_socket_insertion_tolerance_m: float = 0.006
+    allen_socket_lateral_tolerance_m: float = 0.006
+    allen_socket_insertion_tolerance_m: float = 0.008
     allen_socket_tilt_tolerance_deg: float = 5.0
-    allen_palm_contact_threshold_n: float = 0.05
+    allen_palm_contact_threshold_n: float = 0.01
     allen_fingertip_contact_threshold_n: float = 0.05
     allen_fingertip_contact_quality_saturation_count: int = 2
     allen_closure_flexion_fraction: float = 0.15

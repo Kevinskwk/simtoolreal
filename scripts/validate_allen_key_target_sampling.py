@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate Allen-key targets retain the grasp center and are arm-reachable."""
+"""Validate Allen-key bank entries and non-trivial start/target pairs offline."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import torch
 from scipy.spatial.transform import Rotation
 
 
@@ -32,11 +31,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--grasp-bank", type=Path,
-        default=ROOT / "assets/grasp_banks/allen_key_canonical_v1.json",
+        default=ROOT / "assets/grasp_banks/allen_key_manipulation_v2.json",
     )
-    parser.add_argument("--minimum-angle-deg", type=float, default=10.0)
-    parser.add_argument("--maximum-angle-deg", type=float, default=25.0)
-    parser.add_argument("--angle-step-deg", type=float, default=15.0)
+    parser.add_argument("--minimum-translation-m", type=float, default=0.012)
+    parser.add_argument("--maximum-translation-m", type=float, default=0.090)
+    parser.add_argument("--minimum-rotation-deg", type=float, default=18.0)
+    parser.add_argument("--maximum-rotation-deg", type=float, default=100.0)
     parser.add_argument("--maximum-reset-yaw-deg", type=float, default=30.0)
     parser.add_argument("--position-tolerance-m", type=float, default=0.003)
     parser.add_argument("--rotation-tolerance-deg", type=float, default=3.0)
@@ -57,24 +57,15 @@ def main() -> None:
     args = parse_args()
     if not args.grasp_bank.is_file():
         raise FileNotFoundError(args.grasp_bank)
-    if not 0.0 < args.minimum_angle_deg <= args.maximum_angle_deg:
-        raise ValueError("target angle interval is invalid")
-    if args.angle_step_deg <= 0.0 or args.maximum_reset_yaw_deg < 0.0:
-        raise ValueError("angle step and reset yaw must be non-negative")
+    payload = json.loads(args.grasp_bank.read_text())
+    entries = payload.get("entries", [])
+    if payload.get("tool_type") != "allen_key" or len(entries) < 2:
+        raise ValueError("target validation requires at least two Allen-key grasps")
 
-    adjustment = load_module(
-        "allen_target_adjustment_utils",
-        ROOT / "isaacsimenvs/tasks/simtoolreal/utils/adjustment_utils.py",
-    )
     evaluator = load_module(
         "allen_target_grasp_evaluator",
         ROOT / "isaacsimenvs/tasks/simtoolreal/utils/grasp_evaluator.py",
     )
-    payload = json.loads(args.grasp_bank.read_text())
-    entries = payload.get("entries", [])
-    if payload.get("tool_type") != "allen_key" or not entries:
-        raise ValueError("target validation requires a non-empty Allen-key grasp bank")
-
     robot_urdf = (
         ROOT / "assets/urdf/kuka_sharpa_description"
         / "iiwa14_left_sharpa_adjusted_restricted.urdf"
@@ -87,88 +78,75 @@ def main() -> None:
     )
     robot_base = np.eye(4)
     robot_base[1, 3] = 0.8
-    angles = np.arange(
-        args.minimum_angle_deg,
-        args.maximum_angle_deg + 0.5 * args.angle_step_deg,
-        args.angle_step_deg,
-    )
-    failures: list[str] = []
+    reset_yaw = math.radians(float(args.maximum_reset_yaw_deg))
+    centers: list[np.ndarray] = []
+    rotations: list[Rotation] = []
     worst_position = 0.0
     worst_rotation = 0.0
     minimum_joint_margin = math.inf
-    reset_yaw = math.radians(float(args.maximum_reset_yaw_deg))
 
-    for entry_index, entry in enumerate(entries):
-        palm_to_tool_pos = torch.tensor(
-            [entry["palm_to_tool_pos"]], dtype=torch.float64
+    for index, entry in enumerate(entries):
+        palm_to_tool = pose_from_wxyz(
+            entry["palm_to_tool_pos"], entry["palm_to_tool_quat_wxyz"]
         )
-        palm_to_tool_quat = torch.tensor(
-            [entry["palm_to_tool_quat_wxyz"]], dtype=torch.float64
-        )
-        tool_pose = pose_from_wxyz(
-            entry["object_pos_local"], entry["object_quat_wxyz"]
-        )
+        centers.append(np.linalg.inv(palm_to_tool)[:3, 3])
+        rotations.append(Rotation.from_matrix(palm_to_tool[:3, :3]))
+        tool_pose = pose_from_wxyz(entry["object_pos_local"], entry["object_quat_wxyz"])
+        target_palm = tool_pose @ np.linalg.inv(palm_to_tool)
         original = np.asarray(entry["joint_pos_canonical"], dtype=np.float64)
-        for angle_deg in angles:
-            target_pos, target_quat = adjustment.rotate_palm_about_tool_axis_in_place(
-                palm_to_tool_pos,
-                palm_to_tool_quat,
-                torch.tensor([math.radians(float(angle_deg))], dtype=torch.float64),
-                torch.tensor((0.0, 0.0, -1.0), dtype=torch.float64),
+        arm, position_error, rotation_error, _, _ = evaluator.solve_arm_ik(
+            kinematics, target_palm, original[:7], original[7:], robot_base, thresholds
+        )
+        rotated_arm = arm.copy()
+        rotated_arm[0] += reset_yaw
+        joint_margin = np.minimum(
+            rotated_arm - kinematics.arm_lower,
+            kinematics.arm_upper - rotated_arm,
+        ).min()
+        worst_position = max(worst_position, float(position_error))
+        worst_rotation = max(worst_rotation, float(rotation_error))
+        minimum_joint_margin = min(minimum_joint_margin, float(joint_margin))
+        if (
+            position_error > thresholds.ik_position_m
+            or rotation_error > thresholds.ik_orientation_deg
+            or joint_margin < 0.0
+        ):
+            raise RuntimeError(
+                f"bank entry {index} is not reachable across reset yaw: "
+                f"position={position_error:.6f}m rotation={rotation_error:.3f}deg "
+                f"joint_margin={joint_margin:.6f}rad"
             )
-            current_center = adjustment._quat_apply(
-                adjustment._quat_inv(palm_to_tool_quat), -palm_to_tool_pos
-            )
-            target_center = adjustment._quat_apply(
-                adjustment._quat_inv(target_quat), -target_pos
-            )
-            center_drift = float(torch.linalg.vector_norm(
-                target_center - current_center, dim=-1
-            )[0].item())
-            if center_drift > 1.0e-8:
-                failures.append(
-                    f"entry={entry_index} angle={angle_deg:.2f}deg "
-                    f"grasp_center_drift={center_drift:.9f}m"
-                )
-                continue
-            palm_to_tool = pose_from_wxyz(
-                target_pos[0].numpy(), target_quat[0].numpy()
-            )
-            target_palm = tool_pose @ np.linalg.inv(palm_to_tool)
-            arm, position_error, rotation_error, _, _ = evaluator.solve_arm_ik(
-                kinematics, target_palm, original[:7], original[7:],
-                robot_base, thresholds,
-            )
-            rotated_arm = arm.copy()
-            rotated_arm[0] += reset_yaw
-            joint_margin = np.minimum(
-                rotated_arm - kinematics.arm_lower,
-                kinematics.arm_upper - rotated_arm,
-            ).min()
-            worst_position = max(worst_position, position_error)
-            worst_rotation = max(worst_rotation, rotation_error)
-            minimum_joint_margin = min(minimum_joint_margin, float(joint_margin))
-            if (
-                position_error > thresholds.ik_position_m
-                or rotation_error > thresholds.ik_orientation_deg
-                or joint_margin < 0.0
-            ):
-                failures.append(
-                    f"entry={entry_index} angle={angle_deg:.2f}deg "
-                    f"position={position_error:.6f}m rotation={rotation_error:.3f}deg "
-                    f"joint_margin={joint_margin:.6f}rad"
-                )
 
-    if failures:
-        preview = "\n".join(failures[:12])
+    adjacency = np.zeros((len(entries), len(entries)), dtype=bool)
+    translations: list[float] = []
+    angles: list[float] = []
+    for i in range(len(entries)):
+        for j in range(i + 1, len(entries)):
+            translation = float(np.linalg.norm(centers[i] - centers[j]))
+            angle = math.degrees(float((rotations[i].inv() * rotations[j]).magnitude()))
+            valid = (
+                translation <= args.maximum_translation_m
+                and angle <= args.maximum_rotation_deg
+                and (
+                    translation >= args.minimum_translation_m
+                    or angle >= args.minimum_rotation_deg
+                )
+            )
+            if valid:
+                adjacency[i, j] = adjacency[j, i] = True
+                translations.append(translation)
+                angles.append(angle)
+    isolated = np.flatnonzero(adjacency.sum(axis=1) == 0)
+    if isolated.size:
         raise RuntimeError(
-            f"{len(failures)} Allen-key palm targets are invalid:\n{preview}"
+            f"Allen-key bank has targetless start entries: {isolated.tolist()}"
         )
     print(
-        f"[pass] {len(entries) * len(angles)} Allen-key palm targets are reachable; "
-        f"worst_position={worst_position:.6f}m "
-        f"worst_rotation={worst_rotation:.3f}deg "
-        f"minimum_joint_margin={minimum_joint_margin:.4f}rad"
+        f"[pass] {len(entries)} reachable grasps, {len(translations)} valid pairs; "
+        f"translation={min(translations):.4f}..{max(translations):.4f}m "
+        f"rotation={min(angles):.1f}..{max(angles):.1f}deg "
+        f"worst_ik={worst_position:.6f}m/{worst_rotation:.2f}deg "
+        f"joint_margin={minimum_joint_margin:.3f}rad"
     )
 
 

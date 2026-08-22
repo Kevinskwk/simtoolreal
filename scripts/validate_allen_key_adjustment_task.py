@@ -165,7 +165,10 @@ def main() -> None:
         # IK alone is insufficient. Place every sampled wrist target with its
         # validated bank finger posture and test the physical grasps.
         env_ids = torch.arange(inner.num_envs, device=inner.device)
-        target_joints = inner.robot.data.joint_pos.clone()
+        target_ids = inner._allen_target_bank_index
+        target_joints = inner._inhand_bank_joint_pos[target_ids][
+            :, inner._perm_canon_to_lab
+        ].clone()
         target_arm_tensor = torch.as_tensor(
             target_arms, device=inner.device, dtype=target_joints.dtype
         )
@@ -173,10 +176,12 @@ def main() -> None:
         inner.robot.write_joint_state_to_sim(
             target_joints, torch.zeros_like(target_joints), env_ids=env_ids
         )
-        target_controls = inner._cur_targets.clone()
+        target_controls = inner._inhand_bank_joint_targets[target_ids][
+            :, inner._perm_canon_to_lab
+        ].clone()
         target_controls[:, inner._arm_joint_ids] = target_arm_tensor
         inner._replay_target_lab_order = target_controls
-        target_actions = inner._stable_previous_action.clone()
+        target_actions = inner._inhand_bank_last_action[target_ids]
         for step in range(int(ARGS.settle_steps)):
             observation, reward, terminated, truncated, _ = env.step(target_actions)
             require_finite(step, observation, reward)
@@ -203,7 +208,8 @@ def main() -> None:
                 f"rotation={target_rotation_error.tolist()} "
                 f"palm_contact={inner._allen_palm_contact.tolist()} "
                 f"flexion_closure={inner._allen_flexion_closure.tolist()} "
-                f"target_angle_deg={torch.rad2deg(inner._adjustment_target_axial_translation).tolist()}"
+                f"start_bank={inner._inhand_reset_bank_index.tolist()} "
+                f"target_bank={inner._allen_target_bank_index.tolist()}"
             )
 
         observation, _ = env.reset()
@@ -221,17 +227,19 @@ def main() -> None:
                 "socket engagement was not retained during settling: "
                 f"ratio={float(inner._allen_socket_valid.float().mean().item()):.3f}"
             )
-        if not bool(inner._allen_palm_contact.all()):
+        if not bool(inner._allen_final_grasp_valid.all()):
             current_pos, current_quat = inner._palm_tool_relative()
+            source_ids = inner._inhand_reset_bank_index
             relative_drift = torch.linalg.vector_norm(
-                current_pos - inner._inhand_bank_relative_pos[0], dim=-1
+                current_pos - inner._inhand_bank_relative_pos[source_ids], dim=-1
             )
             raise RuntimeError(
-                "whole-palm tool contact was not retained during settling: "
-                f"ratio={float(inner._allen_palm_contact.float().mean().item()):.3f} "
+                "multi-contact grasp support was not retained during settling: "
+                f"valid={inner._allen_final_grasp_valid.tolist()} "
                 f"contact={inner._allen_palm_contact.tolist()} "
                 f"force_n={inner._allen_palm_force_n.tolist()} "
                 f"yaw_deg={torch.rad2deg(inner._allen_reset_yaw_rad).tolist()} "
+                f"start_bank={source_ids.tolist()} "
                 f"support={inner._stable_support_count.tolist()} "
                 f"relative_drift_m={relative_drift.tolist()}"
             )
@@ -243,7 +251,7 @@ def main() -> None:
             inner.object.data.root_pos_w - fixture_position, dim=-1
         )
         if float(fixture_position_error.max().item()) > float(
-            cfg.allen_socket_lateral_tolerance_m
+            cfg.allen_tool_position_tolerance_m
         ):
             raise RuntimeError(
                 "fixture did not preserve tool position during adjustment: "
@@ -286,6 +294,7 @@ def main() -> None:
                 f"palm={inner._allen_palm_contact.tolist()} "
                 f"tool_position_error={inner._adjustment_tool_position_error.tolist()} "
                 f"relative_speed={inner._stable_relative_linear_speed.tolist()}"
+                f" start_bank={inner._inhand_reset_bank_index.tolist()}"
             )
         observation, reward, terminated, truncated, _ = env.step(actions)
         require_finite(480, observation, reward)
