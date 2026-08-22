@@ -20,6 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--settle-steps", type=int, default=60)
     parser.add_argument("--grasp-bank", type=Path, default=None)
     parser.add_argument("--reset-yaw-range-deg", type=float, default=None)
+    parser.add_argument("--target-angles-deg", type=float, nargs="+", default=None)
     parser.add_argument("--output", type=Path, default=None)
     AppLauncher.add_app_launcher_args(parser)
     parser.set_defaults(headless=True)
@@ -33,6 +34,7 @@ APP = AppLauncher(ARGS).app
 import gymnasium as gym  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
+from isaaclab.utils.math import combine_frame_transforms, quat_apply, quat_inv  # noqa: E402
 
 import isaacsimenvs  # noqa: E402,F401
 from isaacsimenvs.tasks.simtoolreal.pose_viewer import (  # noqa: E402
@@ -51,6 +53,9 @@ from isaacsimenvs.tasks.simtoolreal.utils.grasp_evaluator import (  # noqa: E402
     pose_matrix,
     solve_arm_ik,
 )
+from isaacsimenvs.tasks.simtoolreal.utils.adjustment_utils import (  # noqa: E402
+    rotate_palm_about_tool_axis_in_place,
+)
 from isaacsimenvs.tasks.simtoolreal.utils.obs_utils import compute_obs_dim  # noqa: E402
 
 
@@ -64,41 +69,54 @@ def require_finite(step: int, observation: dict, reward: torch.Tensor) -> None:
             raise RuntimeError(f"{name} contains NaN or Inf at validation step {step}")
 
 
-def verify_sampled_target_reachability(inner) -> tuple[float, float]:
+def solve_sampled_target_arms(inner) -> tuple[np.ndarray, float, float]:
     robot_urdf = ROOT / "assets/urdf/kuka_sharpa_description/iiwa14_left_sharpa_adjusted_restricted.urdf"
     kinematics = UrdfKinematics(robot_urdf)
     base = np.eye(4)
     base[1, 3] = 0.8
-    env_id = 0
-    target_pos_local = (
-        inner._adjustment_target_palm_pos_w[env_id] - inner.scene.env_origins[env_id]
-    )
-    target = pose_matrix(
-        target_pos_local.detach().cpu().numpy(),
-        inner._adjustment_target_palm_quat_w[env_id].detach().cpu().numpy(),
-    )
-    joints = inner.robot.data.joint_pos[env_id, inner._perm_lab_to_canon].detach().cpu().numpy()
-    _, position_error, rotation_error, _, _ = solve_arm_ik(
-        kinematics,
-        target,
-        joints[:7],
-        joints[7:],
-        base,
-        GraspEvaluatorThresholds(
-            ik_position_m=0.003, ik_orientation_deg=3.0, max_ik_iterations=300
-        ),
-    )
-    if position_error > 0.003 or rotation_error > 3.0:
-        raise RuntimeError(
-            "sampled target palm transform is not arm-reachable: "
-            f"position={position_error:.6f}m rotation={rotation_error:.3f}deg"
+    arms = []
+    position_errors = []
+    rotation_errors = []
+    for env_id in range(inner.num_envs):
+        target_pos_local = (
+            inner._adjustment_target_palm_pos_w[env_id]
+            - inner.scene.env_origins[env_id]
         )
-    return float(position_error), float(rotation_error)
+        target = pose_matrix(
+            target_pos_local.detach().cpu().numpy(),
+            inner._adjustment_target_palm_quat_w[env_id].detach().cpu().numpy(),
+        )
+        joints = inner.robot.data.joint_pos[
+            env_id, inner._perm_lab_to_canon
+        ].detach().cpu().numpy()
+        arm, position_error, rotation_error, _, _ = solve_arm_ik(
+            kinematics,
+            target,
+            joints[:7],
+            joints[7:],
+            base,
+            GraspEvaluatorThresholds(
+                ik_position_m=0.003, ik_orientation_deg=3.0, max_ik_iterations=300
+            ),
+        )
+        if position_error > 0.003 or rotation_error > 3.0:
+            raise RuntimeError(
+                f"sampled target {env_id} is not arm-reachable: "
+                f"position={position_error:.6f}m rotation={rotation_error:.3f}deg"
+            )
+        arms.append(arm)
+        position_errors.append(float(position_error))
+        rotation_errors.append(float(rotation_error))
+    return (
+        np.stack(arms), max(position_errors), max(rotation_errors)
+    )
 
 
 def main() -> None:
     if ARGS.num_envs <= 0 or ARGS.settle_steps <= 0:
         raise ValueError("num-envs and settle-steps must be positive")
+    if ARGS.target_angles_deg is not None and len(ARGS.target_angles_deg) != ARGS.num_envs:
+        raise ValueError("target-angles-deg must provide exactly one angle per environment")
     cfg = SimToolRealAllenKeyAdjustmentEnvCfg()
     cfg.scene.num_envs = int(ARGS.num_envs)
     if ARGS.grasp_bank is not None:
@@ -119,7 +137,76 @@ def main() -> None:
             raise RuntimeError(f"unexpected policy shape {tuple(observation['policy'].shape)}")
         if observation["critic"].shape != expected_critic:
             raise RuntimeError(f"unexpected critic shape {tuple(observation['critic'].shape)}")
-        ik_position, ik_rotation = verify_sampled_target_reachability(inner)
+        if ARGS.target_angles_deg is not None:
+            angles = torch.deg2rad(torch.tensor(
+                ARGS.target_angles_deg, device=inner.device, dtype=torch.float32
+            ))
+            target_pos, target_quat = rotate_palm_about_tool_axis_in_place(
+                inner._stable_relative_pos,
+                inner._stable_relative_quat,
+                angles,
+                torch.tensor(inner.cfg.allen_screw_axis_tool, device=inner.device),
+            )
+            inner._adjustment_target_relative_pos.copy_(target_pos)
+            inner._adjustment_target_relative_quat.copy_(target_quat)
+            tool_to_palm_quat = quat_inv(target_quat)
+            tool_to_palm_pos = quat_apply(tool_to_palm_quat, -target_pos)
+            target_palm_pos, target_palm_quat = combine_frame_transforms(
+                inner.object.data.root_pos_w,
+                inner.object.data.root_quat_w,
+                tool_to_palm_pos,
+                tool_to_palm_quat,
+            )
+            inner._adjustment_target_palm_pos_w.copy_(target_palm_pos)
+            inner._adjustment_target_palm_quat_w.copy_(target_palm_quat)
+            inner._adjustment_target_axial_translation.copy_(angles.abs())
+        target_arms, ik_position, ik_rotation = solve_sampled_target_arms(inner)
+
+        # IK alone is insufficient. Place every sampled wrist target with its
+        # validated bank finger posture and test the physical grasps.
+        env_ids = torch.arange(inner.num_envs, device=inner.device)
+        target_joints = inner.robot.data.joint_pos.clone()
+        target_arm_tensor = torch.as_tensor(
+            target_arms, device=inner.device, dtype=target_joints.dtype
+        )
+        target_joints[:, inner._arm_joint_ids] = target_arm_tensor
+        inner.robot.write_joint_state_to_sim(
+            target_joints, torch.zeros_like(target_joints), env_ids=env_ids
+        )
+        target_controls = inner._cur_targets.clone()
+        target_controls[:, inner._arm_joint_ids] = target_arm_tensor
+        inner._replay_target_lab_order = target_controls
+        target_actions = inner._stable_previous_action.clone()
+        for step in range(int(ARGS.settle_steps)):
+            observation, reward, terminated, truncated, _ = env.step(target_actions)
+            require_finite(step, observation, reward)
+            if bool(terminated.any()) or bool(truncated.any()):
+                raise RuntimeError("episode ended during sampled-target grasp validation")
+        target_position_error = inner._adjustment_target_palm_position_error
+        target_rotation_error = torch.rad2deg(
+            inner._adjustment_target_palm_rotation_error
+        )
+        feasible = (
+            (target_position_error <= 0.005)
+            & (target_rotation_error <= 5.0)
+            & inner._allen_palm_contact
+            & (
+                inner._allen_flexion_closure
+                >= float(cfg.allen_min_flexion_closure_fraction)
+            )
+        )
+        if not bool(feasible.all()):
+            raise RuntimeError(
+                "sampled target is arm-reachable but not a feasible closed-palm grasp: "
+                f"valid={feasible.tolist()} "
+                f"position={target_position_error.tolist()} "
+                f"rotation={target_rotation_error.tolist()} "
+                f"palm_contact={inner._allen_palm_contact.tolist()} "
+                f"flexion_closure={inner._allen_flexion_closure.tolist()} "
+                f"target_angle_deg={torch.rad2deg(inner._adjustment_target_axial_translation).tolist()}"
+            )
+
+        observation, _ = env.reset()
 
         inner._replay_target_lab_order = inner._cur_targets.clone()
         actions = inner._stable_previous_action.clone()

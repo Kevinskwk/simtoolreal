@@ -98,9 +98,14 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
             raise ValueError("Allen-key reset yaw curriculum length is inconsistent")
         if any(not math.isfinite(value) or not 0.0 <= value <= 45.0 for value in yaw_ranges):
             raise ValueError("Allen-key reset yaw ranges must be finite and in [0, 45]")
-        target_low, target_high = map(float, cfg.allen_target_orbit_range_deg)
-        if not 0.0 < target_low <= target_high <= 60.0:
-            raise ValueError("Allen-key target orbit range must be within prevalidated (0, 60] degrees")
+        target_angles = tuple(float(value) for value in cfg.allen_target_angles_deg)
+        if not target_angles or any(
+            not math.isfinite(value) or not 0.0 < value <= 25.0
+            for value in target_angles
+        ):
+            raise ValueError(
+                "Allen-key target angles must use the physically validated (0, 25] set"
+            )
         sigma = tuple(float(value) for value in cfg.allen_pose_sigma_stages_m)
         if len(sigma) != len(cfg.adjustment_target_rotation_deg):
             raise ValueError("Allen-key pose sigma curriculum length is inconsistent")
@@ -158,10 +163,13 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         self, env_ids: torch.Tensor, relative_pos: torch.Tensor,
         relative_quat: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        low, high = self.cfg.allen_target_orbit_range_deg
-        angle = torch.empty(relative_pos.shape[0], device=self.device).uniform_(
-            math.radians(float(low)), math.radians(float(high))
+        choices = torch.tensor(
+            self.cfg.allen_target_angles_deg, device=self.device, dtype=relative_pos.dtype
         )
+        choice_ids = torch.randint(
+            0, choices.numel(), (relative_pos.shape[0],), device=self.device
+        )
+        angle = torch.deg2rad(choices[choice_ids])
         target_pos, target_quat = rotate_palm_about_tool_axis_in_place(
             relative_pos, relative_quat, angle,
             torch.tensor(self.cfg.allen_screw_axis_tool, device=self.device),
@@ -628,8 +636,8 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
             "curriculum/allen_stage": self._adjustment_curriculum_stage,
             "curriculum/allen_success_mean": self._allen_curriculum_success_mean,
             "curriculum/allen_palm_pose_sigma_m": pose_sigma,
-            "curriculum/allen_target_orbit_min_deg": self.cfg.allen_target_orbit_range_deg[0],
-            "curriculum/allen_target_orbit_max_deg": self.cfg.allen_target_orbit_range_deg[1],
+            "curriculum/allen_target_angle_min_deg": min(self.cfg.allen_target_angles_deg),
+            "curriculum/allen_target_angle_max_deg": max(self.cfg.allen_target_angles_deg),
             "curriculum/allen_reset_yaw_range_deg": (
                 self.cfg.allen_reset_yaw_range_stages_deg[
                     self._adjustment_curriculum_stage
