@@ -1,0 +1,59 @@
+# End-to-end ungrasped Allen-key acquisition and resistance-loaded turning.
+use_tacmap: false
+enable_vbts: false
+include_tacmap_in_policy: false
+enable_fingertip_tool_contact_sensors: true
+enable_palm_tool_contact_sensor: true
+
+assets:
+  table_urdf: assets/urdf/table_allen_disabled.urdf
+  workpiece_urdf: assets/urdf/workpieces/allen_key_hex_socket.urdf
+  workpiece_collision_enabled: false
+  handle_head_types: [screwdriver]
+  allen_key_lengths_m: [0.20, 0.22, 0.24, 0.264, 0.28, 0.30, 0.32]
+  allen_key_handle_across_flats_m: 0.030
+  allen_key_short_leg_length_m: 0.060
+  allen_key_elbow_x_m: 0.192
+
+allen_turn_calibrated_torque_nm: 0.0
+allen_turn_require_calibrated_load: true
+allen_turn_fixture_damping_nm_per_radps: 0.05
+allen_turn_resistance_transition_speed_radps: 0.20
+allen_turn_initial_arm_clearance_m: 0.055
+episode_length_s: 30.0
+
+scene:
+  num_envs: 12288
+
+domain_randomization:
+  use_obs_delay: false
+  use_action_delay: false
+  use_object_state_delay_noise: false
+  joint_velocity_obs_noise_std: 0.0
+  force_scale: 0.0
+  torque_scale: 0.0
+  force_prob_range: [1.0e-12, 1.0e-12]
+  torque_prob_range: [1.0e-12, 1.0e-12]
+
+reset:
+  reset_dof_pos_random_interval_arm: 0.0
+  reset_dof_pos_random_interval_fingers: 0.0
+  reset_dof_vel_random_interval: 0.0
+
+termination:
+  episode_length: 1800
+  success_steps: 1000000
+  max_consecutive_successes: 0
+
+obs:
+  obs_list: [joint_pos, joint_vel, prev_action_targets, palm_pos, palm_rot,
+             object_rot, fingertip_pos_rel_palm, keypoints_rel_palm,
+             keypoints_rel_goal, object_scales, allen_turn_state,
+             allen_turn_geometry]
+  state_list: [joint_pos, joint_vel, prev_action_targets, palm_pos, palm_rot,
+               palm_vel, object_rot, object_vel, fingertip_pos_rel_palm,
+               keypoints_rel_palm, keypoints_rel_goal, object_scales,
+               closest_keypoint_max_dist, closest_fingertip_dist, progress,
+               reward, allen_turn_state, allen_turn_geometry,
+               allen_turn_grasp, allen_turn_effort]
+  clamp_abs_observations: 10.0

@@ -60,6 +60,7 @@ class AssetsCfg:
     table_urdf: str = "assets/urdf/table_narrow.urdf"
     # Optional task-owned kinematic workpiece, such as an Allen-key socket.
     workpiece_urdf: str = ""
+    workpiece_collision_enabled: bool = True
     # Per-env scale ranges applied to the table mesh at scene-build time.
     # Sampled independently per env: sx ~ U(table_scale_range_x), sy ~ U(table_scale_range_y).
     # Z is held at 1.0 so the table surface height stays at table_reset_z (which the
@@ -78,6 +79,13 @@ class AssetsCfg:
     # convention: metric bbox / object_base_size) and is required with it.
     object_urdf: str = ""
     object_scale: tuple[float, float, float] | None = None
+    # Optional task-specific procedural Allen-key pool. When non-empty it
+    # takes precedence over object_urdf and varies physical handle length
+    # across cloned environments while preserving a common screw pivot.
+    allen_key_lengths_m: tuple[float, ...] = ()
+    allen_key_handle_across_flats_m: float = 0.030
+    allen_key_short_leg_length_m: float = 0.060
+    allen_key_elbow_x_m: float = 0.192
     handle_head_types: tuple[str, ...] = (
         "hammer",
         "screwdriver",

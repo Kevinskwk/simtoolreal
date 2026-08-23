@@ -213,15 +213,16 @@ class EnvStatsAlgoObserver(AlgoObserver):
                 raise RuntimeError(f"episode metric {key!r} is not aligned with step counts")
             self.writer.add_scalar(f"reward/{key}", np.mean(array / counts), frame)
 
-        for phase in ("adjustment", "closure", "release"):
-            reward_values = self.episode_cumulative_avg.get(
-                f"phase/{phase}_reward_sum"
-            )
-            phase_counts = self.episode_cumulative_avg.get(
-                f"phase/{phase}_step_count"
-            )
-            if reward_values is None or phase_counts is None:
-                continue
+        phases = sorted({
+            key.removeprefix("phase/").removesuffix("_reward_sum")
+            for key in self.episode_cumulative_avg
+            if key.startswith("phase/") and key.endswith("_reward_sum")
+        })
+        for phase in phases:
+            reward_values = self.episode_cumulative_avg[f"phase/{phase}_reward_sum"]
+            phase_counts = self.episode_cumulative_avg.get(f"phase/{phase}_step_count")
+            if phase_counts is None:
+                raise RuntimeError(f"completed {phase} phase has no step count")
             rewards = np.asarray(reward_values, dtype=np.float64)
             counts = np.asarray(phase_counts, dtype=np.float64)
             if rewards.shape != counts.shape or np.any(counts <= 0.0):

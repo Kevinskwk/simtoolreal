@@ -702,6 +702,125 @@ class SimToolRealAllenKeyPalmDownAdjustmentEnvCfg(
         0.080, 0.060, 0.040, 0.025, 0.015
     )
 
+
+@configclass
+class SimToolRealAllenKeyTurningEnvCfg(SimToolRealTacMapEnvCfg):
+    """End-to-end acquisition and 360-degree Allen-key turning."""
+
+    assets: AssetsCfg = AssetsCfg(
+        table_urdf=str(
+            Path(__file__).resolve().parents[3]
+            / "assets" / "urdf" / "table_allen_disabled.urdf"
+        ),
+        workpiece_urdf=str(
+            Path(__file__).resolve().parents[3]
+            / "assets" / "urdf" / "workpieces" / "allen_key_hex_socket.urdf"
+        ),
+        # The ideal screw-axis fixture supplies the physical constraint and
+        # calibrated load. Keeping these synchronized meshes collidable would
+        # add timestep-dependent socket impulses to the resistance target.
+        workpiece_collision_enabled=False,
+        handle_head_types=("screwdriver",),
+        allen_key_lengths_m=(0.20, 0.22, 0.24, 0.264, 0.28, 0.30, 0.32),
+        allen_key_handle_across_flats_m=0.030,
+        allen_key_short_leg_length_m=0.060,
+        allen_key_elbow_x_m=0.192,
+    )
+    use_tacmap: bool = False
+    enable_vbts: bool = False
+    include_tacmap_in_policy: bool = False
+    enable_fingertip_tool_contact_sensors: bool = True
+    enable_palm_tool_contact_sensor: bool = True
+    episode_length_s: float = 30.0
+
+    allen_turn_screw_axis_tool: tuple[float, float, float] = (0.0, 0.0, -1.0)
+    allen_turn_screw_pivot_tool_m: tuple[float, float, float] = (0.192, 0.0, -0.030)
+    allen_turn_socket_root_from_pivot_m: tuple[float, float, float] = (0.0, 0.0, -0.065)
+    allen_turn_goal_increment_deg: float = 30.0
+    allen_turn_goal_count: int = 12
+    allen_turn_goal_tolerance_deg: float = 6.0
+    allen_turn_goal_hold_steps: int = 10
+    allen_turn_final_hold_steps: int = 30
+    allen_turn_acquisition_hold_steps: int = 15
+    allen_turn_acquisition_timeout_steps: int = 240
+    allen_turn_minimum_contact_fingers: int = 2
+    allen_turn_contact_force_threshold_n: float = 0.05
+    allen_turn_palm_contact_threshold_n: float = 0.05
+    allen_turn_max_relative_linear_speed_mps: float = 0.08
+    allen_turn_max_relative_angular_speed_radps: float = 2.0
+
+    # Pose curriculum is deliberately completed before non-zero load begins.
+    allen_turn_xy_half_range_stages_m: tuple[float, ...] = (
+        0.12, 0.16, 0.20, 0.20, 0.20, 0.20, 0.20
+    )
+    allen_turn_z_range_stages_m: tuple[tuple[float, float], ...] = (
+        (0.40, 0.52), (0.38, 0.58), (0.37, 0.67), (0.37, 0.67),
+        (0.37, 0.67), (0.37, 0.67), (0.37, 0.67),
+    )
+    allen_turn_resistance_fractions: tuple[float, ...] = (
+        0.0, 0.0, 0.0, 0.25, 0.50, 0.75, 1.00
+    )
+    # Training launchers must override this from a validated calibration JSON.
+    allen_turn_calibrated_torque_nm: float = 0.0
+    allen_turn_require_calibrated_load: bool = True
+    allen_turn_fixture_damping_nm_per_radps: float = 0.05
+    allen_turn_resistance_transition_speed_radps: float = 0.20
+    allen_turn_curriculum_min_episodes: int = 4096
+    allen_turn_curriculum_acquisition_threshold: float = 0.60
+    allen_turn_curriculum_conditional_success_threshold: float = 0.60
+
+    allen_turn_effort_soft_threshold_fraction: float = 0.70
+    allen_turn_effort_penalty_weight: float = 0.20
+    allen_turn_angular_progress_weight: float = 8.0
+    allen_turn_subgoal_progress_weight: float = 2.0
+    allen_turn_subgoal_bonus: float = 8.0
+    allen_turn_acquisition_bonus: float = 10.0
+    allen_turn_final_success_bonus: float = 100.0
+    allen_turn_final_hold_reward: float = 4.0
+    allen_turn_fingertip_approach_weight: float = 20.0
+    allen_turn_action_rate_penalty_weight: float = 0.01
+    allen_turn_constraint_penalty_weight: float = 2.0
+    allen_turn_constraint_position_tolerance_m: float = 0.005
+    allen_turn_constraint_tilt_tolerance_deg: float = 5.0
+    allen_turn_hidden_table_offset_m: float = 1.0
+    allen_turn_initial_hand_clearance_m: float = 0.015
+    allen_turn_initial_arm_clearance_m: float = 0.055
+    allen_turn_initial_sampling_max_attempts: int = 64
+
+    reset: ResetCfg = ResetCfg(
+        reset_dof_pos_random_interval_arm=0.0,
+        reset_dof_pos_random_interval_fingers=0.0,
+        reset_dof_vel_random_interval=0.0,
+    )
+    domain_randomization: DomainRandomizationCfg = DomainRandomizationCfg(
+        use_obs_delay=False,
+        use_action_delay=False,
+        use_object_state_delay_noise=False,
+        joint_velocity_obs_noise_std=0.0,
+        force_scale=0.0,
+        force_prob_range=(1.0e-12, 1.0e-12),
+        torque_scale=0.0,
+        torque_prob_range=(1.0e-12, 1.0e-12),
+    )
+    obs: ObsCfg = ObsCfg(
+        obs_list=(
+            "joint_pos", "joint_vel", "prev_action_targets", "palm_pos",
+            "palm_rot", "object_rot", "fingertip_pos_rel_palm",
+            "keypoints_rel_palm", "keypoints_rel_goal", "object_scales",
+            "allen_turn_state", "allen_turn_geometry",
+        ),
+        state_list=(
+            "joint_pos", "joint_vel", "prev_action_targets", "palm_pos",
+            "palm_rot", "palm_vel", "object_rot", "object_vel",
+            "fingertip_pos_rel_palm", "keypoints_rel_palm",
+            "keypoints_rel_goal", "object_scales",
+            "closest_keypoint_max_dist", "closest_fingertip_dist",
+            "progress", "reward", "allen_turn_state", "allen_turn_geometry",
+            "allen_turn_grasp", "allen_turn_effort",
+        ),
+        clamp_abs_observations=10.0,
+    )
+
 @configclass
 class SimToolRealFixedGraspNormalForceEnvCfg(SimToolRealTacMapScrapePoseEnvCfg):
     """One-action diagnostic for normal-force RL controllability."""

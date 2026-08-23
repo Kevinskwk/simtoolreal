@@ -1683,7 +1683,22 @@ def setup_scene(env) -> None:
     # 1. Resolve the object pool: a single named URDF (DexToolBench eval) or
     #    procedural URDFs generated in a per-launch temp dir.
     env._tmp_asset_dir = tempfile.mkdtemp(prefix="simtoolreal_assets_")
-    if assets_cfg.object_urdf:
+    if assets_cfg.allen_key_lengths_m:
+        from .allen_key_turning_utils import generate_allen_key_urdf_pool
+
+        mesh_path = (
+            Path(__file__).resolve().parents[4]
+            / "assets" / "urdf" / "objects" / "meshes" / "unit_hex_prism_x.obj"
+        )
+        urdf_paths, object_scales_normalized = generate_allen_key_urdf_pool(
+            Path(env._tmp_asset_dir) / "allen_key_pool",
+            tuple(float(value) for value in assets_cfg.allen_key_lengths_m),
+            handle_across_flats_m=float(assets_cfg.allen_key_handle_across_flats_m),
+            short_leg_length_m=float(assets_cfg.allen_key_short_leg_length_m),
+            elbow_x_m=float(assets_cfg.allen_key_elbow_x_m),
+            mesh_path=mesh_path,
+        )
+    elif assets_cfg.object_urdf:
         if assets_cfg.object_scale is None:
             raise ValueError(
                 "cfg.assets.object_scale must be set when object_urdf is given "
@@ -1839,6 +1854,7 @@ def setup_scene(env) -> None:
             props=dict(
                 kinematic_enabled=True, disable_gravity=True, articulation_enabled=False,
             ),
+            collision_enabled=bool(assets_cfg.workpiece_collision_enabled),
         )]
     _log_scene_step(setup_t0, "resolved baked USDs")
 

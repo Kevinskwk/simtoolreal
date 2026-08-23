@@ -83,6 +83,10 @@ OBS_FIELD_SIZES: dict[str, int] = {
     "allen_socket_state": 4,
     "allen_phase": 3,
     "allen_validity": 7,
+    "allen_turn_state": 8,
+    "allen_turn_geometry": 3,
+    "allen_turn_grasp": 8,
+    "allen_turn_effort": 4,
 }
 
 SCRAPE_CONTACT_FIELDS: set[str] = {
@@ -121,6 +125,11 @@ ALLEN_KEY_FIELDS: set[str] = {
     "allen_geometry", "allen_socket_state", "allen_phase", "allen_validity",
 }
 
+ALLEN_TURN_FIELDS: set[str] = {
+    "allen_turn_state", "allen_turn_geometry", "allen_turn_grasp",
+    "allen_turn_effort",
+}
+
 
 def _allen_key_obs(env) -> dict[str, torch.Tensor]:
     required = (
@@ -142,6 +151,25 @@ def _allen_key_obs(env) -> dict[str, torch.Tensor]:
         "allen_socket_state": env._allen_socket_state_obs,
         "allen_phase": env._allen_phase_obs,
         "allen_validity": env._allen_validity_obs,
+    }
+
+
+def _allen_turn_obs(env) -> dict[str, torch.Tensor]:
+    required = (
+        "_turn_state_obs", "_turn_geometry_obs", "_turn_grasp_obs",
+        "_turn_effort_obs",
+    )
+    missing = [name for name in required if not hasattr(env, name)]
+    if missing:
+        raise RuntimeError(
+            "Allen-key turning observations were requested before initialization: "
+            + ", ".join(missing)
+        )
+    return {
+        "allen_turn_state": env._turn_state_obs,
+        "allen_turn_geometry": env._turn_geometry_obs,
+        "allen_turn_grasp": env._turn_grasp_obs,
+        "allen_turn_effort": env._turn_effort_obs,
     }
 
 
@@ -547,6 +575,8 @@ def build_observations(env) -> dict[str, torch.Tensor]:
         obs_clean.update(_adjustment_obs(env))
     if requested_fields & ALLEN_KEY_FIELDS:
         obs_clean.update(_allen_key_obs(env))
+    if requested_fields & ALLEN_TURN_FIELDS:
+        obs_clean.update(_allen_turn_obs(env))
 
     obs_noisy = dict(obs_clean)
     obs_noisy["object_rot"] = noisy_obj_rot_xyzw

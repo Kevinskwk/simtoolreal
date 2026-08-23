@@ -23,6 +23,16 @@ def log_step_metrics(env) -> None:
             for name, value in env._termination_reasons.items()
         }
     )
+    extra_final = getattr(env, "_episode_final_terms", {})
+    duplicate_final = set(episode_final).intersection(extra_final)
+    if duplicate_final:
+        raise RuntimeError(
+            f"duplicate episode final metric names: {sorted(duplicate_final)}"
+        )
+    for name, value in extra_final.items():
+        if not isinstance(value, torch.Tensor):
+            raise RuntimeError(f"episode final metric {name!r} must be a tensor")
+        episode_final[name] = value.clone()
 
     episode_cumulative = dict(env._reward_terms)
     extra_cumulative = getattr(env, "_episode_cumulative_terms", {})
