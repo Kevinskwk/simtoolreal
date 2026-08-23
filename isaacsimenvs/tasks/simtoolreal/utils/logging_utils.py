@@ -24,7 +24,20 @@ def log_step_metrics(env) -> None:
         }
     )
 
-    env.extras["episode_cumulative"] = env._reward_terms
+    episode_cumulative = dict(env._reward_terms)
+    extra_cumulative = getattr(env, "_episode_cumulative_terms", {})
+    duplicate = set(episode_cumulative).intersection(extra_cumulative)
+    if duplicate:
+        raise RuntimeError(
+            "duplicate episode cumulative metric names: "
+            f"{sorted(duplicate)}"
+        )
+    episode_cumulative.update(extra_cumulative)
+    reward = env._reward_terms.get("total_reward")
+    if reward is None:
+        raise RuntimeError("reward terms must include total_reward")
+    episode_cumulative["episode_step_count"] = torch.ones_like(reward)
+    env.extras["episode_cumulative"] = episode_cumulative
     env.extras["episode_final"] = episode_final
     env.extras["successes"] = env._prev_episode_successes.float()
     env.extras["current_success_tolerance"] = float(env._current_success_tolerance)

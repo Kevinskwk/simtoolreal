@@ -436,7 +436,10 @@ class SimToolRealFixedGraspNormalForceEnv(SimToolRealTacMapScrapePoseEnv):
         self._episode_within_steps.add_(within.float())
         self._episode_force_steps.add_(1.0)
         self._reward_terms = terms
-        self.extras["episode_cumulative"] = terms
+        self.extras["episode_cumulative"] = {
+            **terms,
+            "episode_step_count": torch.ones_like(reward),
+        }
         self.extras["episode_final"] = {
             "within_1n_ratio": self._episode_within_steps
             / self._episode_force_steps.clamp_min(1.0),

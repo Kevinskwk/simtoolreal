@@ -109,7 +109,8 @@ class EnvStatsAlgoObserver(AlgoObserver):
         self.episode_cumulative = {}
         self.episode_cumulative_avg = {}
         self.episode_final_avg = {}
-        self.direct_info = {}
+        self.direct_info_sum = {}
+        self.direct_info_count = {}
         self.new_finished_episodes = False
 
     def after_init(self, algo):
@@ -129,12 +130,16 @@ class EnvStatsAlgoObserver(AlgoObserver):
         self._process_episode_cumulative(infos.get("episode_cumulative"), done_indices)
         self._process_episode_final(infos.get("episode_final"), done_indices)
 
-        self.direct_info = {
-            key: value
-            for key, value in _flatten_dict(infos).items()
-            if _is_scalar(value)
-        }
+        for key, value in _flatten_dict(infos).items():
+            if _is_scalar(value):
+                self._accumulate_direct_info(key, _as_float(value))
         self._process_vector_summaries(infos, tag="successes")
+
+    def _accumulate_direct_info(self, key: str, value: float) -> None:
+        if not np.isfinite(value):
+            raise RuntimeError(f"direct environment metric {key!r} is not finite")
+        self.direct_info_sum[key] = self.direct_info_sum.get(key, 0.0) + value
+        self.direct_info_count[key] = self.direct_info_count.get(key, 0) + 1
 
     def _process_episode_cumulative(self, terms, done_indices: list[int]) -> None:
         if not terms:
@@ -170,25 +175,62 @@ class EnvStatsAlgoObserver(AlgoObserver):
         if tag not in infos:
             return
         value = infos[tag]
-        self.direct_info[tag] = _mean_float(value)
+        self._accumulate_direct_info(tag, _mean_float(value))
         if isinstance(value, torch.Tensor):
-            self.direct_info[f"{tag}_median"] = float(torch.median(value.float()).detach().cpu().item())
-            self.direct_info[f"{tag}_max"] = float(value.max().detach().cpu().item())
+            median = float(torch.median(value.float()).detach().cpu().item())
+            maximum = float(value.max().detach().cpu().item())
         else:
             array = np.asarray(value)
-            self.direct_info[f"{tag}_median"] = float(np.median(array))
-            self.direct_info[f"{tag}_max"] = float(np.max(array))
+            median = float(np.median(array))
+            maximum = float(np.max(array))
+        self._accumulate_direct_info(f"{tag}_median", median)
+        self._accumulate_direct_info(f"{tag}_max", maximum)
 
         prefix = f"{tag}_per_block/"
         for key, value in _flatten_dict(infos).items():
             if key.startswith(prefix):
-                self.direct_info[key] = _mean_float(value)
+                self._accumulate_direct_info(key, _mean_float(value))
 
     def after_clear_stats(self):
         self.episode_cumulative_avg.clear()
         self.episode_final_avg.clear()
-        self.direct_info.clear()
+        self.direct_info_sum.clear()
+        self.direct_info_count.clear()
         self.new_finished_episodes = False
+
+    def _write_episode_reward_means(self, frame: int) -> None:
+        step_counts = self.episode_cumulative_avg.get("episode_step_count")
+        if not step_counts:
+            return
+        counts = np.asarray(step_counts, dtype=np.float64)
+        if np.any(counts <= 0.0) or not np.isfinite(counts).all():
+            raise RuntimeError("completed episodes contain an invalid step count")
+        for key, values in self.episode_cumulative_avg.items():
+            if key == "episode_step_count" or key.startswith("phase/"):
+                continue
+            array = np.asarray(values, dtype=np.float64)
+            if array.shape != counts.shape:
+                raise RuntimeError(f"episode metric {key!r} is not aligned with step counts")
+            self.writer.add_scalar(f"reward/{key}", np.mean(array / counts), frame)
+
+        for phase in ("adjustment", "closure", "release"):
+            reward_values = self.episode_cumulative_avg.get(
+                f"phase/{phase}_reward_sum"
+            )
+            phase_counts = self.episode_cumulative_avg.get(
+                f"phase/{phase}_step_count"
+            )
+            if reward_values is None or phase_counts is None:
+                continue
+            rewards = np.asarray(reward_values, dtype=np.float64)
+            counts = np.asarray(phase_counts, dtype=np.float64)
+            if rewards.shape != counts.shape or np.any(counts <= 0.0):
+                raise RuntimeError(f"completed {phase} phase metrics are invalid")
+            self.writer.add_scalar(
+                f"episode_phase/{phase}_reward_mean",
+                np.mean(rewards / counts),
+                frame,
+            )
 
     def after_print_stats(self, frame, epoch_num, total_time):
         if self.writer is None:
@@ -203,10 +245,15 @@ class EnvStatsAlgoObserver(AlgoObserver):
             for key, values in self.episode_final_avg.items():
                 if values:
                     self.writer.add_scalar(f"episode_final/{key}", np.mean(values), frame)
+            self._write_episode_reward_means(frame)
             self.new_finished_episodes = False
 
-        for key, value in self.direct_info.items():
-            self.writer.add_scalar(key, _as_float(value), frame)
+        for key, total in self.direct_info_sum.items():
+            count = self.direct_info_count[key]
+            output_key = f"rollout_step_mean/{key}" if key.startswith("reward/") else key
+            self.writer.add_scalar(output_key, total / count, frame)
+        self.direct_info_sum.clear()
+        self.direct_info_count.clear()
 
 
 class MultiObserver(AlgoObserver):
