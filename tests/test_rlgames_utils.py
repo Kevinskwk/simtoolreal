@@ -73,3 +73,88 @@ def test_observer_rejects_nonfinite_direct_metric() -> None:
             {"reward": {"total_reward": float("nan")}},
             torch.empty(0, dtype=torch.long),
         )
+
+
+def _record_finished_phase_metrics(
+    observer: EnvStatsAlgoObserver,
+    *,
+    reward_sums: list[float],
+    phase_step_counts: list[float],
+) -> None:
+    num_episodes = len(reward_sums)
+    observer.process_infos(
+        {
+            "episode_cumulative": {
+                "episode_step_count": torch.full((num_episodes,), 10.0),
+                "phase/final_hold_reward_sum": torch.tensor(reward_sums),
+                "phase/final_hold_step_count": torch.tensor(phase_step_counts),
+            }
+        },
+        torch.arange(num_episodes),
+    )
+
+
+def test_observer_averages_phase_reward_only_over_episodes_that_entered_phase() -> None:
+    observer = EnvStatsAlgoObserver()
+    writer = RecordingWriter()
+    observer.after_init(SimpleNamespace(writer=writer, games_to_track=16))
+    _record_finished_phase_metrics(
+        observer,
+        reward_sums=[6.0, 0.0],
+        phase_step_counts=[3.0, 0.0],
+    )
+
+    observer.after_print_stats(frame=64, epoch_num=4, total_time=0.0)
+
+    assert writer.values["episode_phase/final_hold_reward_mean"] == pytest.approx((2.0, 64))
+
+
+def test_observer_skips_phase_reward_when_no_episode_entered_phase() -> None:
+    observer = EnvStatsAlgoObserver()
+    writer = RecordingWriter()
+    observer.after_init(SimpleNamespace(writer=writer, games_to_track=16))
+    _record_finished_phase_metrics(
+        observer,
+        reward_sums=[0.0, 0.0],
+        phase_step_counts=[0.0, 0.0],
+    )
+
+    observer.after_print_stats(frame=64, epoch_num=4, total_time=0.0)
+
+    assert "episode_phase/final_hold_reward_mean" not in writer.values
+
+
+def test_observer_rejects_phase_reward_without_phase_steps() -> None:
+    observer = EnvStatsAlgoObserver()
+    observer.after_init(SimpleNamespace(writer=RecordingWriter(), games_to_track=16))
+    _record_finished_phase_metrics(
+        observer,
+        reward_sums=[1.0, 0.0],
+        phase_step_counts=[0.0, 0.0],
+    )
+
+    with pytest.raises(RuntimeError, match="accumulated reward without any phase steps"):
+        observer.after_print_stats(frame=64, epoch_num=4, total_time=0.0)
+
+
+@pytest.mark.parametrize(
+    ("reward_sums", "phase_step_counts"),
+    [
+        ([float("nan")], [1.0]),
+        ([0.0], [float("inf")]),
+        ([0.0], [-1.0]),
+    ],
+)
+def test_observer_rejects_invalid_phase_metrics(
+    reward_sums: list[float], phase_step_counts: list[float]
+) -> None:
+    observer = EnvStatsAlgoObserver()
+    observer.after_init(SimpleNamespace(writer=RecordingWriter(), games_to_track=16))
+    _record_finished_phase_metrics(
+        observer,
+        reward_sums=reward_sums,
+        phase_step_counts=phase_step_counts,
+    )
+
+    with pytest.raises(RuntimeError, match="phase 'final_hold'"):
+        observer.after_print_stats(frame=64, epoch_num=4, total_time=0.0)

@@ -222,14 +222,26 @@ class EnvStatsAlgoObserver(AlgoObserver):
             reward_values = self.episode_cumulative_avg[f"phase/{phase}_reward_sum"]
             phase_counts = self.episode_cumulative_avg.get(f"phase/{phase}_step_count")
             if phase_counts is None:
-                raise RuntimeError(f"completed {phase} phase has no step count")
+                raise RuntimeError(f"phase {phase!r} reward sum has no matching step count")
             rewards = np.asarray(reward_values, dtype=np.float64)
-            counts = np.asarray(phase_counts, dtype=np.float64)
-            if rewards.shape != counts.shape or np.any(counts <= 0.0):
-                raise RuntimeError(f"completed {phase} phase metrics are invalid")
+            phase_step_counts = np.asarray(phase_counts, dtype=np.float64)
+            if rewards.shape != phase_step_counts.shape:
+                raise RuntimeError(f"phase {phase!r} metrics are not aligned")
+            if not np.isfinite(rewards).all() or not np.isfinite(phase_step_counts).all():
+                raise RuntimeError(f"phase {phase!r} metrics are not finite")
+            if np.any(phase_step_counts < 0.0):
+                raise RuntimeError(f"phase {phase!r} contains a negative step count")
+
+            entered_phase = phase_step_counts > 0.0
+            if np.any(np.abs(rewards[~entered_phase]) > 1.0e-8):
+                raise RuntimeError(
+                    f"phase {phase!r} accumulated reward without any phase steps"
+                )
+            if not np.any(entered_phase):
+                continue
             self.writer.add_scalar(
                 f"episode_phase/{phase}_reward_mean",
-                np.mean(rewards / counts),
+                np.mean(rewards[entered_phase] / phase_step_counts[entered_phase]),
                 frame,
             )
 
