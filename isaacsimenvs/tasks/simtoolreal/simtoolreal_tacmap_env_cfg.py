@@ -541,7 +541,7 @@ class SimToolRealAllenKeyAdjustmentEnvCfg(SimToolRealInHandAdjustmentEnvCfg):
     )
     grasp_bank_path: str = str(
         Path(__file__).resolve().parents[3]
-        / "assets" / "grasp_banks" / "allen_key_manipulation_v2.json"
+        / "assets" / "grasp_banks" / "allen_key_manipulation_v3.json"
     )
     grasp_bank_min_entries: int = 6
     episode_length_s: float = 8.0
@@ -575,13 +575,25 @@ class SimToolRealAllenKeyAdjustmentEnvCfg(SimToolRealInHandAdjustmentEnvCfg):
     allen_target_pair_rotation_range_deg: tuple[float, float] = (18.0, 100.0)
     allen_require_valid_target_pairs: bool = True
     allen_pose_sigma_stages_m: tuple[float, ...] = (0.060, 0.040, 0.025, 0.015, 0.010)
-    allen_reset_yaw_range_stages_deg: tuple[float, ...] = (20.0, 35.0, 50.0, 65.0, 80.0)
+    # The bank itself covers a physically validated 100-degree world-yaw span.
+    # Do not rotate those grasps into unscreened arm configurations at reset.
+    allen_reset_yaw_range_stages_deg: tuple[float, ...] = (0.0,) * 5
+    # Disabled for the legacy bank. The workspace task below enables strict
+    # rollout-derived source and target curricula.
+    allen_workspace_conditioned_sampling: bool = False
+    allen_workspace_tier_probabilities_stages: tuple[
+        tuple[float, float, float], ...
+    ] = ((1.0, 0.0, 0.0),) * 5
+    allen_pair_max_translation_stages_m: tuple[float, ...] = (0.09,) * 5
+    allen_pair_max_rotation_stages_deg: tuple[float, ...] = (100.0,) * 5
+    allen_target_min_quality_improvement: float = 0.0
     allen_palm_keypoints_m: tuple[tuple[float, float, float], ...] = (
         (0.0, 0.0, 0.0), (0.05, 0.0, 0.0), (-0.05, 0.0, 0.0),
         (0.0, 0.035, 0.0), (0.0, -0.035, 0.0), (0.0, 0.0, 0.03),
     )
     allen_screw_axis_tool: tuple[float, float, float] = (0.0, 0.0, -1.0)
     allen_screw_pivot_tool_m: tuple[float, float, float] = (0.192, 0.0, -0.03)
+    allen_handle_across_flats_m: float = 0.010
     allen_workpiece_from_tool_m: tuple[float, float, float] = (0.192, 0.0, -0.095)
     allen_hidden_table_offset_m: float = 1.0
     allen_socket_lateral_tolerance_m: float = 0.006
@@ -611,6 +623,83 @@ class SimToolRealAllenKeyAdjustmentEnvCfg(SimToolRealInHandAdjustmentEnvCfg):
             "allen_socket_state", "allen_phase", "allen_validity",
         ),
         clamp_abs_observations=_BASE_OBS.clamp_abs_observations,
+    )
+
+
+@configclass
+class SimToolRealAllenKeyWorkspaceAdjustmentEnvCfg(
+    SimToolRealAllenKeyAdjustmentEnvCfg
+):
+    """Rollout-conditioned Allen-key adjustment from weaker to functional grasps."""
+
+    grasp_bank_path: str = str(
+        Path(__file__).resolve().parents[3]
+        / "assets" / "grasp_banks" / "allen_key_rollout_adjustment_v1.json"
+    )
+    grasp_bank_min_entries: int = 18
+    allen_workspace_conditioned_sampling: bool = True
+    # Stage zero follows the measured 69% acquisition region. Broader support
+    # and hard poses enter only after endpoint hold success advances curriculum.
+    allen_workspace_tier_probabilities_stages: tuple[
+        tuple[float, float, float], ...
+    ] = (
+        (0.80, 0.20, 0.00),
+        (0.65, 0.30, 0.05),
+        (0.50, 0.40, 0.10),
+        (0.40, 0.40, 0.20),
+        (0.30, 0.40, 0.30),
+    )
+    allen_pair_max_translation_stages_m: tuple[float, ...] = (
+        0.060, 0.060, 0.075, 0.075, 0.090
+    )
+    allen_pair_max_rotation_stages_deg: tuple[float, ...] = (
+        60.0, 60.0, 80.0, 80.0, 100.0
+    )
+    allen_target_min_quality_improvement: float = 0.25
+
+
+@configclass
+class SimToolRealAllenKeyPalmDownAdjustmentEnvCfg(
+    SimToolRealAllenKeyWorkspaceAdjustmentEnvCfg
+):
+    """Palm-down side-changing regrasp around a thick Allen-key handle."""
+
+    assets: AssetsCfg = AssetsCfg(
+        table_urdf=str(
+            Path(__file__).resolve().parents[3]
+            / "assets" / "urdf" / "table_allen_disabled.urdf"
+        ),
+        handle_head_types=("screwdriver",),
+        object_urdf=str(
+            Path(__file__).resolve().parents[3]
+            / "assets" / "urdf" / "objects" / "allen_key_thick_handle.urdf"
+        ),
+        object_scale=(1.0, 1.0, 1.0),
+        workpiece_urdf=str(
+            Path(__file__).resolve().parents[3]
+            / "assets" / "urdf" / "workpieces" / "allen_key_hex_socket.urdf"
+        ),
+    )
+    grasp_bank_path: str = str(
+        Path(__file__).resolve().parents[3]
+        / "assets" / "grasp_banks" / "allen_key_palm_down_v1.json"
+    )
+    grasp_bank_min_entries: int = 8
+    allen_handle_across_flats_m: float = 0.030
+    allen_target_pair_translation_range_m: tuple[float, float] = (0.0, 0.200)
+    allen_target_pair_rotation_range_deg: tuple[float, float] = (40.0, 100.0)
+    allen_workspace_tier_probabilities_stages: tuple[
+        tuple[float, float, float], ...
+    ] = ((1.0, 0.0, 0.0),) * 5
+    allen_pair_max_translation_stages_m: tuple[float, ...] = (
+        0.20, 0.20, 0.20, 0.20, 0.20
+    )
+    # Pair difficulty is fixed by the screened rollout graph. Curriculum
+    # progression tightens endpoint accuracy instead of hiding valid goals.
+    allen_pair_max_rotation_stages_deg: tuple[float, ...] = (100.0,) * 5
+    allen_target_min_quality_improvement: float = 0.0
+    allen_pose_sigma_stages_m: tuple[float, ...] = (
+        0.080, 0.060, 0.040, 0.025, 0.015
     )
 
 @configclass

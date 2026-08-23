@@ -35,6 +35,8 @@ from .simtoolreal_tacmap_env_cfg import (
     SimToolRealInHandAdjustmentEnvCfg,
     SimToolRealScrewdriverAxialAdjustmentEnvCfg,
     SimToolRealAllenKeyAdjustmentEnvCfg,
+    SimToolRealAllenKeyWorkspaceAdjustmentEnvCfg,
+    SimToolRealAllenKeyPalmDownAdjustmentEnvCfg,
 )
 
 __all__ = [
@@ -56,6 +58,8 @@ __all__ = [
     "SimToolRealScrewdriverAxialAdjustmentEnvCfg",
     "SimToolRealAllenKeyAdjustmentEnv",
     "SimToolRealAllenKeyAdjustmentEnvCfg",
+    "SimToolRealAllenKeyWorkspaceAdjustmentEnvCfg",
+    "SimToolRealAllenKeyPalmDownAdjustmentEnvCfg",
 ]
 
 _CFG_DIR = Path(__file__).resolve().parents[2] / "cfg"
@@ -213,6 +217,50 @@ gym.register(
         ),
         "rl_games_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealSAPG.yaml"),
         "rl_games_sapg_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealSAPG.yaml"),
+    },
+)
+
+gym.register(
+    id="Isaacsimenvs-SimToolReal-AllenKey-Workspace-Adjustment-Direct-v0",
+    entry_point=(
+        "isaacsimenvs.tasks.simtoolreal.simtoolreal_allen_key_adjustment_env:"
+        "SimToolRealAllenKeyAdjustmentEnv"
+    ),
+    order_enforce=False,
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            "isaacsimenvs.tasks.simtoolreal.simtoolreal_tacmap_env_cfg:"
+            "SimToolRealAllenKeyWorkspaceAdjustmentEnvCfg"
+        ),
+        "env_cfg_yaml_entry_point": str(
+            _CFG_DIR / "task" / "SimToolRealAllenKeyWorkspaceAdjustment.yaml"
+        ),
+        "rl_games_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealSAPG.yaml"),
+        "rl_games_sapg_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealSAPG.yaml"),
+    },
+)
+
+gym.register(
+    id="Isaacsimenvs-SimToolReal-AllenKey-PalmDown-Adjustment-Direct-v0",
+    entry_point=(
+        "isaacsimenvs.tasks.simtoolreal.simtoolreal_allen_key_adjustment_env:"
+        "SimToolRealAllenKeyAdjustmentEnv"
+    ),
+    order_enforce=False,
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            "isaacsimenvs.tasks.simtoolreal.simtoolreal_tacmap_env_cfg:"
+            "SimToolRealAllenKeyPalmDownAdjustmentEnvCfg"
+        ),
+        "env_cfg_yaml_entry_point": str(
+            _CFG_DIR / "task" / "SimToolRealAllenKeyPalmDownAdjustment.yaml"
+        ),
+        "rl_games_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealSAPG.yaml"),
+        "rl_games_sapg_cfg_entry_point": str(
+            _CFG_DIR / "train" / "SimToolRealSAPG.yaml"
+        ),
     },
 )
 

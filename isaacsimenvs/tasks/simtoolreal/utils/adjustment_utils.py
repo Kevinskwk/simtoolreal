@@ -10,6 +10,93 @@ import torch
 
 
 SCENARIO_KINDS = ("nominal", "fixed_pose_hard")
+ALLEN_WORKSPACE_TIERS = ("easy", "support", "broad")
+
+
+def allen_workspace_tier(
+    handle_center_x_m: torch.Tensor,
+    handle_center_y_m: torch.Tensor,
+    socket_z_m: torch.Tensor,
+    yaw_deg: torch.Tensor,
+) -> torch.Tensor:
+    """Classify sampled Allen-key poses using the measured rollout regions."""
+    shape = handle_center_x_m.shape
+    if any(value.shape != shape for value in (
+        handle_center_y_m, socket_z_m, yaw_deg
+    )):
+        raise ValueError("Allen-key workspace inputs must share one shape")
+    values = (handle_center_x_m, handle_center_y_m, socket_z_m, yaw_deg)
+    if any(not bool(torch.isfinite(value).all()) for value in values):
+        raise ValueError("Allen-key workspace inputs must be finite")
+    support = (
+        (handle_center_x_m >= -0.13) & (handle_center_x_m <= 0.325)
+        & (handle_center_y_m >= -0.065) & (handle_center_y_m <= 0.195)
+        & (socket_z_m >= 0.37) & (socket_z_m <= 0.67)
+    )
+    easy_yaw = ((yaw_deg >= -180.0) & (yaw_deg < -120.0)) | (
+        (yaw_deg >= 150.0) & (yaw_deg <= 180.0)
+    )
+    easy = support & easy_yaw & (socket_z_m <= 0.62)
+    result = torch.full(shape, 2, dtype=torch.long, device=yaw_deg.device)
+    result[support] = 1
+    result[easy] = 0
+    return result
+
+
+def allen_workspace_sampling_weights(
+    entry_tiers: torch.Tensor, tier_probabilities: tuple[float, float, float]
+) -> torch.Tensor:
+    """Give each bank entry equal mass within its requested workspace tier."""
+    if entry_tiers.ndim != 1 or entry_tiers.dtype not in (torch.int32, torch.int64):
+        raise ValueError("entry_tiers must be a one-dimensional integer tensor")
+    if bool(((entry_tiers < 0) | (entry_tiers >= len(ALLEN_WORKSPACE_TIERS))).any()):
+        raise ValueError("entry_tiers contains an unknown Allen-key workspace tier")
+    probabilities = torch.tensor(
+        tier_probabilities, dtype=torch.float32, device=entry_tiers.device
+    )
+    if probabilities.shape != (3,) or not bool(torch.isfinite(probabilities).all()):
+        raise ValueError("Allen-key tier probabilities must contain three finite values")
+    if bool((probabilities < 0).any()) or not torch.isclose(
+        probabilities.sum(), torch.tensor(1.0, device=probabilities.device), atol=1.0e-6
+    ):
+        raise ValueError("Allen-key tier probabilities must be non-negative and sum to one")
+    weights = torch.zeros(entry_tiers.shape, device=entry_tiers.device)
+    for tier, probability in enumerate(probabilities):
+        count = int((entry_tiers == tier).sum().item())
+        if float(probability.item()) > 0.0 and count == 0:
+            raise ValueError(
+                f"Allen-key sampling requests absent tier {ALLEN_WORKSPACE_TIERS[tier]!r}"
+            )
+        if count:
+            weights[entry_tiers == tier] = probability / count
+    if not torch.isclose(weights.sum(), torch.tensor(1.0, device=weights.device), atol=1.0e-6):
+        raise RuntimeError("Allen-key workspace weights lost probability mass")
+    return weights
+
+
+def allen_pair_curriculum_mask(
+    base_valid: torch.Tensor,
+    translation_m: torch.Tensor,
+    rotation_deg: torch.Tensor,
+    *,
+    maximum_translation_m: float,
+    maximum_rotation_deg: float,
+) -> torch.Tensor:
+    """Restrict a prevalidated target graph to the active adjustment difficulty."""
+    if base_valid.dtype != torch.bool or base_valid.ndim != 2:
+        raise ValueError("base_valid must be a two-dimensional boolean tensor")
+    if translation_m.shape != base_valid.shape or rotation_deg.shape != base_valid.shape:
+        raise ValueError("Allen-key pair metric matrices must match base_valid")
+    if (
+        not math.isfinite(maximum_translation_m) or maximum_translation_m <= 0.0
+        or not math.isfinite(maximum_rotation_deg) or maximum_rotation_deg <= 0.0
+    ):
+        raise ValueError("Allen-key pair curriculum limits must be finite and positive")
+    if not bool(torch.isfinite(translation_m).all()) or not bool(torch.isfinite(rotation_deg).all()):
+        raise ValueError("Allen-key pair metrics must be finite")
+    return base_valid & (translation_m <= maximum_translation_m) & (
+        rotation_deg <= maximum_rotation_deg
+    )
 
 
 def _quat_mul(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
@@ -297,7 +384,9 @@ def adjustment_reward_terms(
 
 
 __all__ = [
-    "SCENARIO_KINDS", "adjustment_reward_terms", "arm_controllability_metrics",
+    "ALLEN_WORKSPACE_TIERS", "SCENARIO_KINDS", "adjustment_reward_terms",
+    "allen_pair_curriculum_mask", "allen_workspace_sampling_weights",
+    "allen_workspace_tier", "arm_controllability_metrics",
     "controllability_score", "load_adjustment_scenarios",
     "orbit_palm_tool_about_screw_axis", "palm_keypoint_error",
     "rotate_palm_about_tool_axis_in_place",

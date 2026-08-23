@@ -11,6 +11,9 @@ from isaaclab.utils.math import quat_apply, quat_from_angle_axis, quat_inv, quat
 from .simtoolreal_inhand_adjustment_env import SimToolRealInHandAdjustmentEnv
 from .simtoolreal_tacmap_env_cfg import SimToolRealAllenKeyAdjustmentEnvCfg
 from .utils.adjustment_utils import (
+    ALLEN_WORKSPACE_TIERS,
+    allen_pair_curriculum_mask,
+    allen_workspace_sampling_weights,
     palm_keypoint_error,
     screw_axis_orbit_errors,
 )
@@ -34,7 +37,10 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         self._allen_target_error_obs = torch.zeros(n, 5, device=device)
         self._allen_geometry_obs = torch.zeros(n, 9, device=device)
         geometry = torch.tensor(
-            (0.264, 0.06, 0.010, *cfg.allen_screw_axis_tool, *cfg.allen_screw_pivot_tool_m),
+            (
+                0.264, 0.06, float(cfg.allen_handle_across_flats_m),
+                *cfg.allen_screw_axis_tool, *cfg.allen_screw_pivot_tool_m,
+            ),
             device=device,
         )
         self._allen_geometry_obs[:] = geometry
@@ -69,6 +75,10 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         self._allen_fixture_workpiece_quat[:, 0] = 1.0
         self._allen_reset_yaw_rad = torch.zeros(n, device=device)
         self._allen_target_bank_index = torch.zeros(n, dtype=torch.long, device=device)
+        self._allen_source_workspace_tier = torch.zeros(n, dtype=torch.long, device=device)
+        self._allen_target_quality_improvement = torch.zeros(n, device=device)
+        self._allen_sampled_pair_translation_m = torch.zeros(n, device=device)
+        self._allen_sampled_pair_rotation_deg = torch.zeros(n, device=device)
         self._allen_curriculum_eligible = 0
         self._allen_curriculum_successes = 0
         self._allen_curriculum_success_mean = 0.0
@@ -106,12 +116,14 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         rotation_range = tuple(
             float(value) for value in cfg.allen_target_pair_rotation_range_deg
         )
-        for name, values in (
-            ("translation", translation_range), ("rotation", rotation_range)
+        for name, values, allow_zero in (
+            ("translation", translation_range, True),
+            ("rotation", rotation_range, False),
         ):
             if (
                 len(values) != 2 or not all(math.isfinite(value) for value in values)
-                or values[0] <= 0.0 or values[1] <= values[0]
+                or values[0] < 0.0 or (not allow_zero and values[0] == 0.0)
+                or values[1] <= values[0]
             ):
                 raise ValueError(f"Allen-key target pair {name} range is invalid")
         sigma = tuple(float(value) for value in cfg.allen_pose_sigma_stages_m)
@@ -121,6 +133,37 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
             raise ValueError("Allen-key pose sigmas must be finite and positive")
         if any(later >= earlier for earlier, later in zip(sigma, sigma[1:])):
             raise ValueError("Allen-key pose sigma curriculum must strictly tighten")
+        stage_count = len(cfg.adjustment_target_rotation_deg)
+        for name in (
+            "allen_workspace_tier_probabilities_stages",
+            "allen_pair_max_translation_stages_m",
+            "allen_pair_max_rotation_stages_deg",
+        ):
+            if len(getattr(cfg, name)) != stage_count:
+                raise ValueError(f"{name} must have one value per curriculum stage")
+        for probabilities in cfg.allen_workspace_tier_probabilities_stages:
+            if (
+                len(probabilities) != len(ALLEN_WORKSPACE_TIERS)
+                or any(not math.isfinite(float(value)) or float(value) < 0.0 for value in probabilities)
+                or not math.isclose(sum(float(value) for value in probabilities), 1.0, abs_tol=1.0e-6)
+            ):
+                raise ValueError(
+                    "Allen-key workspace tier probabilities must be non-negative and sum to one"
+                )
+        for name in (
+            "allen_pair_max_translation_stages_m",
+            "allen_pair_max_rotation_stages_deg",
+        ):
+            values = tuple(float(value) for value in getattr(cfg, name))
+            if any(not math.isfinite(value) or value <= 0.0 for value in values):
+                raise ValueError(f"{name} values must be finite and positive")
+            if any(later < earlier for earlier, later in zip(values, values[1:])):
+                raise ValueError(f"{name} must be non-decreasing")
+        if (
+            not math.isfinite(float(cfg.allen_target_min_quality_improvement))
+            or float(cfg.allen_target_min_quality_improvement) < 0.0
+        ):
+            raise ValueError("Allen-key target quality improvement must be finite and non-negative")
         if len(cfg.allen_palm_keypoints_m) < 4:
             raise ValueError("Allen-key pose reward requires at least four palm keypoints")
         for name in (
@@ -168,12 +211,68 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         meaningful = (translation >= translation_low) | (rotation_deg >= rotation_low)
         bounded = (translation <= translation_high) & (rotation_deg <= rotation_high)
         self._allen_target_pair_valid = distinct & meaningful & bounded
+        entries = self._inhand_bank_payload.get("entries", [])
+        if len(entries) != self._inhand_bank_size:
+            raise RuntimeError("Allen-key bank entry count changed during materialization")
+        declared = torch.zeros_like(self._allen_target_pair_valid)
+        self._allen_target_arm_joint_0 = torch.full(
+            (self._inhand_bank_size, self._inhand_bank_size),
+            float("nan"),
+            device=self.device,
+        )
+        graph_present = all(
+            entry.get("verification", {}).get("valid_target_ids") is not None
+            and entry.get("verification", {}).get("target_arm_joint_0_rad") is not None
+            for entry in entries
+        )
+        if not graph_present and not bool(self.cfg.allen_require_valid_target_pairs):
+            # Provisional banks have no screened graph yet. Use each target
+            # entry's actual first arm joint for the reset-yaw intersection;
+            # zero is not generally inside the feasible interval.
+            self._allen_target_arm_joint_0.copy_(
+                self._inhand_bank_joint_pos[:, 0].unsqueeze(0).expand(
+                    self._inhand_bank_size, -1
+                )
+            )
+            declared.fill_(True)
+        for source_id, entry in enumerate(entries):
+            verification = entry.get("verification", {})
+            target_ids = verification.get("valid_target_ids")
+            target_joint_0 = verification.get("target_arm_joint_0_rad")
+            if target_ids is None or target_joint_0 is None:
+                if not graph_present and not bool(self.cfg.allen_require_valid_target_pairs):
+                    continue
+                raise RuntimeError(
+                    "Allen-key grasp bank is missing its IK-valid target graph; "
+                    "regenerate it with adapt_allen_key_grasp_bank.py"
+                )
+            if len(target_ids) != len(target_joint_0):
+                raise RuntimeError(
+                    f"Allen-key target graph row {source_id} has mismatched fields"
+                )
+            for target_id, joint_0 in zip(target_ids, target_joint_0, strict=True):
+                target_id = int(target_id)
+                joint_0 = float(joint_0)
+                if not 0 <= target_id < self._inhand_bank_size or not math.isfinite(joint_0):
+                    raise RuntimeError(
+                        f"Allen-key target graph row {source_id} is invalid"
+                    )
+                declared[source_id, target_id] = True
+                self._allen_target_arm_joint_0[source_id, target_id] = joint_0
+        self._allen_target_pair_valid &= declared
         candidates_per_start = self._allen_target_pair_valid.sum(dim=-1)
-        if bool(self.cfg.allen_require_valid_target_pairs) and bool(
-            (candidates_per_start == 0).any()
-        ):
+        target_only = torch.tensor(
+            [
+                bool(entry.get("verification", {}).get("target_only", False))
+                for entry in entries
+            ],
+            dtype=torch.bool,
+            device=self.device,
+        )
+        invalid_start = (candidates_per_start == 0) & ~target_only
+        if bool(self.cfg.allen_require_valid_target_pairs) and bool(invalid_start.any()):
             invalid = torch.nonzero(
-                candidates_per_start == 0, as_tuple=False
+                invalid_start, as_tuple=False
             ).squeeze(-1).tolist()
             raise RuntimeError(
                 "Allen-key grasp bank has no valid manipulation target for start entries "
@@ -181,6 +280,84 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
             )
         self._allen_pair_translation_m = translation
         self._allen_pair_rotation_deg = rotation_deg
+        workspace_tiers = []
+        functional_quality = []
+        for index, entry in enumerate(entries):
+            verification = entry.get("verification", {})
+            tier = verification.get("rollout_workspace_tier_id")
+            quality = verification.get("rollout_functional_quality")
+            if bool(self.cfg.allen_workspace_conditioned_sampling) and (
+                tier is None or quality is None
+            ):
+                raise RuntimeError(
+                    f"Allen-key rollout bank entry {index} lacks workspace/quality metadata"
+                )
+            workspace_tiers.append(0 if tier is None else int(tier))
+            functional_quality.append(0.0 if quality is None else float(quality))
+        self._allen_bank_workspace_tier = torch.tensor(
+            workspace_tiers, dtype=torch.long, device=self.device
+        )
+        self._allen_bank_functional_quality = torch.tensor(
+            functional_quality, dtype=torch.float32, device=self.device
+        )
+        if bool(((self._allen_bank_workspace_tier < 0) | (
+            self._allen_bank_workspace_tier >= len(ALLEN_WORKSPACE_TIERS)
+        )).any()):
+            raise RuntimeError("Allen-key bank contains an invalid workspace tier")
+        if not bool(torch.isfinite(self._allen_bank_functional_quality).all()):
+            raise RuntimeError("Allen-key bank contains non-finite functional quality")
+
+    def _active_target_graph(self) -> torch.Tensor:
+        graph = self._allen_target_pair_valid
+        if not (
+            bool(self.cfg.allen_workspace_conditioned_sampling)
+            and getattr(self, "_allen_ready", False)
+        ):
+            return graph
+        stage = self._adjustment_curriculum_stage
+        graph = allen_pair_curriculum_mask(
+            graph,
+            self._allen_pair_translation_m,
+            self._allen_pair_rotation_deg,
+            maximum_translation_m=float(
+                self.cfg.allen_pair_max_translation_stages_m[stage]
+            ),
+            maximum_rotation_deg=float(
+                self.cfg.allen_pair_max_rotation_stages_deg[stage]
+            ),
+        )
+        improvement = (
+            self._allen_bank_functional_quality.unsqueeze(0)
+            - self._allen_bank_functional_quality.unsqueeze(1)
+        )
+        return graph & (
+            improvement >= float(self.cfg.allen_target_min_quality_improvement)
+        )
+
+    def _sample_workspace_source_ids(self, count: int) -> torch.Tensor:
+        graph = self._active_target_graph()
+        available = graph.any(dim=-1)
+        available_ids = torch.nonzero(available, as_tuple=False).squeeze(-1)
+        if available_ids.numel() == 0:
+            raise RuntimeError(
+                "Allen-key curriculum has no start with a valid improved target"
+            )
+        stage = int(getattr(self, "_adjustment_curriculum_stage", 0))
+        probabilities = tuple(float(value) for value in (
+            self.cfg.allen_workspace_tier_probabilities_stages[
+                stage
+            ]
+        ))
+        try:
+            available_weights = allen_workspace_sampling_weights(
+                self._allen_bank_workspace_tier[available_ids], probabilities
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "Allen-key curriculum requests an unavailable workspace tier"
+            ) from exc
+        sampled = torch.multinomial(available_weights, count, replacement=True)
+        return available_ids[sampled]
 
     def _setup_scene(self) -> None:
         super()._setup_scene()
@@ -209,7 +386,14 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         relative_quat: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         source_ids = self._inhand_reset_bank_index[env_ids]
-        weights = self._allen_target_pair_valid[source_ids].float()
+        graph = self._active_target_graph()
+        weights = graph[source_ids].float()
+        if bool(self.cfg.allen_workspace_conditioned_sampling) and getattr(
+            self, "_allen_ready", False
+        ):
+            quality = self._allen_bank_functional_quality
+            quality = quality - quality.min() + 1.0
+            weights *= quality.unsqueeze(0)
         missing = weights.sum(dim=-1) == 0
         if bool(self.cfg.allen_require_valid_target_pairs) and bool(missing.any()):
             raise RuntimeError("Allen-key reset selected a start without a valid target")
@@ -222,6 +406,16 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         target_quat = self._inhand_bank_relative_quat[target_ids]
         rotation = torch.deg2rad(self._allen_pair_rotation_deg[source_ids, target_ids])
         translation = self._allen_pair_translation_m[source_ids, target_ids]
+        if hasattr(self, "_allen_source_workspace_tier"):
+            self._allen_source_workspace_tier[env_ids] = (
+                self._allen_bank_workspace_tier[source_ids]
+            )
+            self._allen_target_quality_improvement[env_ids] = (
+                self._allen_bank_functional_quality[target_ids]
+                - self._allen_bank_functional_quality[source_ids]
+            )
+            self._allen_sampled_pair_translation_m[env_ids] = translation
+            self._allen_sampled_pair_rotation_deg[env_ids] = torch.rad2deg(rotation)
         return target_pos, target_quat, rotation, translation
 
     def _sample_nearby_contact_target(
@@ -236,6 +430,11 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         return object_pos, object_quat, object_pos.clone(), zeros, zeros
 
     def _restore_inhand_state(self, env_ids: torch.Tensor, bank_ids=None) -> None:
+        if (
+            bank_ids is None
+            and bool(self.cfg.allen_workspace_conditioned_sampling)
+        ):
+            bank_ids = self._sample_workspace_source_ids(env_ids.numel())
         super()._restore_inhand_state(env_ids, bank_ids)
         if not hasattr(self, "workpiece"):
             return
@@ -346,6 +545,11 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         ))
         arm_joint = int(self._arm_joint_ids[0])
         current_targets = self._cur_targets[env_ids, arm_joint]
+        source_ids = self._inhand_reset_bank_index[env_ids]
+        target_ids = self._allen_target_bank_index[env_ids]
+        target_joint_0 = self._allen_target_arm_joint_0[source_ids, target_ids]
+        if not bool(torch.isfinite(target_joint_0).all()):
+            raise RuntimeError("sampled Allen-key target has no finite arm-yaw solution")
         low = torch.maximum(
             torch.full_like(current_targets, -limit),
             self._arm_lower[env_ids, 0] - current_targets,
@@ -354,6 +558,8 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
             torch.full_like(current_targets, limit),
             self._arm_upper[env_ids, 0] - current_targets,
         )
+        low = torch.maximum(low, self._arm_lower[env_ids, 0] - target_joint_0)
+        high = torch.minimum(high, self._arm_upper[env_ids, 0] - target_joint_0)
         if bool((low > high).any()):
             raise RuntimeError("Allen-key reset yaw has no valid first-joint interval")
         yaw = low + torch.rand(count, device=self.device) * (high - low)
@@ -699,6 +905,20 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
         }
         reward = torch.stack(tuple(weighted.values())).sum(0)
         self._reward_terms = {**weighted, "total_reward": reward}
+        adjustment_phase = self.episode_length_buf < closure_start
+        closure_phase = closure_or_release & ~release_phase
+        self._episode_cumulative_terms = {}
+        for phase_name, phase_mask in (
+            ("adjustment", adjustment_phase),
+            ("closure", closure_phase),
+            ("release", release_phase),
+        ):
+            self._episode_cumulative_terms[f"phase/{phase_name}_reward_sum"] = (
+                reward * phase_mask.float()
+            )
+            self._episode_cumulative_terms[f"phase/{phase_name}_step_count"] = (
+                phase_mask.float()
+            )
         self.extras.update({f"reward/{name}": value.mean() for name, value in weighted.items()})
         self.extras.update({
             "allen/orbit_error_mean_deg": torch.rad2deg(self._allen_orbit_error).mean(),
@@ -734,9 +954,37 @@ class SimToolRealAllenKeyAdjustmentEnv(SimToolRealInHandAdjustmentEnv):
             "allen/combined_valid_ratio": self._allen_combined_valid.float().mean(),
             "allen/hold_count_mean": self._allen_hold_count.float().mean(),
             "allen/endpoint_success_ratio": self._allen_succeeded.float().mean(),
+            "allen/source_easy_ratio": (
+                self._allen_source_workspace_tier == 0
+            ).float().mean(),
+            "allen/source_support_ratio": (
+                self._allen_source_workspace_tier == 1
+            ).float().mean(),
+            "allen/source_broad_ratio": (
+                self._allen_source_workspace_tier == 2
+            ).float().mean(),
+            "allen/target_quality_improvement_mean": (
+                self._allen_target_quality_improvement.mean()
+            ),
+            "allen/sampled_pair_translation_mean_m": (
+                self._allen_sampled_pair_translation_m.mean()
+            ),
+            "allen/sampled_pair_rotation_mean_deg": (
+                self._allen_sampled_pair_rotation_deg.mean()
+            ),
             "curriculum/allen_stage": self._adjustment_curriculum_stage,
             "curriculum/allen_success_mean": self._allen_curriculum_success_mean,
             "curriculum/allen_palm_pose_sigma_m": pose_sigma,
+            "curriculum/allen_pair_max_translation_m": (
+                self.cfg.allen_pair_max_translation_stages_m[
+                    self._adjustment_curriculum_stage
+                ]
+            ),
+            "curriculum/allen_pair_max_rotation_deg": (
+                self.cfg.allen_pair_max_rotation_stages_deg[
+                    self._adjustment_curriculum_stage
+                ]
+            ),
             "curriculum/allen_target_translation_min_m": (
                 self.cfg.allen_target_pair_translation_range_m[0]
             ),

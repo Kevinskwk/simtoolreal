@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<robot name="allen_key_thick_handle">
+  <link name="object_root">
+    <!-- 30 mm across-flats grasp handle, matching the original policy's
+         screwdriver handle range. The engaged short leg remains 10 mm. -->
+    <visual>
+      <origin xyz="0.067 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/unit_hex_prism_x.obj" scale="0.264 0.0173205 0.0173205"/>
+      </geometry>
+      <material name="grip"><color rgba="0.16 0.20 0.23 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0.067 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/unit_hex_prism_x.obj" scale="0.264 0.0173205 0.0173205"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0.192 0 -0.03" rpy="0 1.57079632679 0"/>
+      <geometry>
+        <mesh filename="meshes/unit_hex_prism_x.obj" scale="0.06 0.0057735 0.0057735"/>
+      </geometry>
+      <material name="steel"><color rgba="0.32 0.36 0.39 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0.192 0 -0.03" rpy="0 1.57079632679 0"/>
+      <geometry>
+        <mesh filename="meshes/unit_hex_prism_x.obj" scale="0.06 0.0057735 0.0057735"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0.070 0 -0.002" rpy="0 0 0"/>
+      <mass value="0.18"/>
+      <inertia ixx="0.000025" iyy="0.00105" izz="0.00105" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+</robot>

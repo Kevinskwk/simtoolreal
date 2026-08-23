@@ -1,0 +1,82 @@
+# Palm-down side-changing regrasp on a thick, hexagonal Allen-key handle.
+use_tacmap: false
+enable_vbts: false
+include_tacmap_in_policy: false
+enable_tool_table_contact_force_reward: false
+enable_tool_table_contact_sensor: false
+enable_palm_tool_contact_sensor: true
+
+assets:
+  table_urdf: assets/urdf/table_allen_disabled.urdf
+  object_urdf: assets/urdf/objects/allen_key_thick_handle.urdf
+  object_scale: [1.0, 1.0, 1.0]
+  workpiece_urdf: assets/urdf/workpieces/allen_key_hex_socket.urdf
+  handle_head_types: [screwdriver]
+  object_pool_limit: 0
+
+grasp_bank_path: assets/grasp_banks/allen_key_palm_down_v1.json
+grasp_bank_min_entries: 8
+grasp_bank_joint_limit_tolerance_rad: 0.0005
+adjustment_terminate_on_success: false
+adjustment_curriculum_success_threshold: 0.80
+adjustment_curriculum_min_eligible_count: 256
+adjustment_finger_perturb_fractions: [0.0, 0.0, 0.0, 0.0, 0.0]
+adjustment_target_translation_mode: none
+adjustment_target_rotation_axis: tool_x
+adjustment_target_axial_translation_m: [0.0, 0.0, 0.0, 0.0, 0.0]
+adjustment_target_perpendicular_translation_m: [0.0, 0.0, 0.0, 0.0, 0.0]
+adjustment_target_rotation_deg: [45.0, 60.0, 70.0, 80.0, 90.0]
+adjustment_relative_position_tolerance_stages_m: [0.010, 0.008, 0.006, 0.005, 0.004]
+adjustment_relative_rotation_tolerance_stages_deg: [8.0, 6.0, 5.0, 4.0, 3.0]
+adjustment_tool_pose_delay_steps: [0, 0, 0, 0, 0]
+adjustment_tool_pose_ramp_steps: [1, 1, 1, 1, 1]
+
+allen_handle_across_flats_m: 0.030
+allen_workspace_conditioned_sampling: true
+allen_workspace_tier_probabilities_stages:
+  - [1.0, 0.0, 0.0]
+  - [1.0, 0.0, 0.0]
+  - [1.0, 0.0, 0.0]
+  - [1.0, 0.0, 0.0]
+  - [1.0, 0.0, 0.0]
+allen_target_pair_translation_range_m: [0.0, 0.200]
+allen_target_pair_rotation_range_deg: [40.0, 100.0]
+allen_pair_max_translation_stages_m: [0.20, 0.20, 0.20, 0.20, 0.20]
+allen_pair_max_rotation_stages_deg: [100.0, 100.0, 100.0, 100.0, 100.0]
+allen_target_min_quality_improvement: 0.0
+allen_pose_sigma_stages_m: [0.080, 0.060, 0.040, 0.025, 0.015]
+allen_reset_yaw_range_stages_deg: [0.0, 0.0, 0.0, 0.0, 0.0]
+allen_hidden_table_offset_m: 1.0
+
+episode_length_s: 8.0
+scene:
+  num_envs: 12288
+domain_randomization:
+  use_obs_delay: false
+  use_action_delay: false
+  use_object_state_delay_noise: false
+  joint_velocity_obs_noise_std: 0.0
+  force_scale: 0.0
+  torque_scale: 0.0
+  force_prob_range: [1.0e-12, 1.0e-12]
+  torque_prob_range: [1.0e-12, 1.0e-12]
+termination:
+  episode_length: 480
+  max_consecutive_successes: 0
+
+obs:
+  obs_list: [joint_pos, joint_vel, prev_action_targets, palm_pos, palm_rot,
+             object_rot, fingertip_pos_rel_palm, keypoints_rel_palm,
+             keypoints_rel_goal, object_scales, allen_current_palm_tool,
+             allen_target_palm_tool, allen_target_error, allen_geometry,
+             allen_socket_state, allen_phase]
+  state_list: [joint_pos, joint_vel, prev_action_targets, palm_pos, palm_rot,
+               palm_vel, object_rot, object_vel, fingertip_pos_rel_palm,
+               keypoints_rel_palm, keypoints_rel_goal, object_scales,
+               closest_keypoint_max_dist, closest_fingertip_dist, lifted_object,
+               progress, successes, reward, stable_support_count,
+               stable_relative_linear_speed, stable_relative_angular_speed,
+               allen_current_palm_tool, allen_target_palm_tool,
+               allen_target_error, allen_geometry, allen_socket_state,
+               allen_phase, allen_validity]
+  clamp_abs_observations: 10.0

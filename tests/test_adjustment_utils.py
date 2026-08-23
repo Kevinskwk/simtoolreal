@@ -157,3 +157,40 @@ def test_in_place_palm_rotation_preserves_grasp_center_in_tool_frame():
     assert torch.allclose(target_center, current_center, atol=1e-6)
     alignment = torch.abs((quat * target_quat).sum(-1)).clamp(0.0, 1.0)
     assert (2.0 * torch.acos(alignment)).item() == pytest.approx(torch.pi / 3, rel=1e-5)
+
+
+def test_allen_workspace_tiers_match_measured_curriculum_regions():
+    tiers = module.allen_workspace_tier(
+        torch.tensor([0.10, 0.10, -0.20]),
+        torch.tensor([0.05, 0.05, -0.20]),
+        torch.tensor([0.50, 0.65, 0.50]),
+        torch.tensor([-150.0, -30.0, 90.0]),
+    )
+    assert tiers.tolist() == [0, 1, 2]
+
+
+def test_allen_workspace_weights_preserve_tier_probability_mass():
+    tiers = torch.tensor([0, 0, 1, 2, 2, 2])
+    weights = module.allen_workspace_sampling_weights(tiers, (0.6, 0.3, 0.1))
+    assert weights[tiers == 0].sum().item() == pytest.approx(0.6)
+    assert weights[tiers == 1].sum().item() == pytest.approx(0.3)
+    assert weights[tiers == 2].sum().item() == pytest.approx(0.1)
+    with pytest.raises(ValueError, match="absent tier"):
+        module.allen_workspace_sampling_weights(torch.tensor([0, 1]), (0.5, 0.4, 0.1))
+
+
+def test_allen_pair_curriculum_only_removes_prevalidated_edges():
+    valid = torch.tensor([[False, True, True], [True, False, True], [True, True, False]])
+    translation = torch.tensor([
+        [0.0, 0.03, 0.07], [0.03, 0.0, 0.04], [0.07, 0.04, 0.0]
+    ])
+    rotation = torch.tensor([
+        [0.0, 20.0, 30.0], [20.0, 0.0, 70.0], [30.0, 70.0, 0.0]
+    ])
+    result = module.allen_pair_curriculum_mask(
+        valid, translation, rotation,
+        maximum_translation_m=0.06, maximum_rotation_deg=60.0,
+    )
+    assert result.tolist() == [
+        [False, True, False], [True, False, False], [False, False, False]
+    ]

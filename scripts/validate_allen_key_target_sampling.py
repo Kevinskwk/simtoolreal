@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--grasp-bank", type=Path,
-        default=ROOT / "assets/grasp_banks/allen_key_manipulation_v2.json",
+        default=ROOT / "assets/grasp_banks/allen_key_manipulation_v3.json",
     )
     parser.add_argument("--minimum-translation-m", type=float, default=0.012)
     parser.add_argument("--maximum-translation-m", type=float, default=0.090)
@@ -141,8 +141,39 @@ def main() -> None:
         raise RuntimeError(
             f"Allen-key bank has targetless start entries: {isolated.tolist()}"
         )
+    directed_pair_count = 0
+    for source_id, entry in enumerate(entries):
+        verification = entry.get("verification", {})
+        target_ids = verification.get("valid_target_ids")
+        target_joint_0 = verification.get("target_arm_joint_0_rad")
+        if target_ids is None or target_joint_0 is None:
+            raise RuntimeError(
+                f"bank entry {source_id} is missing its physical target graph"
+            )
+        if verification.get("target_only", False):
+            if target_ids or target_joint_0:
+                raise RuntimeError(
+                    f"target-only bank entry {source_id} must be a graph leaf"
+                )
+            continue
+        if len(target_ids) != len(target_joint_0) or not target_ids:
+            raise RuntimeError(
+                f"bank entry {source_id} has an empty or malformed target graph"
+            )
+        for target_id, joint_0 in zip(target_ids, target_joint_0, strict=True):
+            target_id = int(target_id)
+            if (
+                not 0 <= target_id < len(entries)
+                or not adjacency[source_id, target_id]
+                or not math.isfinite(float(joint_0))
+            ):
+                raise RuntimeError(
+                    f"bank entry {source_id} declares invalid target {target_id}"
+                )
+            directed_pair_count += 1
     print(
-        f"[pass] {len(entries)} reachable grasps, {len(translations)} valid pairs; "
+        f"[pass] {len(entries)} reachable grasps, {directed_pair_count} screened "
+        f"directed targets ({len(translations)} geometric pairs); "
         f"translation={min(translations):.4f}..{max(translations):.4f}m "
         f"rotation={min(angles):.1f}..{max(angles):.1f}deg "
         f"worst_ik={worst_position:.6f}m/{worst_rotation:.2f}deg "
