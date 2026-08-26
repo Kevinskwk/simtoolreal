@@ -7,7 +7,7 @@ import math
 import torch
 from isaaclab.sensors import ContactSensor, ContactSensorCfg
 from isaacsim.core.utils.stage import get_current_stage
-from pxr import Gf, Sdf, UsdPhysics
+from pxr import Gf, Sdf, Usd, UsdPhysics
 from isaaclab.utils.math import (
     quat_apply,
     quat_from_angle_axis,
@@ -356,9 +356,9 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         arm_table_paths = tuple(cfg.allen_turn_arm_table_contact_prim_paths)
         if not bool(cfg.enable_arm_table_contact_sensor):
             raise ValueError("Allen-key turning requires arm-table contact sensors")
-        if len(arm_table_paths) != 6 or len(set(arm_table_paths)) != 6:
+        if len(arm_table_paths) != 7 or len(set(arm_table_paths)) != 7:
             raise ValueError(
-                "Allen-key arm-table contact paths must contain six unique arm links"
+                "Allen-key arm-table contact paths must contain seven unique arm/wrist links"
             )
         if tuple(cfg.allen_turn_arm_table_contact_filter_paths) != (
             "/World/envs/env_.*/Table/box",
@@ -420,6 +420,7 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
 
     def _setup_scene(self) -> None:
         super()._setup_scene()
+        self._assert_table_collision_enabled()
         if not hasattr(self, "workpiece"):
             raise RuntimeError("Allen-key turning requires a socket workpiece")
         if not bool(self.cfg.enable_palm_tool_contact_sensor):
@@ -497,6 +498,25 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
                 ) from exc
             self.scene.sensors[f"allen_turn_arm_{link_id}_table_contact"] = sensor
             self._turn_arm_table_contact_sensors.append(sensor)
+
+    def _assert_table_collision_enabled(self) -> None:
+        """Fail before simulation if the instantiated table has no active collider."""
+        stage = get_current_stage()
+        table_root = stage.GetPrimAtPath("/World/envs/env_0/Table")
+        if not table_root.IsValid():
+            raise RuntimeError("Allen-key table prim is missing in env_0")
+        colliders = []
+        for prim in Usd.PrimRange(table_root, Usd.TraverseInstanceProxies()):
+            if not prim.HasAPI(UsdPhysics.CollisionAPI):
+                continue
+            enabled = UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get()
+            if enabled is not False:
+                colliders.append(str(prim.GetPath()))
+        if not colliders:
+            raise RuntimeError(
+                "Allen-key table has no enabled collision prims after USD conversion"
+            )
+        self._turn_table_collider_paths = tuple(colliders)
 
     def _create_turn_fixture_joints(self) -> None:
         """Constrain every key to its socket with a physical screw-axis joint."""

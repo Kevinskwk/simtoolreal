@@ -174,6 +174,70 @@ def main() -> None:
                 "Allen-key socket bottom is not aligned with the table top: maximum="
                 f"{float(table_socket_error.max()):.7f} m"
             )
+        arm_table_sensors = getattr(inner, "_turn_arm_table_contact_sensors", None)
+        if arm_table_sensors is None or len(arm_table_sensors) != 7:
+            raise RuntimeError(
+                "Allen-key task did not construct seven arm/wrist table sensors"
+            )
+
+        # Exercise the physical collider, not just its USD metadata. Move the
+        # kinematic table upward through link 6 in env 0 until PhysX reports
+        # contact, then reset before running the fixture checks.
+        probe_env_ids = torch.zeros(1, dtype=torch.long, device=inner.device)
+        link_6_id = inner.robot.data.body_names.index("iiwa14_link_6")
+        link_6_position = inner.robot.data.body_link_pos_w[0, link_6_id].clone()
+        probe_table_position = inner.table.data.root_pos_w[0].clone()
+        probe_table_position[:2] = link_6_position[:2]
+        probe_table_quaternion = inner.table.data.root_quat_w[0].clone()
+        probe_contact_force_n = 0.0
+        probe_any_arm_raw_force_n = 0.0
+        inner._replay_target_lab_order = inner.robot.data.joint_pos.clone()
+        for probe_step in range(20):
+            table_top_z = link_6_position[2] - 0.15 + 0.01 * probe_step
+            probe_table_position[2] = (
+                table_top_z - 0.5 * float(inner.cfg.allen_turn_table_height_m)
+            )
+            inner.table.write_root_pose_to_sim(
+                torch.cat((probe_table_position, probe_table_quaternion))[None],
+                env_ids=probe_env_ids,
+            )
+            observation, reward, terminated, truncated, _ = env.step(action)
+            require_finite(-100 + probe_step, observation, reward)
+            probe_contact_force_n = max(
+                probe_contact_force_n,
+                float(inner._turn_arm_table_contact_force_n[0].max()),
+            )
+            probe_any_arm_raw_force_n = max(
+                probe_any_arm_raw_force_n,
+                max(
+                    float(torch.linalg.vector_norm(
+                        sensor.data.net_forces_w[0].reshape(-1, 3), dim=-1
+                    ).sum())
+                    for sensor in inner._turn_arm_table_contact_sensors
+                ),
+            )
+            if probe_contact_force_n >= float(
+                inner.cfg.allen_turn_arm_table_contact_force_threshold_n
+            ):
+                break
+        if probe_contact_force_n < float(
+            inner.cfg.allen_turn_arm_table_contact_force_threshold_n
+        ):
+            raise RuntimeError(
+                "Allen-key table collider produced no arm contact during the active "
+                f"probe: maximum filtered arm/wrist force={probe_contact_force_n:.6f} N, "
+                f"raw any-arm force={probe_any_arm_raw_force_n:.6f} N, "
+                f"final table position={inner.table.data.root_pos_w[0].tolist()}, "
+                f"final link-6 position={inner.robot.data.body_link_pos_w[0, link_6_id].tolist()}, "
+                f"colliders={inner._turn_table_collider_paths}"
+            )
+        observation, _ = env.reset()
+        table_top_z = inner.table.data.root_pos_w[:, 2] + 0.5 * float(
+            inner.cfg.allen_turn_table_height_m
+        )
+        socket_bottom_z = inner.workpiece.data.root_pos_w[:, 2]
+        if float((table_top_z - socket_bottom_z).abs().max()) > 1.0e-5:
+            raise RuntimeError("table/socket alignment was not restored after collision probe")
         env_ids = torch.arange(inner.num_envs, device=inner.device)
         # Hold the randomized reset posture throughout the fixture-only test.
         # Zero policy actions drive hand joints toward their normalized
@@ -497,6 +561,7 @@ def main() -> None:
             "robot_reset_resample_count_max": int(
                 inner._turn_initial_robot_resample_count.max()
             ),
+            "table_collision_probe_force_n": probe_contact_force_n,
             "kinetic_friction_limit_nm": kinetic_limit_nm,
             "static_friction_limit_nm": static_limit_nm,
             "initial_angular_speed_radps": initial_angular_speed,

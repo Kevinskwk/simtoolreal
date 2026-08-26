@@ -747,7 +747,7 @@ class SimToolRealAllenKeyTurningEnvCfg(SimToolRealTacMapEnvCfg):
     enable_palm_tool_contact_sensor: bool = True
     enable_arm_table_contact_sensor: bool = True
     allen_turn_arm_table_contact_prim_paths: tuple[str, ...] = tuple(
-        f"/World/envs/env_.*/Robot/iiwa14_link_{index}" for index in range(1, 7)
+        f"/World/envs/env_.*/Robot/iiwa14_link_{index}" for index in range(1, 8)
     )
     allen_turn_arm_table_contact_filter_paths: tuple[str, ...] = (
         "/World/envs/env_.*/Table/box",

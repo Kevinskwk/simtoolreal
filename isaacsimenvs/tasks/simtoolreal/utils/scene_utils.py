@@ -1809,6 +1809,7 @@ def setup_scene(env) -> None:
             props=dict(
                 kinematic_enabled=True, disable_gravity=True, articulation_enabled=False,
             ),
+            collision_enabled=True,
         )]
         # Single (sx, sy) = (1.0, 1.0) for downstream consumers (eval viz).
         env._table_variant_scales = [(1.0, 1.0)]
@@ -1833,6 +1834,7 @@ def setup_scene(env) -> None:
                 props=dict(
                     kinematic_enabled=True, disable_gravity=True, articulation_enabled=False,
                 ),
+                collision_enabled=True,
             )
             for idx, p in enumerate(variant_urdf_paths)
         ]
