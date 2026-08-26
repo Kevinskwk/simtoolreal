@@ -164,6 +164,16 @@ def main() -> None:
                 f"maximum={float(sampled_palm_distance.max()):.4f} m, "
                 f"limit={palm_distance_limit:.4f} m"
             )
+        table_top_z = inner.table.data.root_pos_w[:, 2] + 0.5 * float(
+            inner.cfg.allen_turn_table_height_m
+        )
+        socket_bottom_z = inner.workpiece.data.root_pos_w[:, 2]
+        table_socket_error = (table_top_z - socket_bottom_z).abs()
+        if float(table_socket_error.max()) > 1.0e-5:
+            raise RuntimeError(
+                "Allen-key socket bottom is not aligned with the table top: maximum="
+                f"{float(table_socket_error.max()):.7f} m"
+            )
         env_ids = torch.arange(inner.num_envs, device=inner.device)
         # Hold the randomized reset posture throughout the fixture-only test.
         # Zero policy actions drive hand joints toward their normalized
@@ -238,6 +248,7 @@ def main() -> None:
             "full_turn_bonus",
             "finger_effort_penalty",
             "translational_force_penalty",
+            "arm_table_contact_penalty",
             "action_rate_penalty",
         }
         missing = required_reward_terms.difference(inner._reward_terms)
@@ -257,6 +268,7 @@ def main() -> None:
             inner._turn_finger_force_w,
             inner._turn_contact_resultant_force_w,
             inner._turn_translational_force_imbalance,
+            inner._turn_arm_table_contact_force_n,
         )
         if any(not bool(torch.isfinite(value).all()) for value in deep_tensors):
             raise RuntimeError("Allen-key deep-grasp contact signals are non-finite")
@@ -269,6 +281,11 @@ def main() -> None:
         ):
             raise RuntimeError(
                 "translational-force penalty was active before confirmed acquisition"
+            )
+        if bool(inner._turn_arm_table_contact.any()):
+            raise RuntimeError(
+                "Allen-key reset posture intersects the table: maximum arm force="
+                f"{float(inner._turn_arm_table_contact_force_n.max()):.4f} N"
             )
         removed_reward_terms = {
             "turn_progress_rew",

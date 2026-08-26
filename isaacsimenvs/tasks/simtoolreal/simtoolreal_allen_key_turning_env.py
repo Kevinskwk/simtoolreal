@@ -118,6 +118,14 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         self._turn_summed_contact_load_n = torch.zeros(n, device=device)
         self._turn_translational_force_imbalance = torch.zeros(n, device=device)
         self._turn_translational_force_penalty = torch.zeros(n, device=device)
+        arm_table_sensor_count = len(cfg.allen_turn_arm_table_contact_prim_paths)
+        self._turn_arm_table_contact_force_n = torch.zeros(
+            n, arm_table_sensor_count, device=device
+        )
+        self._turn_arm_table_contact = torch.zeros(
+            n, arm_table_sensor_count, dtype=torch.bool, device=device
+        )
+        self._turn_arm_table_contact_penalty = torch.zeros(n, device=device)
         self._turn_palm_contact = torch.zeros(n, dtype=torch.bool, device=device)
         self._turn_palm_supported = torch.zeros(n, dtype=torch.bool, device=device)
         self._turn_contact_support = torch.zeros(n, dtype=torch.bool, device=device)
@@ -231,12 +239,12 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         total_rotation_deg = int(cfg.allen_turn_goal_count) * float(
             cfg.allen_turn_goal_increment_deg
         )
-        if total_rotation_deg < 360.0 or not math.isclose(
-            math.remainder(total_rotation_deg, 360.0), 0.0, abs_tol=1.0e-6
-        ):
-            raise ValueError(
-                "Allen-key subgoals must sum to one or more complete revolutions"
-            )
+        if int(cfg.allen_turn_goal_count) <= 0 or float(
+            cfg.allen_turn_goal_increment_deg
+        ) <= 0.0:
+            raise ValueError("Allen-key subgoal count and increment must be positive")
+        if total_rotation_deg < 360.0:
+            raise ValueError("Allen-key target must include at least one revolution")
         stage_count = len(cfg.allen_turn_friction_ranges_nm)
         if stage_count < 2:
             raise ValueError("Allen-key turning curriculum requires at least two stages")
@@ -345,6 +353,23 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
             cfg.allen_turn_translational_force_soft_threshold_ratio
         ) < 1.0:
             raise ValueError("Allen-key force-imbalance threshold is invalid")
+        arm_table_paths = tuple(cfg.allen_turn_arm_table_contact_prim_paths)
+        if not bool(cfg.enable_arm_table_contact_sensor):
+            raise ValueError("Allen-key turning requires arm-table contact sensors")
+        if len(arm_table_paths) != 6 or len(set(arm_table_paths)) != 6:
+            raise ValueError(
+                "Allen-key arm-table contact paths must contain six unique arm links"
+            )
+        if tuple(cfg.allen_turn_arm_table_contact_filter_paths) != (
+            "/World/envs/env_.*/Table/box",
+        ):
+            raise ValueError("Allen-key arm-table filter must target the table body")
+        if float(cfg.allen_turn_arm_table_contact_force_threshold_n) < 0.0:
+            raise ValueError("Allen-key arm-table force threshold must be non-negative")
+        if float(cfg.allen_turn_arm_table_contact_force_scale_n) <= 0.0:
+            raise ValueError("Allen-key arm-table force scale must be positive")
+        if float(cfg.allen_turn_table_height_m) <= 0.0:
+            raise ValueError("Allen-key table height must be positive")
         finger_groups = tuple(cfg.allen_turn_finger_tool_contact_prim_paths)
         if len(finger_groups) != 5 or any(not group for group in finger_groups):
             raise ValueError(
@@ -374,6 +399,7 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
             cfg.allen_turn_grasp_maintenance_reward_weight,
             cfg.allen_turn_deep_grasp_reward_weight,
             cfg.allen_turn_translational_force_penalty_weight,
+            cfg.allen_turn_arm_table_contact_penalty_weight,
             cfg.allen_turn_subgoal_bonus,
             cfg.allen_turn_full_turn_bonus,
             cfg.allen_turn_effort_penalty_weight,
@@ -447,6 +473,30 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
                 ] = sensor
                 finger_sensors.append(sensor)
             self._turn_finger_contact_sensors.append(finger_sensors)
+        self._turn_arm_table_contact_sensors: list[ContactSensor] = []
+        table_filters = list(self.cfg.allen_turn_arm_table_contact_filter_paths)
+        for link_id, prim_path in enumerate(
+            self.cfg.allen_turn_arm_table_contact_prim_paths
+        ):
+            try:
+                sensor = ContactSensor(ContactSensorCfg(
+                    prim_path=prim_path,
+                    update_period=0.0,
+                    history_length=0,
+                    debug_vis=False,
+                    track_pose=False,
+                    track_contact_points=False,
+                    track_friction_forces=False,
+                    track_air_time=False,
+                    filter_prim_paths_expr=table_filters,
+                ))
+            except Exception as exc:
+                raise RuntimeError(
+                    "Allen-key arm-table ContactSensor creation failed for "
+                    f"link={link_id}, prim={prim_path!r}: {exc!r}"
+                ) from exc
+            self.scene.sensors[f"allen_turn_arm_{link_id}_table_contact"] = sensor
+            self._turn_arm_table_contact_sensors.append(sensor)
 
     def _create_turn_fixture_joints(self) -> None:
         """Constrain every key to its socket with a physical screw-axis joint."""
@@ -643,7 +693,10 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
             torch.zeros(count, 6, device=self.device), env_ids=env_ids
         )
         table_position = self.scene.env_origins[env_ids].clone()
-        table_position[:, 2] -= float(self.cfg.allen_turn_hidden_table_offset_m)
+        table_position[:, 2] = (
+            socket_position[:, 2]
+            - 0.5 * float(self.cfg.allen_turn_table_height_m)
+        )
         identity = torch.zeros(count, 4, device=self.device)
         identity[:, 0] = 1.0
         self.table.write_root_pose_to_sim(
@@ -706,6 +759,9 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         self._turn_summed_contact_load_n[env_ids] = 0.0
         self._turn_translational_force_imbalance[env_ids] = 0.0
         self._turn_translational_force_penalty[env_ids] = 0.0
+        self._turn_arm_table_contact_force_n[env_ids] = 0.0
+        self._turn_arm_table_contact[env_ids] = False
+        self._turn_arm_table_contact_penalty[env_ids] = 0.0
         self._turn_palm_handle_distance[env_ids] = 0.0
         self._turn_min_palm_handle_distance[env_ids] = float("inf")
         self._turn_max_finger_contact_count[env_ids] = 0
@@ -1101,9 +1157,48 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         self._turn_translational_force_imbalance.copy_(imbalance)
         self._turn_translational_force_penalty.copy_(force_penalty)
 
+    def _read_arm_table_contacts(self) -> None:
+        sensors = getattr(self, "_turn_arm_table_contact_sensors", None)
+        expected = len(self.cfg.allen_turn_arm_table_contact_prim_paths)
+        if sensors is None or len(sensors) != expected:
+            raise RuntimeError(
+                "Allen-key turning arm-table contact sensors are unavailable"
+            )
+        forces = []
+        for link_id, sensor in enumerate(sensors):
+            matrix = getattr(getattr(sensor, "data", None), "force_matrix_w", None)
+            if (
+                matrix is None
+                or matrix.shape[0] != self.num_envs
+                or matrix.shape[-1] != 3
+            ):
+                shape = None if matrix is None else tuple(matrix.shape)
+                raise RuntimeError(
+                    "Allen-key arm-table contact sensor has invalid matrix: "
+                    f"link={link_id}, shape={shape}"
+                )
+            force = torch.linalg.vector_norm(
+                matrix.reshape(self.num_envs, -1, 3), dim=-1
+            ).sum(-1)
+            if not bool(torch.isfinite(force).all()):
+                raise RuntimeError(
+                    f"Allen-key arm-table contact sensor {link_id} is non-finite"
+                )
+            forces.append(force)
+        force_matrix = torch.stack(forces, dim=-1)
+        threshold = float(self.cfg.allen_turn_arm_table_contact_force_threshold_n)
+        scale = float(self.cfg.allen_turn_arm_table_contact_force_scale_n)
+        normalized_excess = ((force_matrix - threshold) / scale).clamp(0.0, 1.0)
+        self._turn_arm_table_contact_force_n.copy_(force_matrix)
+        self._turn_arm_table_contact.copy_(force_matrix >= threshold)
+        self._turn_arm_table_contact_penalty.copy_(
+            normalized_excess.square().amax(-1)
+        )
+
     def _update_metrics(self) -> None:
         compute_intermediate_values(self)
         self._read_contacts()
+        self._read_arm_table_contacts()
         current_yaw = yaw_from_quaternion(self.object.data.root_quat_w)
         _, yaw_delta = update_unwrapped_angle(
             self._turn_previous_yaw, current_yaw, self._turn_cumulative_angle
@@ -1626,6 +1721,10 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
                 * execution_phase.float()
                 * self._turn_ever_loaded_grasp.float()
             ),
+            "arm_table_contact_penalty": (
+                -float(self.cfg.allen_turn_arm_table_contact_penalty_weight)
+                * self._turn_arm_table_contact_penalty
+            ),
             "action_rate_penalty": (
                 -regularization_scale
                 * float(self.cfg.allen_turn_action_rate_penalty_weight)
@@ -1674,6 +1773,18 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
             ),
             "allen_turn/translational_force_imbalance_mean": (
                 self._turn_translational_force_imbalance.mean()
+            ),
+            "allen_turn/arm_table_contact_ratio": (
+                self._turn_arm_table_contact.any(-1).float().mean()
+            ),
+            "allen_turn/arm_table_contact_link_count_mean": (
+                self._turn_arm_table_contact.float().sum(-1).mean()
+            ),
+            "allen_turn/arm_table_contact_force_mean_n": (
+                self._turn_arm_table_contact_force_n.mean()
+            ),
+            "allen_turn/arm_table_contact_force_max_n": (
+                self._turn_arm_table_contact_force_n.max()
             ),
             "allen_turn/ever_loaded_grasp_ratio": (
                 self._turn_ever_loaded_grasp.float().mean()

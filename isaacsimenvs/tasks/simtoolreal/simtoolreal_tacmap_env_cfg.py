@@ -538,7 +538,7 @@ class SimToolRealAllenKeyAdjustmentEnvCfg(SimToolRealInHandAdjustmentEnvCfg):
     assets: AssetsCfg = AssetsCfg(
         table_urdf=str(
             Path(__file__).resolve().parents[3]
-            / "assets" / "urdf" / "table_allen_disabled.urdf"
+            / "assets" / "urdf" / "table_allen_turning.urdf"
         ),
         handle_head_types=("screwdriver",),
         object_urdf=str(
@@ -745,6 +745,13 @@ class SimToolRealAllenKeyTurningEnvCfg(SimToolRealTacMapEnvCfg):
     include_tacmap_in_policy: bool = False
     enable_fingertip_tool_contact_sensors: bool = False
     enable_palm_tool_contact_sensor: bool = True
+    enable_arm_table_contact_sensor: bool = True
+    allen_turn_arm_table_contact_prim_paths: tuple[str, ...] = tuple(
+        f"/World/envs/env_.*/Robot/iiwa14_link_{index}" for index in range(1, 7)
+    )
+    allen_turn_arm_table_contact_filter_paths: tuple[str, ...] = (
+        "/World/envs/env_.*/Table/box",
+    )
     # One ContactSensor is created per surviving rigid link, then contacts are
     # reduced to five per-finger values. A contact on any link of a finger is
     # sufficient; multiple contacting links still count as one finger.
@@ -788,9 +795,8 @@ class SimToolRealAllenKeyTurningEnvCfg(SimToolRealTacMapEnvCfg):
     allen_turn_screw_pivot_tool_m: tuple[float, float, float] = (0.192, 0.0, -0.030)
     allen_turn_socket_root_from_pivot_m: tuple[float, float, float] = (0.0, 0.0, -0.065)
     allen_turn_goal_increment_deg: float = 30.0
-    # Two complete revolutions expose late-turn grasp degradation and leave
-    # enough time for an emergent release/regrasp strategy.
-    allen_turn_goal_count: int = 24
+    # Continue beyond one revolution so late-turn grasp degradation is visible.
+    allen_turn_goal_count: int = 16
     allen_turn_goal_tolerance_deg: float = 6.0
     allen_turn_goal_hold_steps: int = 10
     allen_turn_final_hold_steps: int = 30
@@ -813,6 +819,8 @@ class SimToolRealAllenKeyTurningEnvCfg(SimToolRealTacMapEnvCfg):
     allen_turn_deep_grasp_maximum_opposition_cosine: float = -0.25
     allen_turn_deep_grasp_hold_steps: int = 10
     allen_turn_translational_force_soft_threshold_ratio: float = 0.20
+    allen_turn_arm_table_contact_force_threshold_n: float = 0.5
+    allen_turn_arm_table_contact_force_scale_n: float = 20.0
 
     # Keep the graspable long-handle center in the original SimToolReal XY
     # reset range. The Z ranges below refer to the screw pivot; the horizontal
@@ -869,6 +877,7 @@ class SimToolRealAllenKeyTurningEnvCfg(SimToolRealTacMapEnvCfg):
     allen_turn_grasp_maintenance_reward_weight: float = 0.25
     allen_turn_deep_grasp_reward_weight: float = 1.0
     allen_turn_translational_force_penalty_weight: float = 0.5
+    allen_turn_arm_table_contact_penalty_weight: float = 2.0
     allen_turn_subgoal_bonus: float = 8.0
     allen_turn_full_turn_bonus: float = 200.0
 
@@ -882,7 +891,7 @@ class SimToolRealAllenKeyTurningEnvCfg(SimToolRealTacMapEnvCfg):
     allen_turn_action_rate_penalty_weight: float = 0.01
     allen_turn_constraint_position_tolerance_m: float = 0.005
     allen_turn_constraint_tilt_tolerance_deg: float = 5.0
-    allen_turn_hidden_table_offset_m: float = 1.0
+    allen_turn_table_height_m: float = 0.300
     allen_turn_initial_hand_clearance_m: float = 0.015
     allen_turn_initial_arm_clearance_m: float = 0.055
     allen_turn_initial_sampling_max_attempts: int = 128
