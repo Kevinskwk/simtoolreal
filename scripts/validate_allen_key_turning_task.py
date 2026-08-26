@@ -237,6 +237,7 @@ def main() -> None:
             "subgoal_bonus",
             "full_turn_bonus",
             "finger_effort_penalty",
+            "translational_force_penalty",
             "action_rate_penalty",
         }
         missing = required_reward_terms.difference(inner._reward_terms)
@@ -254,12 +255,20 @@ def main() -> None:
             inner._turn_deep_grasp_quality,
             inner._turn_deep_grasp_opposition_cosine,
             inner._turn_finger_force_w,
+            inner._turn_contact_resultant_force_w,
+            inner._turn_translational_force_imbalance,
         )
         if any(not bool(torch.isfinite(value).all()) for value in deep_tensors):
             raise RuntimeError("Allen-key deep-grasp contact signals are non-finite")
         if not bool((inner._reward_terms["deep_grasp_rew"] == 0.0).all()):
             raise RuntimeError(
                 "deep-grasp reward was active without a confirmed acquisition"
+            )
+        if not bool(
+            (inner._reward_terms["translational_force_penalty"] == 0.0).all()
+        ):
+            raise RuntimeError(
+                "translational-force penalty was active before confirmed acquisition"
             )
         removed_reward_terms = {
             "turn_progress_rew",

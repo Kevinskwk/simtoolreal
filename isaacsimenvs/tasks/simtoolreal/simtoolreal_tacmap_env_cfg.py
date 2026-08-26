@@ -717,7 +717,7 @@ class SimToolRealAllenKeyPalmDownAdjustmentEnvCfg(
 
 @configclass
 class SimToolRealAllenKeyTurningEnvCfg(SimToolRealTacMapEnvCfg):
-    """Single-policy 360-degree Allen-key pose tracking under resistance."""
+    """Single-policy sustained Allen-key pose tracking under resistance."""
 
     sim: SimulationCfg = _allen_turn_sim_cfg()
 
@@ -782,13 +782,15 @@ class SimToolRealAllenKeyTurningEnvCfg(SimToolRealTacMapEnvCfg):
             "/World/envs/env_.*/Robot/left_pinky_DP",
         ),
     )
-    episode_length_s: float = 45.0
+    episode_length_s: float = 75.0
 
     allen_turn_screw_axis_tool: tuple[float, float, float] = (0.0, 0.0, -1.0)
     allen_turn_screw_pivot_tool_m: tuple[float, float, float] = (0.192, 0.0, -0.030)
     allen_turn_socket_root_from_pivot_m: tuple[float, float, float] = (0.0, 0.0, -0.065)
     allen_turn_goal_increment_deg: float = 30.0
-    allen_turn_goal_count: int = 12
+    # Two complete revolutions expose late-turn grasp degradation and leave
+    # enough time for an emergent release/regrasp strategy.
+    allen_turn_goal_count: int = 24
     allen_turn_goal_tolerance_deg: float = 6.0
     allen_turn_goal_hold_steps: int = 10
     allen_turn_final_hold_steps: int = 30
@@ -810,6 +812,7 @@ class SimToolRealAllenKeyTurningEnvCfg(SimToolRealTacMapEnvCfg):
     allen_turn_deep_grasp_minimum_contact_fingers: int = 3
     allen_turn_deep_grasp_maximum_opposition_cosine: float = -0.25
     allen_turn_deep_grasp_hold_steps: int = 10
+    allen_turn_translational_force_soft_threshold_ratio: float = 0.20
 
     # Keep the graspable long-handle center in the original SimToolReal XY
     # reset range. The Z ranges below refer to the screw pivot; the horizontal
@@ -865,8 +868,9 @@ class SimToolRealAllenKeyTurningEnvCfg(SimToolRealTacMapEnvCfg):
     allen_turn_first_loaded_grasp_bonus: float = 10.0
     allen_turn_grasp_maintenance_reward_weight: float = 0.25
     allen_turn_deep_grasp_reward_weight: float = 1.0
+    allen_turn_translational_force_penalty_weight: float = 0.5
     allen_turn_subgoal_bonus: float = 8.0
-    allen_turn_full_turn_bonus: float = 100.0
+    allen_turn_full_turn_bonus: float = 200.0
 
     # Regularization is weak while acquisition is being learned, then returns
     # to its configured strength as the task curriculum advances.

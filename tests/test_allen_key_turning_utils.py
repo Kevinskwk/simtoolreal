@@ -229,6 +229,16 @@ def test_deep_grasp_requires_thumb_opposition_and_inner_hand_support():
     assert cosine.tolist() == pytest.approx([-1.0, -1.0, 1.0, 1.0])
 
 
+def test_translational_force_penalty_favors_balanced_contact():
+    penalty, ratio = module.translational_force_imbalance_penalty(
+        torch.tensor([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+        torch.tensor([8.0, 4.0, 0.0]),
+        soft_threshold_ratio=0.2,
+    )
+    assert ratio.tolist() == pytest.approx([0.0, 1.0, 0.0])
+    assert penalty.tolist() == pytest.approx([0.0, 1.0, 0.0])
+
+
 def test_progress_gate_blocks_ungrasped_gain_but_keeps_regression_penalty():
     gated = module.gate_positive_progress(
         torch.tensor([1.0, 1.0, -1.0, -1.0]),

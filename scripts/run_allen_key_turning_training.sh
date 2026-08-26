@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Finetune SimToolReal with grasp-qualified 360-degree Allen-key turning.
+# Finetune SimToolReal with grasp-qualified sustained Allen-key turning.
 
 set -euo pipefail
 
@@ -24,9 +24,9 @@ if (( NUM_ENVS % PRETRAINED_SAPG_GROUPS != 0 )); then
   exit 2
 fi
 EXPL_BLOCK_SIZE=$((NUM_ENVS / PRETRAINED_SAPG_GROUPS))
-# One reset frame plus up to 2700 policy transitions. A normal timeout is
-# finalized at its reset boundary and therefore contains exactly 2700 frames.
-CAPTURE_VIEWER_LEN="${CAPTURE_VIEWER_LEN:-2701}"
+# One reset frame plus up to 4500 policy transitions. A normal timeout is
+# finalized at its reset boundary and therefore contains exactly 4500 frames.
+CAPTURE_VIEWER_LEN="${CAPTURE_VIEWER_LEN:-4501}"
 CAPTURE_VIEWER_INTERVAL="${CAPTURE_VIEWER_INTERVAL:-6000}"
 
 if [[ "${SKIP_PREFLIGHT}" != "1" ]]; then

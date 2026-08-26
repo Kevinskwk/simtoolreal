@@ -362,6 +362,38 @@ def deep_grasp_quality(
     return quality, valid, cosine
 
 
+def translational_force_imbalance_penalty(
+    resultant_force_w: torch.Tensor,
+    summed_contact_load_n: torch.Tensor,
+    *,
+    soft_threshold_ratio: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Penalize unilateral contact force without penalizing balanced grip load."""
+    if resultant_force_w.ndim != 2 or resultant_force_w.shape[-1] != 3:
+        raise ValueError("resultant contact force must have shape (N, 3)")
+    if summed_contact_load_n.shape != resultant_force_w.shape[:1]:
+        raise ValueError("summed contact load must have shape (N,)")
+    if not 0.0 <= soft_threshold_ratio < 1.0:
+        raise ValueError("force-imbalance threshold must lie in [0, 1)")
+    if not bool(torch.isfinite(resultant_force_w).all()) or not bool(
+        torch.isfinite(summed_contact_load_n).all()
+    ):
+        raise ValueError("force-imbalance inputs contain NaN or Inf")
+    if bool((summed_contact_load_n < 0.0).any()):
+        raise ValueError("summed contact load must be non-negative")
+
+    resultant_magnitude = torch.linalg.vector_norm(resultant_force_w, dim=-1)
+    ratio = torch.where(
+        summed_contact_load_n > 1.0e-6,
+        resultant_magnitude / summed_contact_load_n.clamp_min(1.0e-6),
+        torch.zeros_like(summed_contact_load_n),
+    ).clamp(0.0, 1.0)
+    normalized_excess = torch.relu(ratio - soft_threshold_ratio) / (
+        1.0 - soft_threshold_ratio
+    )
+    return normalized_excess.square(), ratio
+
+
 def gate_positive_progress(
     progress: torch.Tensor,
     grasp_quality: torch.Tensor,
