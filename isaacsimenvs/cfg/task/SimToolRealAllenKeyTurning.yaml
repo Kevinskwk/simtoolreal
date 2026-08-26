@@ -33,9 +33,14 @@ allen_turn_handle_approach_progress_weight: 20.0
 allen_turn_handle_approach_sigma_m: 0.10
 allen_turn_handle_proximity_penalty_weight: 0.05
 allen_turn_first_loaded_grasp_bonus: 10.0
-allen_turn_grasp_maintenance_reward_weight: 0.25
+allen_turn_grasp_maintenance_reward_weight: 0.0
+allen_turn_deep_grasp_reward_weight: 0.0
+allen_turn_contact_loss_grace_steps: 30
+allen_turn_productive_regrasp_window_steps: 180
+allen_turn_productive_regrasp_min_progress_deg: 10.0
+allen_turn_productive_regrasp_bonus: 25.0
 allen_turn_subgoal_bonus: 8.0
-allen_turn_full_turn_bonus: 100.0
+allen_turn_full_turn_bonus: 200.0
 allen_turn_regularization_scale_stages: [0.10, 0.25, 0.40, 0.55, 0.70, 0.85, 1.00]
 allen_turn_effort_soft_threshold_fraction: 0.45
 allen_turn_effort_penalty_weight: 2.0

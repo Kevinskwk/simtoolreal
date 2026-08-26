@@ -818,6 +818,12 @@ class SimToolRealAllenKeyTurningEnvCfg(SimToolRealTacMapEnvCfg):
     allen_turn_deep_grasp_minimum_contact_fingers: int = 3
     allen_turn_deep_grasp_maximum_opposition_cosine: float = -0.25
     allen_turn_deep_grasp_hold_steps: int = 10
+    # Permit a short intentional release without suppressing pose-progress
+    # shaping. A productive regrasp is rewarded only after deep reacquisition
+    # followed by measurable turning within the bounded event window.
+    allen_turn_contact_loss_grace_steps: int = 30
+    allen_turn_productive_regrasp_window_steps: int = 180
+    allen_turn_productive_regrasp_min_progress_deg: float = 10.0
     allen_turn_translational_force_soft_threshold_ratio: float = 0.20
     allen_turn_arm_table_contact_force_threshold_n: float = 0.5
     allen_turn_arm_table_contact_force_scale_n: float = 20.0
@@ -874,8 +880,9 @@ class SimToolRealAllenKeyTurningEnvCfg(SimToolRealTacMapEnvCfg):
     allen_turn_handle_approach_sigma_m: float = 0.10
     allen_turn_handle_proximity_penalty_weight: float = 0.05
     allen_turn_first_loaded_grasp_bonus: float = 10.0
-    allen_turn_grasp_maintenance_reward_weight: float = 0.25
-    allen_turn_deep_grasp_reward_weight: float = 1.0
+    allen_turn_grasp_maintenance_reward_weight: float = 0.0
+    allen_turn_deep_grasp_reward_weight: float = 0.0
+    allen_turn_productive_regrasp_bonus: float = 25.0
     allen_turn_translational_force_penalty_weight: float = 0.5
     allen_turn_arm_table_contact_penalty_weight: float = 2.0
     allen_turn_subgoal_bonus: float = 8.0

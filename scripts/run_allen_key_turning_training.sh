@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Finetune SimToolReal with grasp-qualified sustained Allen-key turning.
+# Finetune SimToolReal with event-gated Allen-key turning and regrasping.
 
 set -euo pipefail
 
@@ -11,7 +11,7 @@ NUM_ENVS="${NUM_ENVS:-12288}"
 MAX_EPOCHS="${MAX_EPOCHS:-12000}"
 SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-0}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
-WANDB_NAME="${WANDB_NAME:-allen_key_high_load_full_turn_${STAMP}}"
+WANDB_NAME="${WANDB_NAME:-allen_key_clean_regrasp_${STAMP}}"
 PRETRAINED_SAPG_GROUPS=6
 
 if [[ ! -f "${CHECKPOINT}" ]]; then

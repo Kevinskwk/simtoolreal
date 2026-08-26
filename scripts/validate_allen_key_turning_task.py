@@ -307,6 +307,7 @@ def main() -> None:
             "first_loaded_grasp_bonus",
             "grasp_maintenance_rew",
             "deep_grasp_rew",
+            "productive_regrasp_bonus",
             "keypoint_rew",
             "subgoal_bonus",
             "full_turn_bonus",
@@ -324,7 +325,7 @@ def main() -> None:
             )
         if not bool((inner._reward_terms["grasp_maintenance_rew"] == 0.0).all()):
             raise RuntimeError(
-                "grasp maintenance reward was active before confirmed acquisition"
+                "clean objective emitted a per-step grasp maintenance reward"
             )
         deep_tensors = (
             inner._turn_deep_grasp_quality,
@@ -338,8 +339,10 @@ def main() -> None:
             raise RuntimeError("Allen-key deep-grasp contact signals are non-finite")
         if not bool((inner._reward_terms["deep_grasp_rew"] == 0.0).all()):
             raise RuntimeError(
-                "deep-grasp reward was active without a confirmed acquisition"
+                "clean objective emitted a per-step deep-grasp reward"
             )
+        if not bool((inner._reward_terms["productive_regrasp_bonus"] == 0.0).all()):
+            raise RuntimeError("productive-regrasp bonus fired without a regrasp event")
         if not bool(
             (inner._reward_terms["translational_force_penalty"] == 0.0).all()
         ):

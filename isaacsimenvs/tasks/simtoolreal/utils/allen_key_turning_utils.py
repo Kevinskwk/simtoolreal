@@ -59,6 +59,80 @@ def update_unwrapped_angle(
     return cumulative_angle + delta, delta
 
 
+def update_productive_regrasp_state(
+    state: torch.Tensor,
+    steps_remaining: torch.Tensor,
+    progress_at_reacquisition: torch.Tensor,
+    signed_progress: torch.Tensor,
+    contact_lost: torch.Tensor,
+    contact_reacquired: torch.Tensor,
+    deep_grasp_confirmed: torch.Tensor,
+    turning: torch.Tensor,
+    *,
+    window_steps: int,
+    minimum_progress_rad: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Track loss -> reacquisition -> productive turning as a one-shot event.
+
+    States are 0 (inactive), 1 (waiting for reacquisition), and 2 (waiting
+    for post-reacquisition progress). A new loss restarts the bounded window.
+    """
+    shape = state.shape
+    if (
+        state.dtype != torch.long
+        or steps_remaining.dtype != torch.long
+        or steps_remaining.shape != shape
+    ):
+        raise ValueError("regrasp state and timer must be integer tensors")
+    boolean_inputs = (
+        contact_lost,
+        contact_reacquired,
+        deep_grasp_confirmed,
+        turning,
+    )
+    if any(value.shape != shape or value.dtype != torch.bool for value in boolean_inputs):
+        raise ValueError("regrasp event flags must be matching boolean tensors")
+    if progress_at_reacquisition.shape != shape or signed_progress.shape != shape:
+        raise ValueError("regrasp progress tensors must match state shape")
+    if not bool(torch.isfinite(progress_at_reacquisition).all()) or not bool(
+        torch.isfinite(signed_progress).all()
+    ):
+        raise ValueError("regrasp progress tensors must be finite")
+    if window_steps <= 0 or not math.isfinite(minimum_progress_rad) or minimum_progress_rad <= 0.0:
+        raise ValueError("regrasp window and progress threshold must be positive")
+    if bool(((state < 0) | (state > 2)).any()):
+        raise ValueError("regrasp state must lie in [0, 2]")
+
+    next_state = state.clone()
+    next_timer = torch.where(
+        state > 0,
+        (steps_remaining - 1).clamp_min(0),
+        torch.zeros_like(steps_remaining),
+    )
+    next_baseline = progress_at_reacquisition.clone()
+    expired = (next_state > 0) & (next_timer == 0)
+    next_state[expired] = 0
+
+    new_loss = turning & contact_lost
+    next_state[new_loss] = 1
+    next_timer[new_loss] = int(window_steps)
+    next_baseline[new_loss] = signed_progress[new_loss]
+
+    reacquired = turning & (next_state == 1) & contact_reacquired
+    next_state[reacquired] = 2
+    next_baseline[reacquired] = signed_progress[reacquired]
+
+    productive = (
+        turning
+        & (next_state == 2)
+        & deep_grasp_confirmed
+        & ((signed_progress - next_baseline) >= float(minimum_progress_rad))
+    )
+    next_state[productive] = 0
+    next_timer[productive] = 0
+    return next_state, next_timer, next_baseline, productive
+
+
 def stick_slip_torsional_friction(
     angular_displacement: torch.Tensor,
     angular_velocity: torch.Tensor,

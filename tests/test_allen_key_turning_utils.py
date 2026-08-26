@@ -277,6 +277,58 @@ def test_grasp_hold_resets_immediately_after_invalid_step():
     assert not bool(just_confirmed.item())
 
 
+def test_productive_regrasp_requires_release_reacquisition_and_progress():
+    state = torch.zeros(1, dtype=torch.long)
+    timer = torch.zeros(1, dtype=torch.long)
+    baseline = torch.zeros(1)
+
+    def update(progress, *, lost=False, reacquired=False, deep=False):
+        nonlocal state, timer, baseline
+        state, timer, baseline, event = module.update_productive_regrasp_state(
+            state,
+            timer,
+            baseline,
+            torch.tensor([math.radians(progress)]),
+            torch.tensor([lost]),
+            torch.tensor([reacquired]),
+            torch.tensor([deep]),
+            torch.tensor([True]),
+            window_steps=20,
+            minimum_progress_rad=math.radians(10.0),
+        )
+        return bool(event.item())
+
+    assert not update(20.0, lost=True)
+    assert state.item() == 1
+    assert not update(22.0, reacquired=True, deep=True)
+    assert state.item() == 2
+    assert not update(30.0, deep=True)
+    assert update(32.1, deep=True)
+    assert state.item() == 0
+    assert not update(45.0, reacquired=True, deep=True)
+
+
+def test_productive_regrasp_expires_without_deep_productive_turning():
+    state = torch.tensor([1, 2], dtype=torch.long)
+    timer = torch.tensor([1, 2], dtype=torch.long)
+    baseline = torch.tensor([0.0, 0.0])
+    next_state, next_timer, _, event = module.update_productive_regrasp_state(
+        state,
+        timer,
+        baseline,
+        torch.tensor([0.0, math.radians(20.0)]),
+        torch.tensor([False, False]),
+        torch.tensor([False, False]),
+        torch.tensor([False, False]),
+        torch.tensor([True, True]),
+        window_steps=20,
+        minimum_progress_rad=math.radians(10.0),
+    )
+    assert next_state.tolist() == [0, 2]
+    assert next_timer.tolist() == [0, 1]
+    assert not bool(event.any())
+
+
 def test_curriculum_requires_both_acquisition_and_conditional_turning():
     ready, acquisition, conditional = module.turning_curriculum_ready(
         700,

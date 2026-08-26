@@ -21,12 +21,12 @@ from .utils.action_utils import apply_action_pipeline
 from .utils.allen_key_turning_utils import (
     deep_grasp_quality,
     finger_effort_soft_penalty,
-    gate_positive_progress,
     loaded_grasp_quality,
     stick_slip_torsional_friction,
     translational_force_imbalance_penalty,
     turn_goal_pose,
     update_consecutive_grasp_hold,
+    update_productive_regrasp_state,
     update_unwrapped_angle,
     wrap_to_pi,
     yaw_from_quaternion,
@@ -200,6 +200,20 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         self._turn_previous_stable_grasp = torch.zeros(n, dtype=torch.bool, device=device)
         self._turn_contact_losses = torch.zeros(n, dtype=torch.long, device=device)
         self._turn_contact_reacquisitions = torch.zeros(n, dtype=torch.long, device=device)
+        self._turn_contact_loss_grace_remaining = torch.zeros(
+            n, dtype=torch.long, device=device
+        )
+        self._turn_regrasp_state = torch.zeros(n, dtype=torch.long, device=device)
+        self._turn_regrasp_steps_remaining = torch.zeros(
+            n, dtype=torch.long, device=device
+        )
+        self._turn_regrasp_progress_at_reacquisition = torch.zeros(n, device=device)
+        self._turn_just_productive_regrasp = torch.zeros(
+            n, dtype=torch.bool, device=device
+        )
+        self._turn_productive_regrasps = torch.zeros(
+            n, dtype=torch.long, device=device
+        )
         self._turn_arm_joint_margin = torch.zeros(n, device=device)
         self._turn_initial_shoulder_to_handle_m = torch.zeros(n, device=device)
 
@@ -356,6 +370,22 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
             raise ValueError("Allen-key deep grasp must require three to five fingers")
         if int(cfg.allen_turn_deep_grasp_hold_steps) <= 0:
             raise ValueError("Allen-key deep-grasp hold steps must be positive")
+        if int(cfg.allen_turn_contact_loss_grace_steps) <= 0:
+            raise ValueError("Allen-key contact-loss grace steps must be positive")
+        if int(cfg.allen_turn_productive_regrasp_window_steps) <= 0:
+            raise ValueError("Allen-key productive-regrasp window must be positive")
+        if not math.isfinite(float(
+            cfg.allen_turn_productive_regrasp_min_progress_deg
+        )) or float(cfg.allen_turn_productive_regrasp_min_progress_deg) <= 0.0:
+            raise ValueError("Allen-key productive-regrasp progress must be positive")
+        if float(cfg.allen_turn_grasp_maintenance_reward_weight) != 0.0:
+            raise ValueError(
+                "clean Allen-key objective requires zero per-step grasp maintenance reward"
+            )
+        if float(cfg.allen_turn_deep_grasp_reward_weight) != 0.0:
+            raise ValueError(
+                "clean Allen-key objective requires zero per-step deep-grasp reward"
+            )
         if not -1.0 <= float(
             cfg.allen_turn_deep_grasp_maximum_opposition_cosine
         ) < 1.0:
@@ -409,6 +439,7 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
             cfg.allen_turn_first_loaded_grasp_bonus,
             cfg.allen_turn_grasp_maintenance_reward_weight,
             cfg.allen_turn_deep_grasp_reward_weight,
+            cfg.allen_turn_productive_regrasp_bonus,
             cfg.allen_turn_translational_force_penalty_weight,
             cfg.allen_turn_arm_table_contact_penalty_weight,
             cfg.allen_turn_subgoal_bonus,
@@ -817,6 +848,12 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         self._turn_previous_stable_grasp[env_ids] = False
         self._turn_contact_losses[env_ids] = 0
         self._turn_contact_reacquisitions[env_ids] = 0
+        self._turn_contact_loss_grace_remaining[env_ids] = 0
+        self._turn_regrasp_state[env_ids] = 0
+        self._turn_regrasp_steps_remaining[env_ids] = 0
+        self._turn_regrasp_progress_at_reacquisition[env_ids] = 0.0
+        self._turn_just_productive_regrasp[env_ids] = False
+        self._turn_productive_regrasps[env_ids] = 0
         self._turn_arm_joint_margin[env_ids] = 0.0
         self._turn_initial_shoulder_to_handle_m[env_ids] = shoulder_reach
         self._turn_state_obs[env_ids] = 0.0
@@ -1463,6 +1500,51 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         )
         self._turn_contact_losses += contact_lost.long()
         self._turn_contact_reacquisitions += contact_reacquired.long()
+        turning = self._turn_phase == 1
+        qualifying_loss = contact_lost & self._turn_ever_loaded_grasp & turning
+        qualifying_reacquisition = (
+            contact_reacquired
+            & (self._turn_contact_loss_grace_remaining > 0)
+            & turning
+        )
+        self._turn_contact_loss_grace_remaining.copy_(torch.where(
+            qualifying_loss,
+            torch.full_like(
+                self._turn_contact_loss_grace_remaining,
+                int(self.cfg.allen_turn_contact_loss_grace_steps),
+            ),
+            torch.where(
+                self._turn_stable_grasp,
+                torch.zeros_like(self._turn_contact_loss_grace_remaining),
+                (self._turn_contact_loss_grace_remaining - 1).clamp_min(0),
+            ),
+        ))
+        (
+            regrasp_state,
+            regrasp_steps_remaining,
+            regrasp_progress_at_reacquisition,
+            just_productive_regrasp,
+        ) = update_productive_regrasp_state(
+            self._turn_regrasp_state,
+            self._turn_regrasp_steps_remaining,
+            self._turn_regrasp_progress_at_reacquisition,
+            self._turn_direction * self._turn_cumulative_angle,
+            qualifying_loss,
+            qualifying_reacquisition,
+            self._turn_deep_grasp_confirmed,
+            turning,
+            window_steps=int(self.cfg.allen_turn_productive_regrasp_window_steps),
+            minimum_progress_rad=math.radians(float(
+                self.cfg.allen_turn_productive_regrasp_min_progress_deg
+            )),
+        )
+        self._turn_regrasp_state.copy_(regrasp_state)
+        self._turn_regrasp_steps_remaining.copy_(regrasp_steps_remaining)
+        self._turn_regrasp_progress_at_reacquisition.copy_(
+            regrasp_progress_at_reacquisition
+        )
+        self._turn_just_productive_regrasp.copy_(just_productive_regrasp)
+        self._turn_productive_regrasps += just_productive_regrasp.long()
         self._turn_previous_contact_code.copy_(contact_code)
         self._turn_previous_stable_grasp.copy_(self._turn_stable_grasp)
         arm_position = self.robot.data.joint_pos[:, self._arm_joint_ids]
@@ -1493,6 +1575,7 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         at_subgoal = (
             turning
             & (self._turn_angle_error.abs() <= tolerance)
+            & self._turn_deep_grasp_confirmed
         )
         self._turn_subgoal_hold.copy_(torch.where(
             at_subgoal,
@@ -1658,6 +1741,9 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
             "allen_turn_contact_reacquisitions": (
                 self._turn_contact_reacquisitions.float()
             ),
+            "allen_turn_productive_regrasps": (
+                self._turn_productive_regrasps.float()
+            ),
             "allen_turn_arm_joint_margin_rad": self._turn_arm_joint_margin,
         }
         self._update_curriculum(done)
@@ -1677,21 +1763,13 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
             base_terms[name] = torch.zeros_like(base_terms[name])
         self._lifted_object.copy_(self._turn_ever_loaded_grasp)
 
-        # Keep the original SimToolReal pose objective. Positive progress and
-        # goal bonuses require a currently maintained whole-hand grasp; pose
-        # regression remains fully negative.
-        for name in ("keypoint_rew", "bonus_rew"):
-            raw_term = base_terms[name]
-            qualified_term = gate_positive_progress(
-                raw_term,
-                self._turn_grasp_quality * self._turn_ever_loaded_grasp.float(),
-            )
-            base_reward = base_reward - raw_term + qualified_term
-            base_terms[name] = qualified_term
+        # Keep SimToolReal's dense pose objective independent of contact.
+        # Grasp validity is enforced only at subgoal/final completion and for
+        # the productive-regrasp event, avoiding a per-step hold incentive.
         self._turn_qualified_progress.copy_(base_terms["keypoint_rew"])
         self._turn_unqualified_positive_progress.copy_(
-            torch.relu(self._reward_terms["keypoint_rew"])
-            * (1.0 - self._turn_grasp_quality)
+            torch.relu(base_terms["keypoint_rew"])
+            * (~self._turn_deep_grasp_confirmed).float()
         )
 
         regularization_scale = float(
@@ -1731,6 +1809,10 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
                 * self._turn_deep_grasp_quality
                 * execution_phase.float()
                 * self._turn_ever_loaded_grasp.float()
+            ),
+            "productive_regrasp_bonus": (
+                float(self.cfg.allen_turn_productive_regrasp_bonus)
+                * self._turn_just_productive_regrasp.float()
             ),
             "subgoal_bonus": (
                 float(self.cfg.allen_turn_subgoal_bonus)
@@ -1880,6 +1962,21 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
             "allen_turn/contact_losses_mean": self._turn_contact_losses.float().mean(),
             "allen_turn/contact_reacquisitions_mean": (
                 self._turn_contact_reacquisitions.float().mean()
+            ),
+            "allen_turn/contact_loss_grace_ratio": (
+                (self._turn_contact_loss_grace_remaining > 0).float().mean()
+            ),
+            "allen_turn/regrasp_waiting_for_contact_ratio": (
+                (self._turn_regrasp_state == 1).float().mean()
+            ),
+            "allen_turn/regrasp_waiting_for_progress_ratio": (
+                (self._turn_regrasp_state == 2).float().mean()
+            ),
+            "allen_turn/productive_regrasp_event_ratio": (
+                self._turn_just_productive_regrasp.float().mean()
+            ),
+            "allen_turn/productive_regrasps_mean": (
+                self._turn_productive_regrasps.float().mean()
             ),
             "allen_turn/arm_joint_margin_mean_rad": self._turn_arm_joint_margin.mean(),
             "allen_turn/constraint_position_error_mean_m": (
