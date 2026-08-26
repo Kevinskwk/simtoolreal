@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import torch
 from isaaclab.sensors import ContactSensor, ContactSensorCfg
@@ -234,6 +235,16 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
 
     @staticmethod
     def _validate_cfg(cfg: SimToolRealAllenKeyTurningEnvCfg) -> None:
+        expected_table = (
+            Path(__file__).resolve().parents[3]
+            / "assets" / "urdf" / "table_allen_turning.urdf"
+        ).resolve()
+        configured_table = Path(cfg.assets.table_urdf).resolve()
+        if configured_table != expected_table:
+            raise ValueError(
+                "Allen-key turning requires the physical turning table: "
+                f"configured={configured_table}, expected={expected_table}"
+            )
         if tuple(cfg.allen_turn_screw_axis_tool) != (0.0, 0.0, -1.0):
             raise ValueError("Allen-key turning currently requires canonical local -Z screw axis")
         total_rotation_deg = int(cfg.allen_turn_goal_count) * float(

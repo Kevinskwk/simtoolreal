@@ -1803,6 +1803,7 @@ def setup_scene(env) -> None:
         scale_range_x == (1.0, 1.0) and scale_range_y == (1.0, 1.0)
     ) or n_table_variants <= 1
     if table_scale_is_trivial:
+        env._table_urdf_paths = [str(Path(assets_cfg.table_urdf).resolve())]
         table_usd_paths = [_bake_usd(
             _convert_urdf_to_usd(assets_cfg.table_urdf, usd_work_dir, fix_base=False),
             bake_root, "table",
@@ -1827,6 +1828,7 @@ def setup_scene(env) -> None:
             seed=0,
         )
         env._table_variant_scales = list(variant_scales)
+        env._table_urdf_paths = list(variant_urdf_paths)
         table_usd_paths = [
             _bake_usd(
                 _convert_urdf_to_usd(p, usd_work_dir, fix_base=False),

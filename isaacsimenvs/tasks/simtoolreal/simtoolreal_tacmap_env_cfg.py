@@ -724,7 +724,7 @@ class SimToolRealAllenKeyTurningEnvCfg(SimToolRealTacMapEnvCfg):
     assets: AssetsCfg = AssetsCfg(
         table_urdf=str(
             Path(__file__).resolve().parents[3]
-            / "assets" / "urdf" / "table_allen_disabled.urdf"
+            / "assets" / "urdf" / "table_allen_turning.urdf"
         ),
         workpiece_urdf=str(
             Path(__file__).resolve().parents[3]

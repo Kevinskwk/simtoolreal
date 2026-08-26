@@ -6,7 +6,7 @@ enable_fingertip_tool_contact_sensors: false
 enable_palm_tool_contact_sensor: true
 
 assets:
-  table_urdf: assets/urdf/table_allen_disabled.urdf
+  table_urdf: assets/urdf/table_allen_turning.urdf
   workpiece_urdf: assets/urdf/workpieces/allen_key_hex_socket.urdf
   workpiece_collision_enabled: false
   handle_head_types: [screwdriver]
