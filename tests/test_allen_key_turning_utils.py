@@ -187,6 +187,48 @@ def test_loaded_grasp_requires_palm_multifinger_contact_and_low_slip():
     assert quality[3].item() == pytest.approx(0.0)
 
 
+def test_deep_grasp_requires_thumb_opposition_and_inner_hand_support():
+    contacts = torch.tensor(
+        [
+            [True, True, True, False, False],
+            [True, True, True, False, False],
+            [False, True, True, True, False],
+            [True, True, True, False, False],
+        ]
+    )
+    proximal = torch.tensor(
+        [
+            [False, True, False, False, False],
+            [False, False, False, False, False],
+            [False, True, False, False, False],
+            [False, True, False, False, False],
+        ]
+    )
+    forces = torch.zeros(4, 5, 3)
+    forces[:, 0, 0] = 1.0
+    forces[:, 1, 0] = -0.5
+    forces[:, 2, 0] = -0.5
+    forces[3, 1:3, 0] = 0.5
+    quality, valid, cosine = module.deep_grasp_quality(
+        contacts,
+        proximal,
+        torch.tensor([False, False, True, False]),
+        forces,
+        torch.zeros(4),
+        torch.zeros(4),
+        minimum_contact_fingers=3,
+        maximum_opposition_cosine=-0.25,
+        maximum_relative_linear_speed_mps=0.08,
+        maximum_relative_angular_speed_radps=2.0,
+    )
+    assert valid.tolist() == [True, False, False, False]
+    assert quality[0].item() == pytest.approx(1.0)
+    assert quality[1].item() == pytest.approx(0.0)
+    assert quality[2].item() == pytest.approx(0.0)
+    assert quality[3].item() == pytest.approx(0.0)
+    assert cosine.tolist() == pytest.approx([-1.0, -1.0, 1.0, 1.0])
+
+
 def test_progress_gate_blocks_ungrasped_gain_but_keeps_regression_penalty():
     gated = module.gate_positive_progress(
         torch.tensor([1.0, 1.0, -1.0, -1.0]),

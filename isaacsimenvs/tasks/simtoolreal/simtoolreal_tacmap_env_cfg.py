@@ -805,6 +805,11 @@ class SimToolRealAllenKeyTurningEnvCfg(SimToolRealTacMapEnvCfg):
     allen_turn_palm_contact_threshold_n: float = 0.05
     allen_turn_max_relative_linear_speed_mps: float = 0.08
     allen_turn_max_relative_angular_speed_radps: float = 2.0
+    # A deep grasp excludes unilateral finger pushing. It requires thumb and
+    # opposing-finger force closure plus actual palm/proximal-link support.
+    allen_turn_deep_grasp_minimum_contact_fingers: int = 3
+    allen_turn_deep_grasp_maximum_opposition_cosine: float = -0.25
+    allen_turn_deep_grasp_hold_steps: int = 10
 
     # Keep the graspable long-handle center in the original SimToolReal XY
     # reset range. The Z ranges below refer to the screw pivot; the horizontal
@@ -859,6 +864,7 @@ class SimToolRealAllenKeyTurningEnvCfg(SimToolRealTacMapEnvCfg):
     allen_turn_handle_proximity_penalty_weight: float = 0.05
     allen_turn_first_loaded_grasp_bonus: float = 10.0
     allen_turn_grasp_maintenance_reward_weight: float = 0.25
+    allen_turn_deep_grasp_reward_weight: float = 1.0
     allen_turn_subgoal_bonus: float = 8.0
     allen_turn_full_turn_bonus: float = 100.0
 

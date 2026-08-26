@@ -227,7 +227,10 @@ def loaded_grasp_quality(
         raise ValueError("loaded-grasp inputs must have matching shapes")
     if minimum_contact_fingers <= 0:
         raise ValueError("loaded grasp requires at least one finger")
-    if maximum_relative_linear_speed_mps <= 0.0 or maximum_relative_angular_speed_radps <= 0.0:
+    if (
+        maximum_relative_linear_speed_mps <= 0.0
+        or maximum_relative_angular_speed_radps <= 0.0
+    ):
         raise ValueError("loaded-grasp slip limits must be positive")
     if any(
         not bool(torch.isfinite(value).all())
@@ -258,6 +261,105 @@ def loaded_grasp_quality(
         & (relative_angular_speed_radps <= maximum_relative_angular_speed_radps)
     )
     return quality, valid
+
+
+def deep_grasp_quality(
+    finger_contact: torch.Tensor,
+    proximal_finger_contact: torch.Tensor,
+    palm_contact: torch.Tensor,
+    finger_force_w: torch.Tensor,
+    relative_linear_speed_mps: torch.Tensor,
+    relative_angular_speed_radps: torch.Tensor,
+    *,
+    minimum_contact_fingers: int,
+    maximum_opposition_cosine: float,
+    maximum_relative_linear_speed_mps: float,
+    maximum_relative_angular_speed_radps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Score a deep, opposed whole-hand grasp rather than unilateral pushing.
+
+    Finger index zero is the thumb. A valid grasp requires the thumb, at least
+    one opposing finger, physical palm or proximal-link support, opposed thumb
+    and finger normal forces, and low palm-tool slip.
+    """
+    if finger_contact.ndim != 2 or finger_contact.shape[1] != 5:
+        raise ValueError("deep-grasp finger contact must have shape (N, 5)")
+    if (
+        proximal_finger_contact.shape != finger_contact.shape
+        or proximal_finger_contact.dtype != torch.bool
+        or finger_contact.dtype != torch.bool
+    ):
+        raise ValueError("deep-grasp contact masks must be matching boolean tensors")
+    if finger_force_w.shape != (*finger_contact.shape, 3):
+        raise ValueError("deep-grasp finger force must have shape (N, 5, 3)")
+    shape = finger_contact.shape[:1]
+    if (
+        palm_contact.shape != shape
+        or palm_contact.dtype != torch.bool
+        or relative_linear_speed_mps.shape != shape
+        or relative_angular_speed_radps.shape != shape
+    ):
+        raise ValueError("deep-grasp per-environment inputs have invalid shapes")
+    if not 3 <= minimum_contact_fingers <= 5:
+        raise ValueError("deep grasp requires between three and five fingers")
+    if not -1.0 <= maximum_opposition_cosine < 1.0:
+        raise ValueError("deep-grasp opposition cosine must lie in [-1, 1)")
+    if maximum_relative_linear_speed_mps <= 0.0 or maximum_relative_angular_speed_radps <= 0.0:
+        raise ValueError("deep-grasp slip limits must be positive")
+    if not bool(torch.isfinite(finger_force_w).all()) or not bool(
+        torch.isfinite(relative_linear_speed_mps).all()
+    ) or not bool(torch.isfinite(relative_angular_speed_radps).all()):
+        raise ValueError("deep-grasp inputs contain NaN or Inf")
+
+    contact_count = finger_contact.sum(-1)
+    thumb_contact = finger_contact[:, 0]
+    opposing_finger_contact = finger_contact[:, 1:].any(-1)
+    inner_hand_support = palm_contact | proximal_finger_contact.any(-1)
+
+    thumb_force = finger_force_w[:, 0]
+    opposing_force = finger_force_w[:, 1:].sum(1)
+    thumb_norm = torch.linalg.vector_norm(thumb_force, dim=-1)
+    opposing_norm = torch.linalg.vector_norm(opposing_force, dim=-1)
+    force_pair_valid = thumb_contact & opposing_finger_contact & (
+        thumb_norm > 1.0e-6
+    ) & (opposing_norm > 1.0e-6)
+    cosine = (thumb_force * opposing_force).sum(-1) / (
+        thumb_norm * opposing_norm
+    ).clamp_min(1.0e-12)
+    cosine = torch.where(
+        force_pair_valid, cosine.clamp(-1.0, 1.0), torch.ones_like(cosine)
+    )
+    opposition_quality = ((1.0 - cosine) * 0.5).clamp(0.0, 1.0)
+
+    contact_quality = (
+        contact_count.float() / float(minimum_contact_fingers)
+    ).clamp(0.0, 1.0)
+    linear_quality = (
+        1.0 - relative_linear_speed_mps / maximum_relative_linear_speed_mps
+    ).clamp(0.0, 1.0)
+    angular_quality = (
+        1.0 - relative_angular_speed_radps / maximum_relative_angular_speed_radps
+    ).clamp(0.0, 1.0)
+    topology_quality = (
+        thumb_contact & opposing_finger_contact & inner_hand_support
+    ).float()
+    quality = (
+        contact_quality
+        * topology_quality
+        * opposition_quality
+        * torch.sqrt(linear_quality * angular_quality)
+    )
+    valid = (
+        (contact_count >= minimum_contact_fingers)
+        & thumb_contact
+        & opposing_finger_contact
+        & inner_hand_support
+        & force_pair_valid
+        & (cosine <= maximum_opposition_cosine)
+        & (relative_linear_speed_mps <= maximum_relative_linear_speed_mps)
+        & (relative_angular_speed_radps <= maximum_relative_angular_speed_radps)
+    )
+    return quality, valid, cosine
 
 
 def gate_positive_progress(

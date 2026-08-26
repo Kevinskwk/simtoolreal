@@ -18,6 +18,7 @@ from .simtoolreal_tacmap_env import SimToolRealTacMapEnv
 from .simtoolreal_tacmap_env_cfg import SimToolRealAllenKeyTurningEnvCfg
 from .utils.action_utils import apply_action_pipeline
 from .utils.allen_key_turning_utils import (
+    deep_grasp_quality,
     finger_effort_soft_penalty,
     gate_positive_progress,
     loaded_grasp_quality,
@@ -105,7 +106,11 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         self._turn_subgoal_potential_progress = torch.zeros(n, device=device)
 
         self._turn_finger_force_n = torch.zeros(n, 5, device=device)
+        self._turn_finger_force_w = torch.zeros(n, 5, 3, device=device)
         self._turn_finger_contact = torch.zeros(n, 5, dtype=torch.bool, device=device)
+        self._turn_proximal_finger_contact = torch.zeros(
+            n, 5, dtype=torch.bool, device=device
+        )
         self._turn_palm_force_n = torch.zeros(n, device=device)
         self._turn_palm_contact = torch.zeros(n, dtype=torch.bool, device=device)
         self._turn_palm_supported = torch.zeros(n, dtype=torch.bool, device=device)
@@ -117,6 +122,16 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         self._turn_ever_loaded_grasp = torch.zeros(n, dtype=torch.bool, device=device)
         self._turn_just_loaded_grasp = torch.zeros(n, dtype=torch.bool, device=device)
         self._turn_grasp_hold_count = torch.zeros(n, dtype=torch.long, device=device)
+        self._turn_deep_grasp = torch.zeros(n, dtype=torch.bool, device=device)
+        self._turn_deep_grasp_confirmed = torch.zeros(
+            n, dtype=torch.bool, device=device
+        )
+        self._turn_deep_grasp_hold_count = torch.zeros(
+            n, dtype=torch.long, device=device
+        )
+        self._turn_deep_grasp_quality = torch.zeros(n, device=device)
+        self._turn_deep_grasp_opposition_cosine = torch.ones(n, device=device)
+        self._turn_max_deep_grasp_quality = torch.zeros(n, device=device)
         self._turn_relative_linear_speed = torch.zeros(n, device=device)
         self._turn_relative_angular_speed = torch.zeros(n, device=device)
         self._turn_palm_handle_distance = torch.zeros(n, device=device)
@@ -305,6 +320,14 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
             raise ValueError("Allen-key loaded grasp requires at least one finger")
         if int(cfg.allen_turn_acquisition_hold_steps) <= 0:
             raise ValueError("Allen-key acquisition hold steps must be positive")
+        if not 3 <= int(cfg.allen_turn_deep_grasp_minimum_contact_fingers) <= 5:
+            raise ValueError("Allen-key deep grasp must require three to five fingers")
+        if int(cfg.allen_turn_deep_grasp_hold_steps) <= 0:
+            raise ValueError("Allen-key deep-grasp hold steps must be positive")
+        if not -1.0 <= float(
+            cfg.allen_turn_deep_grasp_maximum_opposition_cosine
+        ) < 1.0:
+            raise ValueError("Allen-key deep-grasp opposition cosine is invalid")
         finger_groups = tuple(cfg.allen_turn_finger_tool_contact_prim_paths)
         if len(finger_groups) != 5 or any(not group for group in finger_groups):
             raise ValueError(
@@ -332,6 +355,7 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
             cfg.allen_turn_handle_proximity_penalty_weight,
             cfg.allen_turn_first_loaded_grasp_bonus,
             cfg.allen_turn_grasp_maintenance_reward_weight,
+            cfg.allen_turn_deep_grasp_reward_weight,
             cfg.allen_turn_subgoal_bonus,
             cfg.allen_turn_full_turn_bonus,
             cfg.allen_turn_effort_penalty_weight,
@@ -653,6 +677,12 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         self._turn_ever_loaded_grasp[env_ids] = False
         self._turn_just_loaded_grasp[env_ids] = False
         self._turn_grasp_hold_count[env_ids] = 0
+        self._turn_deep_grasp[env_ids] = False
+        self._turn_deep_grasp_confirmed[env_ids] = False
+        self._turn_deep_grasp_hold_count[env_ids] = 0
+        self._turn_deep_grasp_quality[env_ids] = 0.0
+        self._turn_deep_grasp_opposition_cosine[env_ids] = 1.0
+        self._turn_max_deep_grasp_quality[env_ids] = 0.0
         self._turn_palm_handle_distance[env_ids] = 0.0
         self._turn_min_palm_handle_distance[env_ids] = float("inf")
         self._turn_max_finger_contact_count[env_ids] = 0
@@ -925,8 +955,12 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
                 "Allen-key turning requires five nonempty finger contact-sensor groups"
             )
         forces = []
+        force_vectors = []
+        proximal_contacts = []
         for finger_id, finger_sensors in enumerate(sensors):
             finger_force = torch.zeros(self.num_envs, device=self.device)
+            finger_force_w = torch.zeros(self.num_envs, 3, device=self.device)
+            proximal_force = torch.zeros(self.num_envs, device=self.device)
             for link_id, sensor in enumerate(finger_sensors):
                 matrix = getattr(
                     getattr(sensor, "data", None), "force_matrix_w", None
@@ -941,20 +975,36 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
                         "Allen-key finger contact sensor has invalid matrix: "
                         f"finger={finger_id}, link={link_id}, shape={shape}"
                     )
-                link_force = torch.linalg.vector_norm(
-                    matrix.reshape(self.num_envs, -1, 3), dim=-1
-                ).sum(-1)
+                pair_forces = matrix.reshape(self.num_envs, -1, 3)
+                link_force = torch.linalg.vector_norm(pair_forces, dim=-1).sum(-1)
+                link_force_w = pair_forces.sum(1)
                 if not bool(torch.isfinite(link_force).all()):
                     raise RuntimeError(
                         "Allen-key finger contact sensor is non-finite: "
                         f"finger={finger_id}, link={link_id}"
                     )
                 finger_force += link_force
+                finger_force_w += link_force_w
+                prim_path = self.cfg.allen_turn_finger_tool_contact_prim_paths[
+                    finger_id
+                ][link_id]
+                link_name = prim_path.rsplit("/", 1)[-1]
+                if link_name.endswith(("_MC", "_PP", "_MP")):
+                    proximal_force += link_force
             forces.append(finger_force)
+            force_vectors.append(finger_force_w)
+            proximal_contacts.append(
+                proximal_force
+                >= float(self.cfg.allen_turn_contact_force_threshold_n)
+            )
         self._turn_finger_force_n.copy_(torch.stack(forces, dim=-1))
+        self._turn_finger_force_w.copy_(torch.stack(force_vectors, dim=1))
         self._turn_finger_contact.copy_(
             self._turn_finger_force_n
             >= float(self.cfg.allen_turn_contact_force_threshold_n)
+        )
+        self._turn_proximal_finger_contact.copy_(
+            torch.stack(proximal_contacts, dim=-1)
         )
 
         matrix = getattr(
@@ -1127,6 +1177,41 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         self._turn_grasp_hold_count.copy_(hold_count)
         self._turn_just_loaded_grasp.copy_(just_confirmed)
         self._turn_ever_loaded_grasp |= just_confirmed
+        deep_quality, deep_grasp, opposition_cosine = deep_grasp_quality(
+            self._turn_finger_contact,
+            self._turn_proximal_finger_contact,
+            self._turn_palm_contact,
+            self._turn_finger_force_w,
+            self._turn_relative_linear_speed,
+            self._turn_relative_angular_speed,
+            minimum_contact_fingers=int(
+                self.cfg.allen_turn_deep_grasp_minimum_contact_fingers
+            ),
+            maximum_opposition_cosine=float(
+                self.cfg.allen_turn_deep_grasp_maximum_opposition_cosine
+            ),
+            maximum_relative_linear_speed_mps=float(
+                self.cfg.allen_turn_max_relative_linear_speed_mps
+            ),
+            maximum_relative_angular_speed_radps=float(
+                self.cfg.allen_turn_max_relative_angular_speed_radps
+            ),
+        )
+        self._turn_deep_grasp.copy_(deep_grasp)
+        self._turn_deep_grasp_quality.copy_(deep_quality)
+        self._turn_deep_grasp_opposition_cosine.copy_(opposition_cosine)
+        self._turn_max_deep_grasp_quality.copy_(torch.maximum(
+            self._turn_max_deep_grasp_quality, deep_quality
+        ))
+        self._turn_deep_grasp_hold_count.copy_(torch.where(
+            deep_grasp,
+            self._turn_deep_grasp_hold_count + 1,
+            torch.zeros_like(self._turn_deep_grasp_hold_count),
+        ))
+        self._turn_deep_grasp_confirmed.copy_(
+            self._turn_deep_grasp_hold_count
+            >= int(self.cfg.allen_turn_deep_grasp_hold_steps)
+        )
         approach_sigma = float(self.cfg.allen_turn_handle_approach_sigma_m)
         palm_approach_potential = torch.exp(-palm_distance / approach_sigma)
         fingertip_approach_potential = torch.exp(
@@ -1206,8 +1291,6 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         at_subgoal = (
             turning
             & (self._turn_angle_error.abs() <= tolerance)
-            & self._turn_loaded_grasp
-            & self._turn_ever_loaded_grasp
         )
         self._turn_subgoal_hold.copy_(torch.where(
             at_subgoal,
@@ -1244,7 +1327,7 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         final_valid = (
             holding
             & ((final_target - self._turn_cumulative_angle).abs() <= tolerance)
-            & self._turn_loaded_grasp
+            & self._turn_deep_grasp_confirmed
             & self._turn_ever_loaded_grasp
         )
         self._turn_final_hold_valid.copy_(final_valid)
@@ -1335,6 +1418,10 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
             "allen_turn_ever_loaded_grasp": self._turn_ever_loaded_grasp.float(),
             "allen_turn_loaded_grasp_at_end": self._turn_loaded_grasp.float(),
             "allen_turn_max_grasp_quality": self._turn_max_grasp_quality,
+            "allen_turn_deep_grasp_at_end": self._turn_deep_grasp.float(),
+            "allen_turn_max_deep_grasp_quality": (
+                self._turn_max_deep_grasp_quality
+            ),
             "allen_turn_ever_palm_contact": self._turn_ever_palm_contact.float(),
             "allen_turn_min_palm_handle_distance_m": (
                 self._turn_min_palm_handle_distance
@@ -1427,9 +1514,16 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
                 * execution_phase.float()
                 * self._turn_ever_loaded_grasp.float()
             ),
+            "deep_grasp_rew": (
+                float(self.cfg.allen_turn_deep_grasp_reward_weight)
+                * self._turn_deep_grasp_quality
+                * execution_phase.float()
+                * self._turn_ever_loaded_grasp.float()
+            ),
             "subgoal_bonus": (
                 float(self.cfg.allen_turn_subgoal_bonus)
                 * self._turn_just_subgoal.float()
+                * self._turn_deep_grasp_quality
             ),
             "full_turn_bonus": (
                 float(self.cfg.allen_turn_full_turn_bonus)
@@ -1461,6 +1555,22 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
             "allen_turn/stable_grasp_ratio": self._turn_stable_grasp.float().mean(),
             "allen_turn/loaded_grasp_ratio": self._turn_loaded_grasp.float().mean(),
             "allen_turn/grasp_quality_mean": self._turn_grasp_quality.mean(),
+            "allen_turn/deep_grasp_ratio": self._turn_deep_grasp.float().mean(),
+            "allen_turn/deep_grasp_confirmed_ratio": (
+                self._turn_deep_grasp_confirmed.float().mean()
+            ),
+            "allen_turn/deep_grasp_quality_mean": (
+                self._turn_deep_grasp_quality.mean()
+            ),
+            "allen_turn/deep_grasp_hold_steps_mean": (
+                self._turn_deep_grasp_hold_count.float().mean()
+            ),
+            "allen_turn/deep_grasp_opposition_cosine_mean": (
+                self._turn_deep_grasp_opposition_cosine.mean()
+            ),
+            "allen_turn/proximal_finger_contact_count_mean": (
+                self._turn_proximal_finger_contact.float().sum(-1).mean()
+            ),
             "allen_turn/ever_loaded_grasp_ratio": (
                 self._turn_ever_loaded_grasp.float().mean()
             ),

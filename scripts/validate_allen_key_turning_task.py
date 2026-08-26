@@ -232,6 +232,7 @@ def main() -> None:
             "handle_approach_rew",
             "first_loaded_grasp_bonus",
             "grasp_maintenance_rew",
+            "deep_grasp_rew",
             "keypoint_rew",
             "subgoal_bonus",
             "full_turn_bonus",
@@ -248,6 +249,17 @@ def main() -> None:
         if not bool((inner._reward_terms["grasp_maintenance_rew"] == 0.0).all()):
             raise RuntimeError(
                 "grasp maintenance reward was active before confirmed acquisition"
+            )
+        deep_tensors = (
+            inner._turn_deep_grasp_quality,
+            inner._turn_deep_grasp_opposition_cosine,
+            inner._turn_finger_force_w,
+        )
+        if any(not bool(torch.isfinite(value).all()) for value in deep_tensors):
+            raise RuntimeError("Allen-key deep-grasp contact signals are non-finite")
+        if not bool((inner._reward_terms["deep_grasp_rew"] == 0.0).all()):
+            raise RuntimeError(
+                "deep-grasp reward was active without a confirmed acquisition"
             )
         removed_reward_terms = {
             "turn_progress_rew",
