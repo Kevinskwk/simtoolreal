@@ -92,12 +92,21 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         checkpoint_path = cfg.get("checkpoint", "")
         observation_dim = int(cfg.get("observation_dim", 0))
         phase_offset = int(cfg.get("phase_offset", -1))
+        phase_source = str(cfg.get("phase_source", "obs"))
         if not checkpoint_path or observation_dim <= 0:
             raise ValueError("Frozen acquisition requires checkpoint and positive observation_dim")
-        if phase_offset < observation_dim or phase_offset + 3 > self.obs_shape[0]:
+        if phase_source == "obs":
+            phase_width = self.obs_shape[0]
+        elif phase_source == "states":
+            phase_width = self.state_shape[0]
+        else:
+            raise ValueError(
+                f"Frozen acquisition phase_source must be obs/states, got {phase_source!r}"
+            )
+        if phase_offset < 0 or phase_offset + 3 > phase_width:
             raise ValueError(
                 f"Invalid frozen acquisition phase_offset={phase_offset}, "
-                f"observation_dim={observation_dim}, actor_obs_dim={self.obs_shape[0]}"
+                f"phase_source={phase_source}, phase_width={phase_width}"
             )
         checkpoint = torch_ext.load_checkpoint(checkpoint_path)
         if isinstance(checkpoint, dict) and self.global_rank in checkpoint:
@@ -161,7 +170,12 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         if not self.frozen_acquisition_enabled:
             return res_dict, None
         phase_offset = int(self.frozen_acquisition_cfg["phase_offset"])
-        phase = obs["obs"][:, phase_offset : phase_offset + 3]
+        phase_source = str(self.frozen_acquisition_cfg.get("phase_source", "obs"))
+        if phase_source not in obs:
+            raise RuntimeError(
+                f"Frozen acquisition phase source {phase_source!r} is absent from rollout obs"
+            )
+        phase = obs[phase_source][:, phase_offset : phase_offset + 3]
         if phase.shape[1] != 3 or not torch.isfinite(phase).all():
             raise RuntimeError("Frozen acquisition phase observation is invalid")
         if not torch.allclose(phase.sum(dim=-1), torch.ones_like(phase[:, 0]), atol=1e-4):

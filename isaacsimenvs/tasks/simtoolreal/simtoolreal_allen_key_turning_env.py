@@ -1,4 +1,4 @@
-"""End-to-end acquisition and resistance-loaded Allen-key turning."""
+"""Single-policy resistance-loaded Allen-key pose tracking."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ import math
 
 import torch
 from isaaclab.sensors import ContactSensor, ContactSensorCfg
+from isaacsim.core.utils.stage import get_current_stage
+from pxr import Gf, Sdf, UsdPhysics
 from isaaclab.utils.math import (
     quat_apply,
     quat_from_angle_axis,
@@ -17,17 +19,24 @@ from .simtoolreal_tacmap_env_cfg import SimToolRealAllenKeyTurningEnvCfg
 from .utils.action_utils import apply_action_pipeline
 from .utils.allen_key_turning_utils import (
     finger_effort_soft_penalty,
+    gate_positive_progress,
+    loaded_grasp_quality,
+    stick_slip_torsional_friction,
     turn_goal_pose,
-    turning_curriculum_ready,
+    update_consecutive_grasp_hold,
     update_unwrapped_angle,
+    wrap_to_pi,
     yaw_from_quaternion,
 )
 from .utils.logging_utils import log_step_metrics
 from .utils.obs_utils import compute_intermediate_values
+from .utils.palm_geometry import palm_center_pose_from_merged_wrist
+from .utils.reward_utils import compute_rewards
+from .utils.reset_utils import _randomize_robot_dof_state
 
 
 class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
-    """Acquire an engaged Allen key and complete a loaded 360-degree turn."""
+    """Finetune SimToolReal to turn an engaged Allen key through 360 degrees."""
 
     cfg: SimToolRealAllenKeyTurningEnvCfg
 
@@ -38,11 +47,13 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         **kwargs,
     ) -> None:
         self._turn_ready = False
+        self._turn_fixture_joints_created = False
+        self._turn_fixture_robot_joint_pos: torch.Tensor | None = None
         self._validate_cfg(cfg)
         super().__init__(cfg, render_mode, **kwargs)
         n, device = self.num_envs, self.device
 
-        palm_position = self.robot.data.body_link_pos_w[:, self._palm_body_id]
+        palm_position, _ = self._current_palm_center_pose_w()
         fingertip_position = self.robot.data.body_link_pos_w[:, self._fingertip_body_ids]
         self._turn_default_hand_points_local = torch.cat(
             (palm_position[:, None, :], fingertip_position), dim=1
@@ -53,9 +64,19 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         ]
         if not arm_body_ids:
             raise RuntimeError("arm body geometry is unavailable for reset screening")
+        self._turn_arm_body_ids = arm_body_ids
         self._turn_default_arm_points_local = (
             self.robot.data.body_link_pos_w[:, arm_body_ids]
             - self.scene.env_origins[:, None, :]
+        )
+        try:
+            shoulder_body_id = self.robot.data.body_names.index("iiwa14_link_2")
+        except ValueError as exc:
+            raise RuntimeError("iiwa14_link_2 is unavailable for reach screening") from exc
+        self._turn_shoulder_body_id = shoulder_body_id
+        self._turn_default_shoulder_point_local = (
+            self.robot.data.body_link_pos_w[:, shoulder_body_id]
+            - self.scene.env_origins
         )
         if not bool(torch.isfinite(self._turn_default_hand_points_local).all()) or not bool(
             torch.isfinite(self._turn_default_arm_points_local).all()
@@ -77,24 +98,46 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         self._turn_subgoal_index = torch.zeros(n, dtype=torch.long, device=device)
         self._turn_subgoal_hold = torch.zeros(n, dtype=torch.long, device=device)
         self._turn_final_hold = torch.zeros(n, dtype=torch.long, device=device)
-        self._turn_acquisition_hold = torch.zeros(n, dtype=torch.long, device=device)
-        self._turn_acquired = torch.zeros(n, dtype=torch.bool, device=device)
-        self._turn_just_acquired = torch.zeros(n, dtype=torch.bool, device=device)
         self._turn_just_subgoal = torch.zeros(n, dtype=torch.bool, device=device)
         self._turn_just_succeeded = torch.zeros(n, dtype=torch.bool, device=device)
         self._turn_success = torch.zeros(n, dtype=torch.bool, device=device)
         self._turn_previous_subgoal_potential = torch.zeros(n, device=device)
         self._turn_subgoal_potential_progress = torch.zeros(n, device=device)
-        self._turn_previous_fingertip_distance = torch.zeros(n, 5, device=device)
-        self._turn_fingertip_approach = torch.zeros(n, device=device)
 
-        self._turn_fingertip_force_n = torch.zeros(n, 5, device=device)
-        self._turn_fingertip_contact = torch.zeros(n, 5, dtype=torch.bool, device=device)
+        self._turn_finger_force_n = torch.zeros(n, 5, device=device)
+        self._turn_finger_contact = torch.zeros(n, 5, dtype=torch.bool, device=device)
         self._turn_palm_force_n = torch.zeros(n, device=device)
         self._turn_palm_contact = torch.zeros(n, dtype=torch.bool, device=device)
+        self._turn_palm_supported = torch.zeros(n, dtype=torch.bool, device=device)
+        self._turn_contact_support = torch.zeros(n, dtype=torch.bool, device=device)
         self._turn_stable_grasp = torch.zeros(n, dtype=torch.bool, device=device)
+        self._turn_loaded_grasp = torch.zeros(n, dtype=torch.bool, device=device)
+        self._turn_grasp_quality = torch.zeros(n, device=device)
+        self._turn_max_grasp_quality = torch.zeros(n, device=device)
+        self._turn_ever_loaded_grasp = torch.zeros(n, dtype=torch.bool, device=device)
+        self._turn_just_loaded_grasp = torch.zeros(n, dtype=torch.bool, device=device)
+        self._turn_grasp_hold_count = torch.zeros(n, dtype=torch.long, device=device)
         self._turn_relative_linear_speed = torch.zeros(n, device=device)
         self._turn_relative_angular_speed = torch.zeros(n, device=device)
+        self._turn_palm_handle_distance = torch.zeros(n, device=device)
+        self._turn_min_palm_handle_distance = torch.full(
+            (n,), float("inf"), device=device
+        )
+        self._turn_max_finger_contact_count = torch.zeros(
+            n, dtype=torch.long, device=device
+        )
+        self._turn_ever_palm_contact = torch.zeros(n, dtype=torch.bool, device=device)
+        self._turn_previous_approach_potential = torch.zeros(n, device=device)
+        self._turn_approach_initialized = torch.zeros(n, dtype=torch.bool, device=device)
+        self._turn_approach_potential = torch.zeros(n, device=device)
+        self._turn_approach_progress = torch.zeros(n, device=device)
+        self._turn_initial_palm_handle_distance = torch.zeros(n, device=device)
+        self._turn_initial_robot_resample_count = torch.zeros(
+            n, dtype=torch.long, device=device
+        )
+        self._turn_qualified_progress = torch.zeros(n, device=device)
+        self._turn_unqualified_positive_progress = torch.zeros(n, device=device)
+        self._turn_final_hold_valid = torch.zeros(n, dtype=torch.bool, device=device)
 
         self._turn_constraint_position_error = torch.zeros(n, device=device)
         self._turn_constraint_tilt_error = torch.zeros(n, device=device)
@@ -102,6 +145,18 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         self._turn_effort_max_ratio = torch.zeros(n, device=device)
         self._turn_effort_saturation = torch.zeros(n, device=device)
         self._turn_effort_mean_ratio = torch.zeros(n, device=device)
+        self._turn_stiction_yaw = torch.zeros(n, device=device)
+        self._turn_friction_stuck = torch.ones(n, dtype=torch.bool, device=device)
+        self._turn_fixture_torque_nm = torch.zeros(n, device=device)
+        self._turn_fixture_torque_clipped = torch.zeros(
+            n, dtype=torch.bool, device=device
+        )
+        self._turn_fixture_torque_peak_nm = torch.zeros(n, device=device)
+        self._turn_fixture_torque_clipped_steps = torch.zeros(
+            n, dtype=torch.long, device=device
+        )
+        self._turn_coulomb_friction_nm = torch.zeros(n, device=device)
+        self._turn_damping_nm_per_radps = torch.zeros(n, device=device)
         self._turn_previous_actions = torch.zeros(n, cfg.action_space, device=device)
         self._turn_action_delta_sq = torch.zeros(n, device=device)
         self._turn_previous_relative_pos = torch.zeros(n, 3, device=device)
@@ -116,6 +171,7 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         self._turn_contact_losses = torch.zeros(n, dtype=torch.long, device=device)
         self._turn_contact_reacquisitions = torch.zeros(n, dtype=torch.long, device=device)
         self._turn_arm_joint_margin = torch.zeros(n, device=device)
+        self._turn_initial_shoulder_to_handle_m = torch.zeros(n, device=device)
 
         self._turn_state_obs = torch.zeros(n, 8, device=device)
         self._turn_geometry_obs = torch.zeros(n, 3, device=device)
@@ -124,10 +180,8 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
 
         self._turn_curriculum_stage = 0
         self._turn_curriculum_completed = 0
-        self._turn_curriculum_acquired = 0
         self._turn_curriculum_successes = 0
         self._turn_curriculum_updates = 0
-        self._turn_curriculum_acquisition_rate = 0.0
         self._turn_curriculum_conditional_success_rate = 0.0
 
         lengths = torch.tensor(cfg.assets.allen_key_lengths_m, device=device)
@@ -142,7 +196,12 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
             float(cfg.assets.allen_key_short_leg_length_m) / 0.1
         )
         self._turn_ready = True
-        self._reset_idx(torch.arange(n, device=device))
+        all_env_ids = torch.arange(n, device=device)
+        self._reset_idx(all_env_ids)
+        self._turn_fixture_robot_joint_pos = self.robot.data.joint_pos.clone()
+        self.scene.write_data_to_sim()
+        self._create_turn_fixture_joints()
+        self._turn_fixture_joints_created = True
 
     @staticmethod
     def _validate_cfg(cfg: SimToolRealAllenKeyTurningEnvCfg) -> None:
@@ -150,40 +209,146 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
             raise ValueError("Allen-key turning currently requires canonical local -Z screw axis")
         if int(cfg.allen_turn_goal_count) * float(cfg.allen_turn_goal_increment_deg) != 360.0:
             raise ValueError("Allen-key subgoals must sum exactly to 360 degrees")
-        stage_count = len(cfg.allen_turn_resistance_fractions)
+        stage_count = len(cfg.allen_turn_friction_ranges_nm)
         if stage_count < 2:
             raise ValueError("Allen-key turning curriculum requires at least two stages")
-        if len(cfg.allen_turn_xy_half_range_stages_m) != stage_count:
-            raise ValueError("Allen-key XY curriculum length is inconsistent")
+        staged_fields = (
+            cfg.allen_turn_handle_center_x_range_stages_m,
+            cfg.allen_turn_handle_center_y_range_stages_m,
+            cfg.allen_turn_easy_yaw_probability_stages,
+            cfg.allen_turn_max_shoulder_to_handle_stages_m,
+            cfg.allen_turn_max_initial_palm_handle_distance_stages_m,
+            cfg.allen_turn_palm_support_distance_stages_m,
+            cfg.allen_turn_damping_ranges_nm_per_radps,
+            cfg.allen_turn_regularization_scale_stages,
+        )
+        if any(len(values) != stage_count for values in staged_fields):
+            raise ValueError("Allen-key workspace curriculum length is inconsistent")
         if len(cfg.allen_turn_z_range_stages_m) != stage_count:
             raise ValueError("Allen-key Z curriculum length is inconsistent")
-        fractions = tuple(float(value) for value in cfg.allen_turn_resistance_fractions)
-        if any(not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in fractions):
-            raise ValueError("Allen-key resistance fractions must be finite and in [0, 1]")
-        if any(later < earlier for earlier, later in zip(fractions, fractions[1:])):
-            raise ValueError("Allen-key resistance fractions must be non-decreasing")
-        if bool(cfg.allen_turn_require_calibrated_load) and max(fractions) > 0.0:
-            calibrated = float(cfg.allen_turn_calibrated_torque_nm)
-            if not math.isfinite(calibrated) or calibrated <= 0.0:
-                raise ValueError(
-                    "Allen-key turning requires a positive calibrated torque; run "
-                    "scripts/calibrate_allen_key_resistance.py and pass its recommendation"
-                )
+        friction_ranges = cfg.allen_turn_friction_ranges_nm
+        for low, high in friction_ranges:
+            if not (
+                math.isfinite(low) and math.isfinite(high)
+                and 0.0 <= low <= high
+            ):
+                raise ValueError("Allen-key friction ranges must be finite and non-negative")
+        damping_ranges = cfg.allen_turn_damping_ranges_nm_per_radps
+        for low, high in damping_ranges:
+            if not (math.isfinite(low) and math.isfinite(high) and 0.0 <= low <= high):
+                raise ValueError("Allen-key damping ranges must be finite and non-negative")
+        if any(
+            later[1] < earlier[1]
+            for earlier, later in zip(friction_ranges, friction_ranges[1:])
+        ):
+            raise ValueError("Allen-key friction curriculum maxima must be non-decreasing")
+        if any(
+            later[1] < earlier[1]
+            for earlier, later in zip(damping_ranges, damping_ranges[1:])
+        ):
+            raise ValueError("Allen-key damping curriculum maxima must be non-decreasing")
         for low, high in cfg.allen_turn_z_range_stages_m:
             if not (math.isfinite(low) and math.isfinite(high) and 0.0 < low < high):
                 raise ValueError("Allen-key Z curriculum contains an invalid interval")
+        for ranges in (
+            cfg.allen_turn_handle_center_x_range_stages_m,
+            cfg.allen_turn_handle_center_y_range_stages_m,
+        ):
+            for low, high in ranges:
+                if not (math.isfinite(low) and math.isfinite(high) and low < high):
+                    raise ValueError(
+                        "Allen-key handle-center curriculum contains an invalid interval"
+                    )
+        if any(
+            not math.isfinite(value) or not 0.0 <= value <= 1.0
+            for value in cfg.allen_turn_easy_yaw_probability_stages
+        ):
+            raise ValueError("Allen-key easy-yaw probabilities must lie in [0, 1]")
+        if any(
+            not math.isfinite(value) or value <= 0.0
+            for value in cfg.allen_turn_max_shoulder_to_handle_stages_m
+        ):
+            raise ValueError("Allen-key shoulder reach limits must be positive")
+        initial_distance_limits = cfg.allen_turn_max_initial_palm_handle_distance_stages_m
+        if any(not math.isfinite(value) or value <= 0.0 for value in initial_distance_limits):
+            raise ValueError("Allen-key initial palm-handle limits must be positive")
+        if any(
+            later < earlier
+            for earlier, later in zip(initial_distance_limits, initial_distance_limits[1:])
+        ):
+            raise ValueError("Allen-key initial palm-handle limits must be non-decreasing")
         if not cfg.assets.allen_key_lengths_m:
             raise ValueError("Allen-key turning requires a nonempty physical length pool")
         if float(cfg.allen_turn_initial_hand_clearance_m) < 0.0:
             raise ValueError("Allen-key initial hand clearance must be non-negative")
         if float(cfg.allen_turn_initial_arm_clearance_m) <= 0.0:
             raise ValueError("Allen-key initial arm clearance must be positive")
-        if float(cfg.allen_turn_fixture_damping_nm_per_radps) <= 0.0:
-            raise ValueError("Allen-key fixture damping must be positive")
+        if float(cfg.allen_turn_stiction_stiffness_nm_per_rad) <= 0.0:
+            raise ValueError("Allen-key fixture stiction stiffness must be positive")
+        if float(cfg.allen_turn_static_to_kinetic_friction_ratio) < 1.0:
+            raise ValueError("Allen-key static friction must be at least kinetic friction")
+        if float(cfg.allen_turn_max_fixture_torque_multiplier) < float(
+            cfg.allen_turn_static_to_kinetic_friction_ratio
+        ):
+            raise ValueError(
+                "Allen-key fixture torque cap must cover the static-friction limit"
+            )
         if float(cfg.allen_turn_resistance_transition_speed_radps) <= 0.0:
             raise ValueError("Allen-key resistance transition speed must be positive")
+        if float(cfg.allen_turn_friction_restick_speed_radps) <= 0.0:
+            raise ValueError("Allen-key friction re-stick speed must be positive")
         if int(cfg.allen_turn_initial_sampling_max_attempts) <= 0:
             raise ValueError("Allen-key initial sampling attempts must be positive")
+        if int(cfg.allen_turn_initial_robot_resampling_max_attempts) <= 0:
+            raise ValueError("Allen-key robot reset sampling attempts must be positive")
+        if int(cfg.allen_turn_loaded_grasp_minimum_contact_fingers) <= 0:
+            raise ValueError("Allen-key loaded grasp requires at least one finger")
+        if int(cfg.allen_turn_acquisition_hold_steps) <= 0:
+            raise ValueError("Allen-key acquisition hold steps must be positive")
+        finger_groups = tuple(cfg.allen_turn_finger_tool_contact_prim_paths)
+        if len(finger_groups) != 5 or any(not group for group in finger_groups):
+            raise ValueError(
+                "Allen-key turning requires five nonempty finger contact-link groups"
+            )
+        contact_paths = [path for group in finger_groups for path in group]
+        if len(contact_paths) != len(set(contact_paths)):
+            raise ValueError("Allen-key finger contact-link paths must be unique")
+        if bool(cfg.enable_fingertip_tool_contact_sensors):
+            raise ValueError(
+                "Allen-key turning uses all-link finger sensors; base fingertip sensors "
+                "must be disabled"
+            )
+        if float(cfg.allen_turn_handle_approach_sigma_m) <= 0.0:
+            raise ValueError("Allen-key handle approach sigma must be positive")
+        if float(cfg.allen_turn_palm_support_soft_margin_m) <= 0.0:
+            raise ValueError("Allen-key palm support soft margin must be positive")
+        if any(
+            not math.isfinite(float(value)) or float(value) <= 0.0
+            for value in cfg.allen_turn_palm_support_distance_stages_m
+        ):
+            raise ValueError("Allen-key palm support distances must be finite and positive")
+        nonnegative_reward_fields = (
+            cfg.allen_turn_handle_approach_progress_weight,
+            cfg.allen_turn_handle_proximity_penalty_weight,
+            cfg.allen_turn_first_loaded_grasp_bonus,
+            cfg.allen_turn_grasp_maintenance_reward_weight,
+            cfg.allen_turn_subgoal_bonus,
+            cfg.allen_turn_full_turn_bonus,
+            cfg.allen_turn_effort_penalty_weight,
+            cfg.allen_turn_action_rate_penalty_weight,
+        )
+        if any(
+            not math.isfinite(float(value)) or float(value) < 0.0
+            for value in nonnegative_reward_fields
+        ):
+            raise ValueError("Allen-key grasp and effort reward weights must be finite and non-negative")
+        regularization = tuple(
+            float(value) for value in cfg.allen_turn_regularization_scale_stages
+        )
+        if any(not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in regularization):
+            raise ValueError("Allen-key regularization scales must lie in [0, 1]")
+        if any(later < earlier for earlier, later in zip(regularization, regularization[1:])):
+            raise ValueError("Allen-key regularization scales must be non-decreasing")
 
     def _setup_scene(self) -> None:
         super()._setup_scene()
@@ -208,11 +373,104 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
                 f"Allen-key palm-tool ContactSensor creation failed: {exc!r}"
             ) from exc
         self.scene.sensors["allen_turn_palm_tool_contact"] = self._turn_palm_contact_sensor
+        self._turn_finger_contact_sensors: list[list[ContactSensor]] = []
+        filter_paths = list(self.cfg.palm_tool_contact_sensor_filter_paths)
+        for finger_id, prim_paths in enumerate(
+            self.cfg.allen_turn_finger_tool_contact_prim_paths
+        ):
+            finger_sensors: list[ContactSensor] = []
+            for link_id, prim_path in enumerate(prim_paths):
+                try:
+                    sensor = ContactSensor(ContactSensorCfg(
+                        prim_path=prim_path,
+                        update_period=0.0,
+                        history_length=0,
+                        debug_vis=False,
+                        track_pose=False,
+                        track_contact_points=False,
+                        track_friction_forces=True,
+                        track_air_time=False,
+                        filter_prim_paths_expr=filter_paths,
+                        max_contact_data_count_per_prim=int(
+                            self.cfg.fingertip_tool_contact_max_data_count
+                        ),
+                    ))
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Allen-key finger-tool ContactSensor creation failed for "
+                        f"finger={finger_id}, link={link_id}, prim={prim_path!r}: {exc!r}"
+                    ) from exc
+                self.scene.sensors[
+                    f"allen_turn_finger_{finger_id}_link_{link_id}_contact"
+                ] = sensor
+                finger_sensors.append(sensor)
+            self._turn_finger_contact_sensors.append(finger_sensors)
 
-    def _current_resistance_torque_nm(self) -> float:
-        return float(self.cfg.allen_turn_calibrated_torque_nm) * float(
-            self.cfg.allen_turn_resistance_fractions[self._turn_curriculum_stage]
+    def _create_turn_fixture_joints(self) -> None:
+        """Constrain every key to its socket with a physical screw-axis joint."""
+        stage = get_current_stage()
+        pivot_tool = tuple(float(value) for value in self.cfg.allen_turn_screw_pivot_tool_m)
+        for env_id in range(self.cfg.scene.num_envs):
+            root = f"/World/envs/env_{env_id}"
+            workpiece_path = f"{root}/Workpiece/workpiece_root"
+            tool_path = f"{root}/Object/object_root"
+            for body_path in (workpiece_path, tool_path):
+                if not stage.GetPrimAtPath(body_path).IsValid():
+                    raise RuntimeError(
+                        f"Allen-key fixture rigid body prim is missing: {body_path}"
+                    )
+            joint = UsdPhysics.RevoluteJoint.Define(
+                stage, f"{root}/AllenKeyFixtureJoint"
+            )
+            joint.CreateExcludeFromArticulationAttr().Set(True)
+            joint.CreateBody1Rel().SetTargets([Sdf.Path(tool_path)])
+            # Body 0 is omitted intentionally, fixing this frame in world
+            # space. The collision-disabled workpiece remains a visual socket;
+            # tying the joint to its imported kinematic actor would retain the
+            # actor's authored origin instead of its tensor-set pose.
+            world_pivot = self._turn_pivot_w[env_id].tolist()
+            yaw = float(self._turn_initial_yaw[env_id])
+            joint.CreateLocalPos0Attr().Set(Gf.Vec3f(*world_pivot))
+            joint.CreateLocalRot0Attr().Set(Gf.Quatf(
+                math.cos(0.5 * yaw), Gf.Vec3f(0.0, 0.0, math.sin(0.5 * yaw))
+            ))
+            joint.CreateLocalPos1Attr().Set(Gf.Vec3f(*pivot_tool))
+            joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, Gf.Vec3f(0.0)))
+            joint.CreateAxisAttr().Set(UsdPhysics.Tokens.z)
+
+    def _current_palm_center_pose_w(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the physical palm mesh-center pose, not the merged wrist frame."""
+        return palm_center_pose_from_merged_wrist(
+            self.robot.data.body_link_pos_w[:, self._palm_body_id],
+            self.robot.data.body_link_quat_w[:, self._palm_body_id],
         )
+
+    def _current_handle_center_pose_w(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the generated long-handle mesh-center pose."""
+        handle_center_local = torch.zeros(self.num_envs, 3, device=self.device)
+        handle_center_local[:, 0] = (
+            float(self.cfg.assets.allen_key_elbow_x_m)
+            - 0.5 * self._turn_handle_length
+            + 0.25 * float(self.cfg.assets.allen_key_handle_across_flats_m)
+        )
+        handle_center = self.object.data.root_pos_w + quat_apply(
+            self.object.data.root_quat_w, handle_center_local
+        )
+        return handle_center, self.object.data.root_quat_w
+
+    def _sample_resistance_coefficients(self, env_ids: torch.Tensor) -> None:
+        stage = self._turn_curriculum_stage
+        friction_low, friction_high = self.cfg.allen_turn_friction_ranges_nm[stage]
+        damping_low, damping_high = self.cfg.allen_turn_damping_ranges_nm_per_radps[stage]
+        count = env_ids.numel()
+        friction = torch.empty(count, device=self.device).uniform_(
+            float(friction_low), float(friction_high)
+        )
+        damping = torch.empty(count, device=self.device).uniform_(
+            float(damping_low), float(damping_high)
+        )
+        self._turn_coulomb_friction_nm[env_ids] = friction
+        self._turn_damping_nm_per_radps[env_ids] = damping
 
     def _reset_idx(self, env_ids) -> None:
         if env_ids is None:
@@ -221,15 +479,101 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         super()._reset_idx(env_ids)
         if not getattr(self, "_turn_ready", False):
             return
+        if self._turn_fixture_joints_created:
+            if self._turn_fixture_robot_joint_pos is None:
+                raise RuntimeError("Allen-key fixture reset state was not initialized")
+            joint_pos = self._turn_fixture_robot_joint_pos[env_ids]
+            joint_vel = torch.zeros_like(joint_pos)
+            self.robot.write_joint_state_to_sim(
+                joint_pos, joint_vel, env_ids=env_ids
+            )
+            self._cur_targets[env_ids] = joint_pos
+            self._prev_targets[env_ids] = joint_pos
         count = env_ids.numel()
         stage = self._turn_curriculum_stage
-        xy_limit = float(self.cfg.allen_turn_xy_half_range_stages_m[stage])
+        x_range = tuple(
+            float(value)
+            for value in self.cfg.allen_turn_handle_center_x_range_stages_m[stage]
+        )
+        y_range = tuple(
+            float(value)
+            for value in self.cfg.allen_turn_handle_center_y_range_stages_m[stage]
+        )
         z_low, z_high = (
             float(value) for value in self.cfg.allen_turn_z_range_stages_m[stage]
         )
-        xy, z, yaw = self._sample_clear_initial_pose(
-            env_ids, xy_limit=xy_limit, z_low=z_low, z_high=z_high
-        )
+        xy = torch.zeros(count, 2, device=self.device)
+        z = torch.zeros(count, device=self.device)
+        yaw = torch.zeros(count, device=self.device)
+        shoulder_reach = torch.zeros(count, device=self.device)
+        palm_handle_distance = torch.zeros(count, device=self.device)
+        robot_resample_count = torch.zeros(count, dtype=torch.long, device=self.device)
+        if self._turn_fixture_joints_created:
+            pivot = self._turn_pivot_w[env_ids].clone()
+            yaw = self._turn_initial_yaw[env_ids].clone()
+            local_pivot = pivot - self.scene.env_origins[env_ids]
+            xy = local_pivot[:, :2]
+            z = local_pivot[:, 2]
+            # The paired robot state is restored above; retain the metrics
+            # computed when that exact state and fixture pose were screened.
+            shoulder_reach = self._turn_initial_shoulder_to_handle_m[env_ids].clone()
+            palm_handle_distance = self._turn_initial_palm_handle_distance[env_ids].clone()
+            pending = torch.empty(0, dtype=torch.long, device=self.device)
+        else:
+            pending = torch.arange(count, device=self.device)
+        for robot_attempt in range(
+            int(self.cfg.allen_turn_initial_robot_resampling_max_attempts)
+        ):
+            if pending.numel() == 0:
+                break
+            sampled = self._sample_clear_initial_pose(
+                env_ids[pending],
+                handle_center_x_range=x_range,
+                handle_center_y_range=y_range,
+                easy_yaw_probability=float(
+                    self.cfg.allen_turn_easy_yaw_probability_stages[stage]
+                ),
+                maximum_shoulder_reach_m=float(
+                    self.cfg.allen_turn_max_shoulder_to_handle_stages_m[stage]
+                ),
+                maximum_palm_handle_distance_m=float(
+                    self.cfg.allen_turn_max_initial_palm_handle_distance_stages_m[stage]
+                ),
+                z_low=z_low,
+                z_high=z_high,
+            )
+            sampled_xy, sampled_z, sampled_yaw, sampled_reach, sampled_distance, valid = sampled
+            accepted = pending[valid]
+            xy[accepted] = sampled_xy[valid]
+            z[accepted] = sampled_z[valid]
+            yaw[accepted] = sampled_yaw[valid]
+            shoulder_reach[accepted] = sampled_reach[valid]
+            palm_handle_distance[accepted] = sampled_distance[valid]
+            pending = pending[~valid]
+            if pending.numel() == 0:
+                break
+            if robot_attempt + 1 < int(
+                self.cfg.allen_turn_initial_robot_resampling_max_attempts
+            ):
+                _randomize_robot_dof_state(self, env_ids[pending])
+                robot_resample_count[pending] += 1
+        if pending.numel():
+            raise RuntimeError(
+                "Allen-key reset could not sample an acquisition-reachable robot/tool "
+                f"state for {pending.numel()}/{count} environments after "
+                f"{self.cfg.allen_turn_initial_robot_resampling_max_attempts} robot "
+                "reset attempts"
+            )
+        if self._turn_fixture_joints_created:
+            # Standalone PhysX joints retain their instantiated kinematic
+            # anchor. Keep each environment's initially randomized fixture
+            # pose across resets instead of corrupting that anchor by
+            # teleporting the socket.
+            pivot = self._turn_pivot_w[env_ids].clone()
+            yaw = self._turn_initial_yaw[env_ids].clone()
+            local_pivot = pivot - self.scene.env_origins[env_ids]
+            xy = local_pivot[:, :2]
+            z = local_pivot[:, 2]
         z_axis = torch.zeros(count, 3, device=self.device)
         z_axis[:, 2] = 1.0
         quaternion = quat_from_angle_axis(yaw, z_axis)
@@ -272,30 +616,56 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
             -torch.ones(count, device=self.device),
             torch.ones(count, device=self.device),
         )
-        self._turn_phase[env_ids] = 0
+        self._turn_phase[env_ids] = 1
         self._turn_direction[env_ids] = direction
         self._turn_initial_tool_pos[env_ids] = position
         self._turn_initial_tool_quat[env_ids] = quaternion
         self._turn_pivot_w[env_ids] = pivot
         self._turn_initial_yaw[env_ids] = yaw
         self._turn_previous_yaw[env_ids] = yaw
+        self._turn_stiction_yaw[env_ids] = yaw
+        self._turn_friction_stuck[env_ids] = True
+        self._sample_resistance_coefficients(env_ids)
+        self._turn_fixture_torque_nm[env_ids] = 0.0
+        self._turn_fixture_torque_clipped[env_ids] = False
+        self._turn_fixture_torque_peak_nm[env_ids] = 0.0
+        self._turn_fixture_torque_clipped_steps[env_ids] = 0
         self._turn_cumulative_angle[env_ids] = 0.0
         self._turn_angle_delta[env_ids] = 0.0
-        self._turn_target_angle[env_ids] = 0.0
+        first_target = direction * math.radians(
+            float(self.cfg.allen_turn_goal_increment_deg)
+        )
+        self._turn_target_angle[env_ids] = first_target
         self._turn_angle_error[env_ids] = 0.0
         self._turn_subgoal_index[env_ids] = 0
         self._turn_subgoal_hold[env_ids] = 0
         self._turn_final_hold[env_ids] = 0
-        self._turn_acquisition_hold[env_ids] = 0
-        self._turn_acquired[env_ids] = False
-        self._turn_just_acquired[env_ids] = False
         self._turn_just_subgoal[env_ids] = False
         self._turn_just_succeeded[env_ids] = False
         self._turn_success[env_ids] = False
         self._turn_previous_subgoal_potential[env_ids] = 0.0
         self._turn_subgoal_potential_progress[env_ids] = 0.0
-        self._turn_previous_fingertip_distance[env_ids] = 0.0
-        self._turn_fingertip_approach[env_ids] = 0.0
+        self._turn_contact_support[env_ids] = False
+        self._turn_palm_supported[env_ids] = False
+        self._turn_loaded_grasp[env_ids] = False
+        self._turn_grasp_quality[env_ids] = 0.0
+        self._turn_max_grasp_quality[env_ids] = 0.0
+        self._turn_ever_loaded_grasp[env_ids] = False
+        self._turn_just_loaded_grasp[env_ids] = False
+        self._turn_grasp_hold_count[env_ids] = 0
+        self._turn_palm_handle_distance[env_ids] = 0.0
+        self._turn_min_palm_handle_distance[env_ids] = float("inf")
+        self._turn_max_finger_contact_count[env_ids] = 0
+        self._turn_ever_palm_contact[env_ids] = False
+        self._turn_previous_approach_potential[env_ids] = 0.0
+        self._turn_approach_initialized[env_ids] = False
+        self._turn_approach_potential[env_ids] = 0.0
+        self._turn_approach_progress[env_ids] = 0.0
+        self._turn_initial_palm_handle_distance[env_ids] = palm_handle_distance
+        self._turn_initial_robot_resample_count[env_ids] = robot_resample_count
+        self._turn_qualified_progress[env_ids] = 0.0
+        self._turn_unqualified_positive_progress[env_ids] = 0.0
+        self._turn_final_hold_valid[env_ids] = False
         self._turn_effort_penalty[env_ids] = 0.0
         self._turn_previous_actions[env_ids] = 0.0
         self._turn_action_delta_sq[env_ids] = 0.0
@@ -308,24 +678,60 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         self._turn_contact_losses[env_ids] = 0
         self._turn_contact_reacquisitions[env_ids] = 0
         self._turn_arm_joint_margin[env_ids] = 0.0
-        self._write_turn_goal(env_ids, torch.zeros(count, device=self.device))
+        self._turn_initial_shoulder_to_handle_m[env_ids] = shoulder_reach
+        self._turn_state_obs[env_ids] = 0.0
+        self._turn_state_obs[env_ids, 1] = 1.0
+        self._turn_grasp_obs[env_ids] = 0.0
+        self._turn_effort_obs[env_ids] = 0.0
+        # Reuse SimToolReal's lifted flag as "grasp acquired" for this engaged
+        # tool. This keeps fingertip approach shaping active until a loaded
+        # palm grasp is first established, then enables pose progress.
+        self._lifted_object[env_ids] = False
+        self._closest_keypoint_max_dist[env_ids] = -1.0
+        self._write_turn_goal(env_ids, first_target)
 
     def _sample_clear_initial_pose(
         self,
         env_ids: torch.Tensor,
         *,
-        xy_limit: float,
+        handle_center_x_range: tuple[float, float],
+        handle_center_y_range: tuple[float, float],
+        easy_yaw_probability: float,
+        maximum_shoulder_reach_m: float,
+        maximum_palm_handle_distance_m: float,
         z_low: float,
         z_high: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Reject either tool segment intersecting the default hand or arm."""
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
+        """Sample a collision-free pose inside the policy's acquisition workspace."""
         count = env_ids.numel()
         xy = torch.zeros(count, 2, device=self.device)
         z = torch.zeros(count, device=self.device)
         yaw = torch.zeros(count, device=self.device)
+        shoulder_reach = torch.zeros(count, device=self.device)
+        palm_handle_distance = torch.zeros(count, device=self.device)
         pending = torch.arange(count, device=self.device)
-        hand_points = self._turn_default_hand_points_local[env_ids]
-        arm_points = self._turn_default_arm_points_local[env_ids]
+        # Joint-state writes invalidate Isaac Lab's body-pose cache. Reading it
+        # here runs forward kinematics for the newly randomized reset pose, so
+        # collision rejection is based on the actual robot rather than on the
+        # construction-time default pose.
+        palm_position, _ = palm_center_pose_from_merged_wrist(
+            self.robot.data.body_link_pos_w[env_ids, self._palm_body_id],
+            self.robot.data.body_link_quat_w[env_ids, self._palm_body_id],
+        )
+        hand_points = torch.cat((
+            palm_position[:, None, :],
+            self.robot.data.body_link_pos_w[env_ids][:, self._fingertip_body_ids],
+        ), dim=1) - self.scene.env_origins[env_ids, None, :]
+        arm_points = (
+            self.robot.data.body_link_pos_w[env_ids][:, self._turn_arm_body_ids]
+            - self.scene.env_origins[env_ids, None, :]
+        )
+        shoulder_points = (
+            self.robot.data.body_link_pos_w[env_ids, self._turn_shoulder_body_id]
+            - self.scene.env_origins[env_ids]
+        )
         lengths = self._turn_handle_length[env_ids]
         clearance = (
             0.5 * float(self.cfg.assets.allen_key_handle_across_flats_m)
@@ -334,19 +740,47 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         for _ in range(int(self.cfg.allen_turn_initial_sampling_max_attempts)):
             if pending.numel() == 0:
                 break
-            sampled_xy = torch.empty(
-                pending.numel(), 2, device=self.device
-            ).uniform_(-xy_limit, xy_limit)
+            sampled_handle_x = torch.empty(
+                pending.numel(), device=self.device
+            ).uniform_(*handle_center_x_range)
+            sampled_handle_y = torch.empty(
+                pending.numel(), device=self.device
+            ).uniform_(*handle_center_y_range)
+            sampled_handle_xy = torch.stack(
+                (sampled_handle_x, sampled_handle_y), dim=-1
+            )
             sampled_z = torch.empty(pending.numel(), device=self.device).uniform_(
                 z_low, z_high
             )
-            sampled_yaw = torch.empty(pending.numel(), device=self.device).uniform_(
+            broad_yaw = torch.empty(pending.numel(), device=self.device).uniform_(
                 -math.pi, math.pi
+            )
+            negative_easy_yaw = torch.empty(
+                pending.numel(), device=self.device
+            ).uniform_(-math.pi, -2.0 * math.pi / 3.0)
+            positive_easy_yaw = torch.empty(
+                pending.numel(), device=self.device
+            ).uniform_(5.0 * math.pi / 6.0, math.pi)
+            easy_yaw = torch.where(
+                torch.rand(pending.numel(), device=self.device) < 0.5,
+                negative_easy_yaw,
+                positive_easy_yaw,
+            )
+            sampled_yaw = torch.where(
+                torch.rand(pending.numel(), device=self.device)
+                < easy_yaw_probability,
+                easy_yaw,
+                broad_yaw,
             )
             direction = torch.stack((
                 torch.cos(sampled_yaw), torch.sin(sampled_yaw),
                 torch.zeros_like(sampled_yaw),
             ), dim=-1)
+            overlap = 0.25 * float(
+                self.cfg.assets.allen_key_handle_across_flats_m
+            )
+            handle_offset = -0.5 * lengths[pending] + overlap
+            sampled_xy = sampled_handle_xy - handle_offset[:, None] * direction[:, :2]
             pivot_local = torch.cat((sampled_xy, sampled_z[:, None]), dim=-1)
             # The long segment lies 3 cm above the screw pivot and extends
             # backward from the elbow along local -X.
@@ -379,21 +813,33 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
                 minimum_segment_distance(pending_arm, near, far),
                 minimum_segment_distance(pending_arm, pivot_local, short_far),
             )
+            sampled_shoulder_reach = minimum_segment_distance(
+                shoulder_points[pending, None, :], near, far
+            )
+            sampled_handle_center = torch.cat(
+                (sampled_handle_xy, (sampled_z + 0.03)[:, None]), dim=-1
+            )
+            sampled_palm_handle_distance = torch.linalg.vector_norm(
+                palm_position[pending]
+                - self.scene.env_origins[env_ids[pending]]
+                - sampled_handle_center,
+                dim=-1,
+            )
             valid = (hand_distance >= clearance) & (
                 arm_distance >= float(self.cfg.allen_turn_initial_arm_clearance_m)
+            ) & (sampled_shoulder_reach <= maximum_shoulder_reach_m) & (
+                sampled_palm_handle_distance <= maximum_palm_handle_distance_m
             )
             accepted = pending[valid]
             xy[accepted] = sampled_xy[valid]
             z[accepted] = sampled_z[valid]
             yaw[accepted] = sampled_yaw[valid]
+            shoulder_reach[accepted] = sampled_shoulder_reach[valid]
+            palm_handle_distance[accepted] = sampled_palm_handle_distance[valid]
             pending = pending[~valid]
-        if pending.numel():
-            raise RuntimeError(
-                "Allen-key reset sampling could not clear the default robot for "
-                f"{pending.numel()}/{count} environments after "
-                f"{self.cfg.allen_turn_initial_sampling_max_attempts} attempts"
-            )
-        return xy, z, yaw
+        valid = torch.ones(count, dtype=torch.bool, device=self.device)
+        valid[pending] = False
+        return xy, z, yaw, shoulder_reach, palm_handle_distance, valid
 
     def _write_turn_goal(self, env_ids: torch.Tensor, angle: torch.Tensor) -> None:
         pivot_tool = torch.tensor(
@@ -422,31 +868,47 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         )
         self._turn_previous_actions.copy_(actions)
         apply_action_pipeline(self, actions)
-        active = self._turn_phase >= 1
         torque = torch.zeros(self.num_envs, 3, device=self.device)
+        current_yaw = yaw_from_quaternion(self.object.data.root_quat_w)
         angular_velocity = self.object.data.root_ang_vel_w[:, 2]
-        damping = (
-            -float(self.cfg.allen_turn_fixture_damping_nm_per_radps)
-            * angular_velocity
+        angular_displacement = wrap_to_pi(
+            current_yaw - self._turn_stiction_yaw
         )
-        override = getattr(self, "_turn_external_torque_override_nm", None)
-        if override is None:
-            transition_speed = float(
+        maximum_torque = (
+            float(self.cfg.allen_turn_max_fixture_torque_multiplier)
+            * self._turn_coulomb_friction_nm
+        )
+        resistance, stuck, restuck, clipped = stick_slip_torsional_friction(
+            angular_displacement,
+            angular_velocity,
+            self._turn_friction_stuck,
+            kinetic_limit_nm=self._turn_coulomb_friction_nm,
+            static_to_kinetic_ratio=float(
+                self.cfg.allen_turn_static_to_kinetic_friction_ratio
+            ),
+            stiction_stiffness_nm_per_rad=float(
+                self.cfg.allen_turn_stiction_stiffness_nm_per_rad
+            ),
+            damping_nm_per_radps=self._turn_damping_nm_per_radps,
+            maximum_abs_torque_nm=maximum_torque,
+            kinetic_transition_speed_radps=float(
                 self.cfg.allen_turn_resistance_transition_speed_radps
-            )
-            resistance = -self._current_resistance_torque_nm() * torch.tanh(
-                angular_velocity / transition_speed
-            )
-        else:
-            if override.shape != (self.num_envs,):
-                raise RuntimeError(
-                    "Allen-key torque override must have shape "
-                    f"({self.num_envs},), got {tuple(override.shape)}"
-                )
-            if not bool(torch.isfinite(override).all()):
-                raise RuntimeError("Allen-key torque override contains NaN or Inf")
-            resistance = override
-        torque[:, 2] = (damping + resistance) * active.float()
+            ),
+            restick_speed_radps=float(
+                self.cfg.allen_turn_friction_restick_speed_radps
+            ),
+        )
+        self._turn_stiction_yaw.copy_(torch.where(
+            restuck, current_yaw, self._turn_stiction_yaw
+        ))
+        self._turn_friction_stuck.copy_(stuck)
+        self._turn_fixture_torque_nm.copy_(resistance)
+        self._turn_fixture_torque_clipped.copy_(clipped)
+        self._turn_fixture_torque_peak_nm.copy_(torch.maximum(
+            self._turn_fixture_torque_peak_nm, resistance.abs()
+        ))
+        self._turn_fixture_torque_clipped_steps.add_(clipped.long())
+        torque[:, 2] = resistance
         self.object.set_external_force_and_torque(
             torch.zeros(self.num_envs, 1, 3, device=self.device),
             torque[:, None, :],
@@ -455,57 +917,43 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
 
     def _apply_action(self) -> None:
         self.robot.set_joint_position_target(self._cur_targets)
-        if not getattr(self, "_turn_ready", False):
-            return
-        env_ids = torch.arange(self.num_envs, device=self.device)
-        yaw = yaw_from_quaternion(self.object.data.root_quat_w)
-        z_axis = torch.zeros(self.num_envs, 3, device=self.device)
-        z_axis[:, 2] = 1.0
-        quaternion = quat_from_angle_axis(yaw, z_axis)
-        pivot_tool = torch.tensor(
-            self.cfg.allen_turn_screw_pivot_tool_m, device=self.device
-        ).expand(self.num_envs, -1)
-        position = self._turn_pivot_w - quat_apply(quaternion, pivot_tool)
-        angular_velocity = torch.zeros(self.num_envs, 3, device=self.device)
-        angular_velocity[:, 2] = self.object.data.root_ang_vel_w[:, 2]
-        self.object.write_root_pose_to_sim(
-            torch.cat((position, quaternion), dim=-1), env_ids=env_ids
-        )
-        self.object.write_root_velocity_to_sim(
-            torch.cat((torch.zeros_like(angular_velocity), angular_velocity), dim=-1),
-            env_ids=env_ids,
-        )
-        socket_position = self._turn_pivot_w + torch.tensor(
-            self.cfg.allen_turn_socket_root_from_pivot_m, device=self.device
-        )
-        self.workpiece.write_root_pose_to_sim(
-            torch.cat((socket_position, quaternion), dim=-1), env_ids=env_ids
-        )
-        self.workpiece.write_root_velocity_to_sim(
-            torch.zeros(self.num_envs, 6, device=self.device), env_ids=env_ids
-        )
 
     def _read_contacts(self) -> None:
-        sensors = getattr(self, "_fingertip_tool_contact_sensors", None)
-        if sensors is None or len(sensors) != 5:
-            raise RuntimeError("Allen-key turning requires exactly five fingertip sensors")
+        sensors = getattr(self, "_turn_finger_contact_sensors", None)
+        if sensors is None or len(sensors) != 5 or any(not group for group in sensors):
+            raise RuntimeError(
+                "Allen-key turning requires five nonempty finger contact-sensor groups"
+            )
         forces = []
-        for sensor_id, sensor in enumerate(sensors):
-            matrix = getattr(getattr(sensor, "data", None), "force_matrix_w", None)
-            if matrix is None or matrix.shape[0] != self.num_envs or matrix.shape[-1] != 3:
-                shape = None if matrix is None else tuple(matrix.shape)
-                raise RuntimeError(
-                    f"Allen-key fingertip sensor {sensor_id} has invalid matrix {shape}"
+        for finger_id, finger_sensors in enumerate(sensors):
+            finger_force = torch.zeros(self.num_envs, device=self.device)
+            for link_id, sensor in enumerate(finger_sensors):
+                matrix = getattr(
+                    getattr(sensor, "data", None), "force_matrix_w", None
                 )
-            force = torch.linalg.vector_norm(
-                matrix.reshape(self.num_envs, -1, 3), dim=-1
-            ).sum(-1)
-            if not bool(torch.isfinite(force).all()):
-                raise RuntimeError(f"Allen-key fingertip sensor {sensor_id} is non-finite")
-            forces.append(force)
-        self._turn_fingertip_force_n.copy_(torch.stack(forces, dim=-1))
-        self._turn_fingertip_contact.copy_(
-            self._turn_fingertip_force_n
+                if (
+                    matrix is None
+                    or matrix.shape[0] != self.num_envs
+                    or matrix.shape[-1] != 3
+                ):
+                    shape = None if matrix is None else tuple(matrix.shape)
+                    raise RuntimeError(
+                        "Allen-key finger contact sensor has invalid matrix: "
+                        f"finger={finger_id}, link={link_id}, shape={shape}"
+                    )
+                link_force = torch.linalg.vector_norm(
+                    matrix.reshape(self.num_envs, -1, 3), dim=-1
+                ).sum(-1)
+                if not bool(torch.isfinite(link_force).all()):
+                    raise RuntimeError(
+                        "Allen-key finger contact sensor is non-finite: "
+                        f"finger={finger_id}, link={link_id}"
+                    )
+                finger_force += link_force
+            forces.append(finger_force)
+        self._turn_finger_force_n.copy_(torch.stack(forces, dim=-1))
+        self._turn_finger_contact.copy_(
+            self._turn_finger_force_n
             >= float(self.cfg.allen_turn_contact_force_threshold_n)
         )
 
@@ -560,8 +1008,7 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
             torch.acos((axis_world * expected_axis).sum(-1).clamp(-1.0, 1.0))
         )
 
-        palm_position = self.robot.data.body_link_pos_w[:, self._palm_body_id]
-        palm_quaternion = self.robot.data.body_link_quat_w[:, self._palm_body_id]
+        palm_position, palm_quaternion = self._current_palm_center_pose_w()
         relative_position, relative_quaternion = subtract_frame_transforms(
             palm_position,
             palm_quaternion,
@@ -585,23 +1032,123 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
             initialized, relative_rotation_delta / control_dt,
             torch.zeros_like(relative_rotation_delta),
         ))
-        contact_support = self._turn_palm_contact | (
-            self._turn_fingertip_contact.sum(-1)
+        finger_contact_count = self._turn_finger_contact.sum(-1)
+        contact_support = (
+            finger_contact_count
             >= int(self.cfg.allen_turn_minimum_contact_fingers)
+        ) | (self._turn_palm_contact & (finger_contact_count >= 1))
+        self._turn_contact_support.copy_(contact_support)
+        tool_position = self.object.data.root_pos_w
+        tool_quaternion = self.object.data.root_quat_w
+        handle_near_local = torch.zeros(self.num_envs, 3, device=self.device)
+        handle_near_local[:, 0] = float(self.cfg.assets.allen_key_elbow_x_m)
+        handle_far_local = handle_near_local.clone()
+        handle_far_local[:, 0] -= self._turn_handle_length
+        handle_near = tool_position + quat_apply(tool_quaternion, handle_near_local)
+        handle_far = tool_position + quat_apply(tool_quaternion, handle_far_local)
+        handle_segment = handle_far - handle_near
+        segment_sq = handle_segment.square().sum(-1).clamp_min(1.0e-12)
+        handle_center, _ = self._current_handle_center_pose_w()
+        palm_distance = torch.linalg.vector_norm(
+            palm_position - handle_center, dim=-1
         )
-        self._turn_stable_grasp.copy_(
-            contact_support
-            & (
-                self._turn_relative_linear_speed
-                <= float(self.cfg.allen_turn_max_relative_linear_speed_mps)
-            )
-            & (
-                self._turn_relative_angular_speed
-                <= float(self.cfg.allen_turn_max_relative_angular_speed_radps)
-            )
+        fingertip_position = self.robot.data.body_link_pos_w[:, self._fingertip_body_ids]
+        fingertip_fraction = (
+            (
+                (fingertip_position - handle_near[:, None, :])
+                * handle_segment[:, None, :]
+            ).sum(-1)
+            / segment_sq[:, None]
+        ).clamp(0.0, 1.0)
+        closest_fingertip_handle_point = (
+            handle_near[:, None, :]
+            + fingertip_fraction[:, :, None] * handle_segment[:, None, :]
         )
+        fingertip_handle_distance = torch.linalg.vector_norm(
+            fingertip_position - closest_fingertip_handle_point, dim=-1
+        )
+        fingertip_handle_distance = (
+            fingertip_handle_distance
+            - 0.5 * float(self.cfg.assets.allen_key_handle_across_flats_m)
+        ).clamp_min(0.0)
+        self._turn_palm_handle_distance.copy_(palm_distance)
+        self._turn_min_palm_handle_distance.copy_(torch.minimum(
+            self._turn_min_palm_handle_distance, palm_distance
+        ))
+        self._turn_max_finger_contact_count.copy_(torch.maximum(
+            self._turn_max_finger_contact_count, finger_contact_count
+        ))
+        self._turn_ever_palm_contact |= self._turn_palm_contact
+        palm_support_distance = float(
+            self.cfg.allen_turn_palm_support_distance_stages_m[
+                self._turn_curriculum_stage
+            ]
+        )
+        palm_support_margin = float(self.cfg.allen_turn_palm_support_soft_margin_m)
+        palm_supported = self._turn_palm_contact | (
+            palm_distance <= palm_support_distance
+        )
+        palm_support_quality = (
+            (palm_support_distance + palm_support_margin - palm_distance)
+            / palm_support_margin
+        ).clamp(0.0, 1.0)
+        palm_support_quality = torch.maximum(
+            palm_support_quality, self._turn_palm_contact.float()
+        )
+        grasp_quality, loaded_grasp = loaded_grasp_quality(
+            palm_support_quality,
+            palm_supported,
+            finger_contact_count,
+            self._turn_relative_linear_speed,
+            self._turn_relative_angular_speed,
+            minimum_contact_fingers=int(
+                self.cfg.allen_turn_loaded_grasp_minimum_contact_fingers
+            ),
+            maximum_relative_linear_speed_mps=float(
+                self.cfg.allen_turn_max_relative_linear_speed_mps
+            ),
+            maximum_relative_angular_speed_radps=float(
+                self.cfg.allen_turn_max_relative_angular_speed_radps
+            ),
+        )
+        self._turn_palm_supported.copy_(palm_supported)
+        self._turn_grasp_quality.copy_(grasp_quality)
+        self._turn_max_grasp_quality.copy_(torch.maximum(
+            self._turn_max_grasp_quality, grasp_quality
+        ))
+        self._turn_loaded_grasp.copy_(loaded_grasp)
+        self._turn_stable_grasp.copy_(loaded_grasp)
+        hold_count, just_confirmed = update_consecutive_grasp_hold(
+            loaded_grasp,
+            self._turn_grasp_hold_count,
+            self._turn_ever_loaded_grasp,
+            required_steps=int(self.cfg.allen_turn_acquisition_hold_steps),
+        )
+        self._turn_grasp_hold_count.copy_(hold_count)
+        self._turn_just_loaded_grasp.copy_(just_confirmed)
+        self._turn_ever_loaded_grasp |= just_confirmed
+        approach_sigma = float(self.cfg.allen_turn_handle_approach_sigma_m)
+        palm_approach_potential = torch.exp(-palm_distance / approach_sigma)
+        fingertip_approach_potential = torch.exp(
+            -fingertip_handle_distance / approach_sigma
+        ).mean(-1)
+        # Equal palm/fingertip weighting keeps the target a whole-hand grasp;
+        # one close fingertip alone cannot maximize the acquisition potential.
+        approach_potential = 0.5 * (
+            palm_approach_potential + fingertip_approach_potential
+        )
+        self._turn_approach_potential.copy_(approach_potential)
+        approach_progress = approach_potential - self._turn_previous_approach_potential
+        approach_progress = torch.where(
+            self._turn_approach_initialized & ~self._turn_ever_loaded_grasp,
+            approach_progress,
+            torch.zeros_like(approach_progress),
+        )
+        self._turn_approach_progress.copy_(approach_progress)
+        self._turn_previous_approach_potential.copy_(approach_potential)
+        self._turn_approach_initialized.fill_(True)
 
-        diagnostic_active = self._turn_relative_initialized & self._turn_acquired
+        diagnostic_active = self._turn_relative_initialized
         self._turn_cumulative_palm_tool_translation += torch.where(
             diagnostic_active, relative_translation_delta, 0.0
         )
@@ -614,17 +1161,17 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
 
         contact_code = self._turn_palm_contact.long()
         for finger_id in range(5):
-            contact_code += self._turn_fingertip_contact[:, finger_id].long() << (finger_id + 1)
-        topology_changed = self._turn_acquired & (
+            contact_code += self._turn_finger_contact[:, finger_id].long() << (finger_id + 1)
+        topology_changed = initialized & (
             contact_code != self._turn_previous_contact_code
         )
         self._turn_contact_topology_changes += topology_changed.long()
         contact_lost = (
-            self._turn_acquired & self._turn_previous_stable_grasp
+            initialized & self._turn_previous_stable_grasp
             & ~self._turn_stable_grasp
         )
         contact_reacquired = (
-            self._turn_acquired & ~self._turn_previous_stable_grasp
+            initialized & ~self._turn_previous_stable_grasp
             & self._turn_stable_grasp
         )
         self._turn_contact_losses += contact_lost.long()
@@ -651,33 +1198,16 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         self._turn_effort_saturation.copy_(saturation)
         self._turn_effort_mean_ratio.copy_(ratio.mean(-1))
 
-        self._turn_just_acquired.zero_()
         self._turn_just_subgoal.zero_()
         self._turn_just_succeeded.zero_()
-        acquiring = self._turn_phase == 0
-        self._turn_acquisition_hold.copy_(torch.where(
-            acquiring & self._turn_stable_grasp,
-            self._turn_acquisition_hold + 1,
-            torch.zeros_like(self._turn_acquisition_hold),
-        ))
-        acquired_now = acquiring & (
-            self._turn_acquisition_hold >= int(self.cfg.allen_turn_acquisition_hold_steps)
-        )
-        if bool(acquired_now.any()):
-            ids = torch.nonzero(acquired_now, as_tuple=False).squeeze(-1)
-            self._turn_phase[ids] = 1
-            self._turn_acquired[ids] = True
-            self._turn_just_acquired[ids] = True
-            increment = math.radians(float(self.cfg.allen_turn_goal_increment_deg))
-            self._turn_target_angle[ids] = self._turn_direction[ids] * increment
-            self._turn_previous_subgoal_potential[ids] = 0.0
-            self._write_turn_goal(ids, self._turn_target_angle[ids])
-
         turning = self._turn_phase == 1
         self._turn_angle_error.copy_(self._turn_target_angle - self._turn_cumulative_angle)
         tolerance = math.radians(float(self.cfg.allen_turn_goal_tolerance_deg))
-        at_subgoal = turning & self._turn_stable_grasp & (
-            self._turn_angle_error.abs() <= tolerance
+        at_subgoal = (
+            turning
+            & (self._turn_angle_error.abs() <= tolerance)
+            & self._turn_loaded_grasp
+            & self._turn_ever_loaded_grasp
         )
         self._turn_subgoal_hold.copy_(torch.where(
             at_subgoal,
@@ -703,6 +1233,7 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
                 )
                 self._turn_target_angle[continuing_ids] = target
                 self._turn_previous_subgoal_potential[continuing_ids] = 0.0
+                self._closest_keypoint_max_dist[continuing_ids] = -1.0
                 self._write_turn_goal(continuing_ids, target)
             if final_ids.numel():
                 self._turn_phase[final_ids] = 2
@@ -710,9 +1241,13 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
 
         holding = self._turn_phase == 2
         final_target = self._turn_direction * 2.0 * math.pi
-        final_valid = holding & self._turn_stable_grasp & (
-            (final_target - self._turn_cumulative_angle).abs() <= tolerance
+        final_valid = (
+            holding
+            & ((final_target - self._turn_cumulative_angle).abs() <= tolerance)
+            & self._turn_loaded_grasp
+            & self._turn_ever_loaded_grasp
         )
+        self._turn_final_hold_valid.copy_(final_valid)
         self._turn_final_hold.copy_(torch.where(
             final_valid,
             self._turn_final_hold + 1,
@@ -735,28 +1270,20 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         self._turn_state_obs[:, 4] = signed_progress / (2.0 * math.pi)
         self._turn_state_obs[:, 5] = signed_target / (2.0 * math.pi)
         self._turn_state_obs[:, 6] = self._turn_direction * self._turn_angle_error / increment
-        calibrated = max(float(self.cfg.allen_turn_calibrated_torque_nm), 1.0e-6)
-        self._turn_state_obs[:, 7] = self._current_resistance_torque_nm() / calibrated
+        maximum_friction = max(
+            high for _, high in self.cfg.allen_turn_friction_ranges_nm
+        )
+        self._turn_state_obs[:, 7] = (
+            self._turn_coulomb_friction_nm / max(maximum_friction, 1.0e-6)
+        )
         self._turn_grasp_obs[:, 0] = self._turn_palm_contact.float()
-        self._turn_grasp_obs[:, 1:6] = self._turn_fingertip_contact.float()
+        self._turn_grasp_obs[:, 1:6] = self._turn_finger_contact.float()
         self._turn_grasp_obs[:, 6] = self._turn_stable_grasp.float()
-        self._turn_grasp_obs[:, 7] = self._turn_acquired.float()
+        self._turn_grasp_obs[:, 7] = self._turn_contact_support.float()
         self._turn_effort_obs[:, 0] = self._turn_effort_mean_ratio
         self._turn_effort_obs[:, 1] = self._turn_effort_max_ratio
         self._turn_effort_obs[:, 2] = self._turn_effort_saturation
         self._turn_effort_obs[:, 3] = self._turn_effort_penalty
-
-        current_distance = self._curr_fingertip_distances
-        initialized = self._turn_previous_fingertip_distance.sum(-1) > 0.0
-        approach = torch.clamp(
-            self._turn_previous_fingertip_distance - current_distance,
-            min=0.0,
-            max=0.02,
-        ).sum(-1)
-        self._turn_fingertip_approach.copy_(
-            torch.where(initialized & acquiring, approach, torch.zeros_like(approach))
-        )
-        self._turn_previous_fingertip_distance.copy_(current_distance)
 
         error = self._turn_angle_error.abs()
         potential = torch.exp(-error / max(tolerance, 1.0e-6))
@@ -774,54 +1301,47 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         if count == 0:
             return
         self._turn_curriculum_completed += count
-        self._turn_curriculum_acquired += int((done & self._turn_acquired).sum().item())
         self._turn_curriculum_successes += int((done & self._turn_success).sum().item())
         minimum = int(self.cfg.allen_turn_curriculum_min_episodes)
         if self._turn_curriculum_completed < minimum:
             return
-        ready, acquisition_rate, conditional_rate = turning_curriculum_ready(
-            self._turn_curriculum_acquired,
-            self._turn_curriculum_completed,
-            self._turn_curriculum_successes,
-            minimum_episodes=minimum,
-            acquisition_threshold=float(
-                self.cfg.allen_turn_curriculum_acquisition_threshold
-            ),
-            conditional_turn_threshold=float(
-                self.cfg.allen_turn_curriculum_conditional_success_threshold
-            ),
+        success_rate = (
+            self._turn_curriculum_successes / self._turn_curriculum_completed
         )
-        self._turn_curriculum_acquisition_rate = acquisition_rate
-        self._turn_curriculum_conditional_success_rate = conditional_rate
-        last = len(self.cfg.allen_turn_resistance_fractions) - 1
+        ready = success_rate >= float(self.cfg.allen_turn_curriculum_success_threshold)
+        self._turn_curriculum_conditional_success_rate = success_rate
+        last = len(self.cfg.allen_turn_friction_ranges_nm) - 1
         if ready and self._turn_curriculum_stage < last:
             self._turn_curriculum_stage += 1
             self._turn_curriculum_updates += 1
         self._turn_curriculum_completed = 0
-        self._turn_curriculum_acquired = 0
         self._turn_curriculum_successes = 0
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         self._update_metrics()
-        acquisition_failure = (
-            (self._turn_phase == 0)
-            & (self.episode_length_buf >= int(self.cfg.allen_turn_acquisition_timeout_steps))
-        )
         success = self._turn_success
         timeout = self.episode_length_buf >= int(self.cfg.termination.episode_length)
-        terminated = acquisition_failure | success
+        terminated = success
         truncated = timeout & ~terminated
         done = terminated | truncated
         self._is_success.copy_(success)
         self._termination_reasons = {
             "allen_turn_success": success,
-            "allen_turn_acquisition_failure": acquisition_failure,
             "timeout": truncated,
         }
         self._episode_final_terms = {
-            "allen_turn_acquired": self._turn_acquired.float(),
             "allen_turn_subgoals_completed": self._turn_subgoal_index.float(),
             "allen_turn_full_success": self._turn_success.float(),
+            "allen_turn_ever_loaded_grasp": self._turn_ever_loaded_grasp.float(),
+            "allen_turn_loaded_grasp_at_end": self._turn_loaded_grasp.float(),
+            "allen_turn_max_grasp_quality": self._turn_max_grasp_quality,
+            "allen_turn_ever_palm_contact": self._turn_ever_palm_contact.float(),
+            "allen_turn_min_palm_handle_distance_m": (
+                self._turn_min_palm_handle_distance
+            ),
+            "allen_turn_max_finger_contact_count": (
+                self._turn_max_finger_contact_count.float()
+            ),
             "allen_turn_signed_progress_deg": torch.rad2deg(
                 self._turn_direction * self._turn_cumulative_angle
             ),
@@ -845,74 +1365,112 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         return terminated, truncated
 
     def _get_rewards(self) -> torch.Tensor:
-        phase_turning = self._turn_phase >= 1
-        increment = math.radians(float(self.cfg.allen_turn_goal_increment_deg))
-        directed_delta = self._turn_direction * self._turn_angle_delta
-        directed_progress = torch.clamp(
-            directed_delta / increment, min=-0.25, max=0.25
-        ) * phase_turning.float()
-        constraint = (
-            self._turn_constraint_position_error
-            / float(self.cfg.allen_turn_constraint_position_tolerance_m)
-        ).clamp(0.0, 2.0) + (
-            self._turn_constraint_tilt_error
-            / math.radians(float(self.cfg.allen_turn_constraint_tilt_tolerance_deg))
-        ).clamp(0.0, 2.0)
+        self._lifted_object |= self._turn_ever_loaded_grasp
+        base_reward = compute_rewards(self)
+        base_terms = dict(self._reward_terms)
+        base_terms.pop("total_reward", None)
+        # Preserve SimToolReal's acquisition -> pose-tracking structure, but
+        # replace terms whose geometry is invalid for a socket-engaged key.
+        # The key cannot be lifted and fingertip-to-root distance points toward
+        # the socket rather than toward the graspable handle.
+        for name in ("fingertip_delta_rew", "lifting_rew", "lift_bonus_rew"):
+            base_reward = base_reward - base_terms[name]
+            base_terms[name] = torch.zeros_like(base_terms[name])
+        self._lifted_object.copy_(self._turn_ever_loaded_grasp)
+
+        # Keep the original SimToolReal pose objective. Positive progress and
+        # goal bonuses require a currently maintained whole-hand grasp; pose
+        # regression remains fully negative.
+        for name in ("keypoint_rew", "bonus_rew"):
+            raw_term = base_terms[name]
+            qualified_term = gate_positive_progress(
+                raw_term,
+                self._turn_grasp_quality * self._turn_ever_loaded_grasp.float(),
+            )
+            base_reward = base_reward - raw_term + qualified_term
+            base_terms[name] = qualified_term
+        self._turn_qualified_progress.copy_(base_terms["keypoint_rew"])
+        self._turn_unqualified_positive_progress.copy_(
+            torch.relu(self._reward_terms["keypoint_rew"])
+            * (1.0 - self._turn_grasp_quality)
+        )
+
+        regularization_scale = float(
+            self.cfg.allen_turn_regularization_scale_stages[
+                self._turn_curriculum_stage
+            ]
+        )
+        for name in ("kuka_actions_penalty", "hand_actions_penalty"):
+            raw_term = base_terms[name]
+            scaled_term = regularization_scale * raw_term
+            base_reward = base_reward - raw_term + scaled_term
+            base_terms[name] = scaled_term
+
+        execution_phase = self._turn_phase >= 1
+        pregrasp = ~self._turn_ever_loaded_grasp
+        handle_approach_reward = (
+            float(self.cfg.allen_turn_handle_approach_progress_weight)
+            * self._turn_approach_progress
+            - float(self.cfg.allen_turn_handle_proximity_penalty_weight)
+            * (1.0 - self._turn_approach_potential)
+            * pregrasp.float()
+        )
         weighted = {
-            "acquisition_approach_rew": (
-                float(self.cfg.allen_turn_fingertip_approach_weight)
-                * self._turn_fingertip_approach
+            "handle_approach_rew": handle_approach_reward,
+            "first_loaded_grasp_bonus": (
+                float(self.cfg.allen_turn_first_loaded_grasp_bonus)
+                * self._turn_just_loaded_grasp.float()
             ),
-            "acquisition_bonus": (
-                float(self.cfg.allen_turn_acquisition_bonus)
-                * self._turn_just_acquired.float()
-            ),
-            "turn_progress_rew": (
-                float(self.cfg.allen_turn_angular_progress_weight) * directed_progress
-            ),
-            "subgoal_progress_rew": (
-                float(self.cfg.allen_turn_subgoal_progress_weight)
-                * self._turn_subgoal_potential_progress
+            "grasp_maintenance_rew": (
+                float(self.cfg.allen_turn_grasp_maintenance_reward_weight)
+                * self._turn_grasp_quality
+                * execution_phase.float()
+                * self._turn_ever_loaded_grasp.float()
             ),
             "subgoal_bonus": (
                 float(self.cfg.allen_turn_subgoal_bonus)
                 * self._turn_just_subgoal.float()
             ),
-            "final_hold_rew": (
-                float(self.cfg.allen_turn_final_hold_reward)
-                * ((self._turn_phase == 2) & self._turn_stable_grasp).float()
-            ),
-            "final_success_bonus": (
-                float(self.cfg.allen_turn_final_success_bonus)
+            "full_turn_bonus": (
+                float(self.cfg.allen_turn_full_turn_bonus)
                 * self._turn_just_succeeded.float()
             ),
             "finger_effort_penalty": (
-                -float(self.cfg.allen_turn_effort_penalty_weight)
+                -regularization_scale
+                * float(self.cfg.allen_turn_effort_penalty_weight)
                 * self._turn_effort_penalty
             ),
-            "constraint_penalty": (
-                -float(self.cfg.allen_turn_constraint_penalty_weight) * constraint
-            ),
             "action_rate_penalty": (
-                -float(self.cfg.allen_turn_action_rate_penalty_weight)
+                -regularization_scale
+                * float(self.cfg.allen_turn_action_rate_penalty_weight)
                 * self._turn_action_delta_sq
             ),
         }
-        reward = torch.stack(tuple(weighted.values())).sum(0)
+        reward = base_reward + torch.stack(tuple(weighted.values())).sum(0)
         if not bool(torch.isfinite(reward).all()):
             raise RuntimeError("Allen-key turning reward contains NaN or Inf")
-        self._reward_terms = {**weighted, "total_reward": reward}
+        self._reward_terms = {**base_terms, **weighted, "total_reward": reward}
         self._episode_cumulative_terms = {}
         for name, mask in (
-            ("acquisition", self._turn_phase == 0),
             ("turning", self._turn_phase == 1),
             ("final_hold", self._turn_phase == 2),
         ):
             self._episode_cumulative_terms[f"phase/{name}_reward_sum"] = reward * mask.float()
             self._episode_cumulative_terms[f"phase/{name}_step_count"] = mask.float()
         self.extras.update({
-            "allen_turn/acquisition_ratio": self._turn_acquired.float().mean(),
             "allen_turn/stable_grasp_ratio": self._turn_stable_grasp.float().mean(),
+            "allen_turn/loaded_grasp_ratio": self._turn_loaded_grasp.float().mean(),
+            "allen_turn/grasp_quality_mean": self._turn_grasp_quality.mean(),
+            "allen_turn/ever_loaded_grasp_ratio": (
+                self._turn_ever_loaded_grasp.float().mean()
+            ),
+            "allen_turn/first_loaded_grasp_ratio": (
+                self._turn_just_loaded_grasp.float().mean()
+            ),
+            "allen_turn/grasp_hold_steps_mean": (
+                self._turn_grasp_hold_count.float().mean()
+            ),
+            "allen_turn/contact_support_ratio": self._turn_contact_support.float().mean(),
             "allen_turn/subgoals_completed_mean": self._turn_subgoal_index.float().mean(),
             "allen_turn/full_turn_success_ratio": self._turn_success.float().mean(),
             "allen_turn/signed_progress_mean_deg": torch.rad2deg(
@@ -922,8 +1480,34 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
                 self._turn_angle_error.abs()
             ).mean(),
             "allen_turn/palm_contact_ratio": self._turn_palm_contact.float().mean(),
-            "allen_turn/fingertip_contact_count_mean": (
-                self._turn_fingertip_contact.float().sum(-1).mean()
+            "allen_turn/palm_supported_ratio": self._turn_palm_supported.float().mean(),
+            "allen_turn/palm_handle_distance_mean_m": (
+                self._turn_palm_handle_distance.mean()
+            ),
+            "allen_turn/initial_palm_handle_distance_mean_m": (
+                self._turn_initial_palm_handle_distance.mean()
+            ),
+            "allen_turn/initial_palm_handle_distance_max_m": (
+                self._turn_initial_palm_handle_distance.max()
+            ),
+            "allen_turn/initial_palm_handle_distance_limit_m": torch.tensor(
+                float(self.cfg.allen_turn_max_initial_palm_handle_distance_stages_m[
+                    self._turn_curriculum_stage
+                ]),
+                device=self.device,
+            ),
+            "allen_turn/initial_robot_resample_count_mean": (
+                self._turn_initial_robot_resample_count.float().mean()
+            ),
+            "allen_turn/approach_potential_mean": self._turn_approach_potential.mean(),
+            "allen_turn/qualified_progress_mean": (
+                self._turn_qualified_progress.mean()
+            ),
+            "allen_turn/unqualified_positive_progress_mean": (
+                self._turn_unqualified_positive_progress.mean()
+            ),
+            "allen_turn/finger_contact_count_mean": (
+                self._turn_finger_contact.float().sum(-1).mean()
             ),
             "allen_turn/finger_effort_mean_ratio": self._turn_effort_mean_ratio.mean(),
             "allen_turn/finger_effort_max_ratio": self._turn_effort_max_ratio.mean(),
@@ -948,12 +1532,84 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
             "allen_turn/constraint_tilt_error_mean_deg": torch.rad2deg(
                 self._turn_constraint_tilt_error
             ).mean(),
-            "curriculum/allen_turn_stage": self._turn_curriculum_stage,
-            "curriculum/allen_turn_resistance_nm": self._current_resistance_torque_nm(),
-            "curriculum/allen_turn_acquisition_rate": (
-                self._turn_curriculum_acquisition_rate
+            "allen_turn/initial_shoulder_to_handle_mean_m": (
+                self._turn_initial_shoulder_to_handle_m.mean()
             ),
-            "curriculum/allen_turn_conditional_success_rate": (
+            "allen_turn/initial_shoulder_to_handle_max_m": (
+                self._turn_initial_shoulder_to_handle_m.max()
+            ),
+            "allen_turn/fixture_torque_abs_mean_nm": (
+                self._turn_fixture_torque_nm.abs().mean()
+            ),
+            "allen_turn/fixture_torque_abs_max_nm": (
+                self._turn_fixture_torque_nm.abs().max()
+            ),
+            "allen_turn/fixture_torque_episode_peak_mean_nm": (
+                self._turn_fixture_torque_peak_nm.mean()
+            ),
+            "allen_turn/fixture_torque_episode_peak_max_nm": (
+                self._turn_fixture_torque_peak_nm.max()
+            ),
+            "allen_turn/fixture_torque_clip_ratio": (
+                self._turn_fixture_torque_clipped.float().mean()
+            ),
+            "allen_turn/fixture_torque_clipped_steps_mean": (
+                self._turn_fixture_torque_clipped_steps.float().mean()
+            ),
+            "allen_turn/fixture_torque_limit_mean_nm": (
+                float(self.cfg.allen_turn_max_fixture_torque_multiplier)
+                * self._turn_coulomb_friction_nm.mean()
+            ),
+            "allen_turn/fixture_stuck_ratio": self._turn_friction_stuck.float().mean(),
+            "allen_turn/coulomb_friction_mean_nm": (
+                self._turn_coulomb_friction_nm.mean()
+            ),
+            "allen_turn/coulomb_friction_min_nm": self._turn_coulomb_friction_nm.min(),
+            "allen_turn/coulomb_friction_max_nm": self._turn_coulomb_friction_nm.max(),
+            "allen_turn/damping_mean_nm_per_radps": (
+                self._turn_damping_nm_per_radps.mean()
+            ),
+            "allen_turn/damping_min_nm_per_radps": (
+                self._turn_damping_nm_per_radps.min()
+            ),
+            "allen_turn/damping_max_nm_per_radps": (
+                self._turn_damping_nm_per_radps.max()
+            ),
+            "curriculum/allen_turn_stage": self._turn_curriculum_stage,
+            "curriculum/allen_turn_palm_support_distance_m": (
+                self.cfg.allen_turn_palm_support_distance_stages_m[
+                    self._turn_curriculum_stage
+                ]
+            ),
+            "curriculum/allen_turn_regularization_scale": (
+                self.cfg.allen_turn_regularization_scale_stages[
+                    self._turn_curriculum_stage
+                ]
+            ),
+            "curriculum/allen_turn_friction_low_nm": (
+                self.cfg.allen_turn_friction_ranges_nm[
+                    self._turn_curriculum_stage
+                ][0]
+            ),
+            "curriculum/allen_turn_friction_high_nm": (
+                self.cfg.allen_turn_friction_ranges_nm[
+                    self._turn_curriculum_stage
+                ][1]
+            ),
+            "curriculum/allen_turn_damping_low_nm_per_radps": (
+                self.cfg.allen_turn_damping_ranges_nm_per_radps[
+                    self._turn_curriculum_stage
+                ][0]
+            ),
+            "curriculum/allen_turn_damping_high_nm_per_radps": (
+                self.cfg.allen_turn_damping_ranges_nm_per_radps[
+                    self._turn_curriculum_stage
+                ][1]
+            ),
+            "curriculum/allen_turn_fixture_torque_multiplier": (
+                self.cfg.allen_turn_max_fixture_torque_multiplier
+            ),
+            "curriculum/allen_turn_success_rate": (
                 self._turn_curriculum_conditional_success_rate
             ),
             "curriculum/allen_turn_updates": self._turn_curriculum_updates,

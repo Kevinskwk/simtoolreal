@@ -78,6 +78,7 @@ def build_trajectory_payload(
     timestamps=None,
     dt: float | None = None,
     object_poses: dict[str, np.ndarray] | None = None,
+    frame_scalars: dict[str, np.ndarray] | None = None,
     robot_base_poses=None,
     robot_name: str = "robot",
 ) -> dict:
@@ -122,6 +123,13 @@ def build_trajectory_payload(
         "positions": _serialize_array(joint_positions),
         "object_trajectories": _build_object_trajectories(object_poses, num_frames=num_frames),
     }
+    if frame_scalars:
+        trajectory["frame_scalars"] = {
+            name: _serialize_array(
+                _as_1d_float_array(values, name=f'frame_scalars["{name}"]', length=num_frames)
+            )
+            for name, values in frame_scalars.items()
+        }
 
     if robot_base_poses is not None:
         base_positions, base_quats = _split_pose7_array(robot_base_poses, name="robot_base_poses")
@@ -143,6 +151,7 @@ def create_html(
     robot_joint_positions,
     robots: list[dict],
     object_poses: dict[str, np.ndarray] | None = None,
+    frame_scalars: dict[str, np.ndarray] | None = None,
     robot_base_poses=None,
     timestamps=None,
     dt: float | None = None,
@@ -164,6 +173,7 @@ def create_html(
         timestamps=timestamps,
         dt=dt,
         object_poses=object_poses,
+        frame_scalars=frame_scalars,
         robot_base_poses=robot_base_poses,
         robot_name=robot_name,
     )

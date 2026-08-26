@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from isaaclab.sim import SimulationCfg
 from isaaclab.sensors.ray_caster import patterns
 from isaaclab.utils import configclass
 
@@ -21,12 +22,21 @@ from .simtoolreal_env_cfg import (
     ObsCfg,
     ResetCfg,
     SimToolRealEnvCfg,
+    _default_sim_cfg,
 )
 
 
 _TACMAP_ROOT = Path(__file__).resolve().parents[3] / "assets" / "tacmap"
 _ELASTOMER_OFFSET_ROT_WXYZ = (0.5, 0.5, -0.5, 0.5)
 _BASE_OBS = ObsCfg()
+
+
+def _allen_turn_sim_cfg() -> SimulationCfg:
+    cfg = _default_sim_cfg()
+    cfg.physx.min_velocity_iteration_count = 2
+    cfg.physx.max_velocity_iteration_count = 2
+    cfg.physx.enable_external_forces_every_iteration = True
+    return cfg
 
 
 @configclass
@@ -312,6 +322,8 @@ class SimToolRealStableScrapeEnvCfg(SimToolRealTacMapScrapePoseEnvCfg):
     # The vanilla observation tuple is an exact prefix for the frozen actor.
     frozen_acquisition_obs_dim: int = 140
     frozen_acquisition_coefficient_id: float = 0.0
+    frozen_acquisition_phase_field: str = "stable_phase"
+    frozen_acquisition_phase_source: str = "policy"
     obs: ObsCfg = ObsCfg(
         obs_list=_BASE_OBS.obs_list
         + ("stable_target_tangent_velocity", "stable_phase"),
@@ -705,7 +717,9 @@ class SimToolRealAllenKeyPalmDownAdjustmentEnvCfg(
 
 @configclass
 class SimToolRealAllenKeyTurningEnvCfg(SimToolRealTacMapEnvCfg):
-    """End-to-end acquisition and 360-degree Allen-key turning."""
+    """Single-policy 360-degree Allen-key pose tracking under resistance."""
+
+    sim: SimulationCfg = _allen_turn_sim_cfg()
 
     assets: AssetsCfg = AssetsCfg(
         table_urdf=str(
@@ -722,16 +736,53 @@ class SimToolRealAllenKeyTurningEnvCfg(SimToolRealTacMapEnvCfg):
         workpiece_collision_enabled=False,
         handle_head_types=("screwdriver",),
         allen_key_lengths_m=(0.20, 0.22, 0.24, 0.264, 0.28, 0.30, 0.32),
-        allen_key_handle_across_flats_m=0.030,
+        allen_key_handle_across_flats_m=0.020,
         allen_key_short_leg_length_m=0.060,
         allen_key_elbow_x_m=0.192,
     )
     use_tacmap: bool = False
     enable_vbts: bool = False
     include_tacmap_in_policy: bool = False
-    enable_fingertip_tool_contact_sensors: bool = True
+    enable_fingertip_tool_contact_sensors: bool = False
     enable_palm_tool_contact_sensor: bool = True
-    episode_length_s: float = 30.0
+    # One ContactSensor is created per surviving rigid link, then contacts are
+    # reduced to five per-finger values. A contact on any link of a finger is
+    # sufficient; multiple contacting links still count as one finger.
+    allen_turn_finger_tool_contact_prim_paths: tuple[tuple[str, ...], ...] = (
+        (
+            "/World/envs/env_.*/Robot/left_thumb_CMC_VL",
+            "/World/envs/env_.*/Robot/left_thumb_MC",
+            "/World/envs/env_.*/Robot/left_thumb_MCP_VL",
+            "/World/envs/env_.*/Robot/left_thumb_PP",
+            "/World/envs/env_.*/Robot/left_thumb_DP",
+        ),
+        (
+            "/World/envs/env_.*/Robot/left_index_MCP_VL",
+            "/World/envs/env_.*/Robot/left_index_PP",
+            "/World/envs/env_.*/Robot/left_index_MP",
+            "/World/envs/env_.*/Robot/left_index_DP",
+        ),
+        (
+            "/World/envs/env_.*/Robot/left_middle_MCP_VL",
+            "/World/envs/env_.*/Robot/left_middle_PP",
+            "/World/envs/env_.*/Robot/left_middle_MP",
+            "/World/envs/env_.*/Robot/left_middle_DP",
+        ),
+        (
+            "/World/envs/env_.*/Robot/left_ring_MCP_VL",
+            "/World/envs/env_.*/Robot/left_ring_PP",
+            "/World/envs/env_.*/Robot/left_ring_MP",
+            "/World/envs/env_.*/Robot/left_ring_DP",
+        ),
+        (
+            "/World/envs/env_.*/Robot/left_pinky_MC",
+            "/World/envs/env_.*/Robot/left_pinky_MCP_VL",
+            "/World/envs/env_.*/Robot/left_pinky_PP",
+            "/World/envs/env_.*/Robot/left_pinky_MP",
+            "/World/envs/env_.*/Robot/left_pinky_DP",
+        ),
+    )
+    episode_length_s: float = 45.0
 
     allen_turn_screw_axis_tool: tuple[float, float, float] = (0.0, 0.0, -1.0)
     allen_turn_screw_pivot_tool_m: tuple[float, float, float] = (0.192, 0.0, -0.030)
@@ -741,56 +792,99 @@ class SimToolRealAllenKeyTurningEnvCfg(SimToolRealTacMapEnvCfg):
     allen_turn_goal_tolerance_deg: float = 6.0
     allen_turn_goal_hold_steps: int = 10
     allen_turn_final_hold_steps: int = 30
-    allen_turn_acquisition_hold_steps: int = 15
-    allen_turn_acquisition_timeout_steps: int = 240
     allen_turn_minimum_contact_fingers: int = 2
+    allen_turn_loaded_grasp_minimum_contact_fingers: int = 2
+    allen_turn_acquisition_hold_steps: int = 20
+    # Center-to-center distance from the physical palm mesh to the tool handle.
+    # The stage curriculum tightens the palm-supported grasp envelope.
+    allen_turn_palm_support_distance_stages_m: tuple[float, ...] = (
+        0.105, 0.100, 0.095, 0.090, 0.085, 0.080, 0.075
+    )
+    allen_turn_palm_support_soft_margin_m: float = 0.040
     allen_turn_contact_force_threshold_n: float = 0.05
     allen_turn_palm_contact_threshold_n: float = 0.05
     allen_turn_max_relative_linear_speed_mps: float = 0.08
     allen_turn_max_relative_angular_speed_radps: float = 2.0
 
-    # Pose curriculum is deliberately completed before non-zero load begins.
-    allen_turn_xy_half_range_stages_m: tuple[float, ...] = (
-        0.12, 0.16, 0.20, 0.20, 0.20, 0.20, 0.20
+    # Keep the graspable long-handle center in the original SimToolReal XY
+    # reset range. The Z ranges below refer to the screw pivot; the horizontal
+    # handle lies 3 cm above it. Workspace sampling remains fixed while the
+    # curriculum increases fixture resistance and regularization.
+    allen_turn_handle_center_x_range_stages_m: tuple[tuple[float, float], ...] = (
+        (-0.10, 0.10), (-0.10, 0.10), (-0.10, 0.10), (-0.10, 0.10),
+        (-0.10, 0.10), (-0.10, 0.10), (-0.10, 0.10),
+    )
+    allen_turn_handle_center_y_range_stages_m: tuple[tuple[float, float], ...] = (
+        (-0.10, 0.10), (-0.10, 0.10), (-0.10, 0.10), (-0.10, 0.10),
+        (-0.10, 0.10), (-0.10, 0.10), (-0.10, 0.10),
+    )
+    allen_turn_easy_yaw_probability_stages: tuple[float, ...] = (
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    )
+    allen_turn_max_shoulder_to_handle_stages_m: tuple[float, ...] = (
+        0.74, 0.76, 0.78, 0.80, 0.82, 0.84, 0.84
+    )
+    allen_turn_max_initial_palm_handle_distance_stages_m: tuple[float, ...] = (
+        0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.35
     )
     allen_turn_z_range_stages_m: tuple[tuple[float, float], ...] = (
-        (0.40, 0.52), (0.38, 0.58), (0.37, 0.67), (0.37, 0.67),
-        (0.37, 0.67), (0.37, 0.67), (0.37, 0.67),
+        (0.50, 0.60), (0.50, 0.60), (0.50, 0.60), (0.50, 0.60),
+        (0.50, 0.60), (0.50, 0.60), (0.50, 0.60),
     )
-    allen_turn_resistance_fractions: tuple[float, ...] = (
-        0.0, 0.0, 0.0, 0.25, 0.50, 0.75, 1.00
+    # Per-episode Coulomb friction and viscous damping are randomized. The
+    # curriculum expands these ranges; no constant load is applied.
+    allen_turn_friction_ranges_nm: tuple[tuple[float, float], ...] = (
+        (0.040, 0.080), (0.060, 0.120), (0.100, 0.200), (0.160, 0.320),
+        (0.250, 0.500), (0.350, 0.700), (0.500, 1.000),
     )
-    # Training launchers must override this from a validated calibration JSON.
-    allen_turn_calibrated_torque_nm: float = 0.0
-    allen_turn_require_calibrated_load: bool = True
-    allen_turn_fixture_damping_nm_per_radps: float = 0.05
-    allen_turn_resistance_transition_speed_radps: float = 0.20
+    allen_turn_damping_ranges_nm_per_radps: tuple[tuple[float, float], ...] = (
+        (0.025, 0.070), (0.040, 0.100), (0.060, 0.150), (0.090, 0.220),
+        (0.130, 0.320), (0.180, 0.450), (0.250, 0.600),
+    )
+    allen_turn_stiction_stiffness_nm_per_rad: float = 1.0
+    allen_turn_static_to_kinetic_friction_ratio: float = 1.5
+    # Bound the combined Coulomb and viscous reaction. Without this cap, a
+    # contact transient can turn damping into an arbitrarily large impulse.
+    allen_turn_max_fixture_torque_multiplier: float = 2.0
+    allen_turn_resistance_transition_speed_radps: float = 0.05
+    allen_turn_friction_restick_speed_radps: float = 0.03
     allen_turn_curriculum_min_episodes: int = 4096
-    allen_turn_curriculum_acquisition_threshold: float = 0.60
-    allen_turn_curriculum_conditional_success_threshold: float = 0.60
+    allen_turn_curriculum_success_threshold: float = 0.60
 
-    allen_turn_effort_soft_threshold_fraction: float = 0.70
-    allen_turn_effort_penalty_weight: float = 0.20
-    allen_turn_angular_progress_weight: float = 8.0
-    allen_turn_subgoal_progress_weight: float = 2.0
+    # Keep the original SimToolReal acquisition -> pose-tracking structure.
+    # The socket-engaged key cannot be lifted, so handle approach and loaded
+    # grasp replace the original fingertip-to-root and lift terms.
+    allen_turn_handle_approach_progress_weight: float = 20.0
+    allen_turn_handle_approach_sigma_m: float = 0.10
+    allen_turn_handle_proximity_penalty_weight: float = 0.05
+    allen_turn_first_loaded_grasp_bonus: float = 10.0
+    allen_turn_grasp_maintenance_reward_weight: float = 0.25
     allen_turn_subgoal_bonus: float = 8.0
-    allen_turn_acquisition_bonus: float = 10.0
-    allen_turn_final_success_bonus: float = 100.0
-    allen_turn_final_hold_reward: float = 4.0
-    allen_turn_fingertip_approach_weight: float = 20.0
+    allen_turn_full_turn_bonus: float = 100.0
+
+    # Regularization is weak while acquisition is being learned, then returns
+    # to its configured strength as the task curriculum advances.
+    allen_turn_regularization_scale_stages: tuple[float, ...] = (
+        0.10, 0.25, 0.40, 0.55, 0.70, 0.85, 1.00
+    )
+    allen_turn_effort_soft_threshold_fraction: float = 0.45
+    allen_turn_effort_penalty_weight: float = 2.0
     allen_turn_action_rate_penalty_weight: float = 0.01
-    allen_turn_constraint_penalty_weight: float = 2.0
     allen_turn_constraint_position_tolerance_m: float = 0.005
     allen_turn_constraint_tilt_tolerance_deg: float = 5.0
     allen_turn_hidden_table_offset_m: float = 1.0
     allen_turn_initial_hand_clearance_m: float = 0.015
     allen_turn_initial_arm_clearance_m: float = 0.055
-    allen_turn_initial_sampling_max_attempts: int = 64
+    allen_turn_initial_sampling_max_attempts: int = 128
+    allen_turn_initial_robot_resampling_max_attempts: int = 16
+    # Bound overlap recovery so a bad finger contact cannot launch the key in
+    # one physics frame. The revolute constraint handles the fixture geometry.
+    contact_max_depenetration_velocity_mps: float = 2.0
 
     reset: ResetCfg = ResetCfg(
-        reset_dof_pos_random_interval_arm=0.0,
-        reset_dof_pos_random_interval_fingers=0.0,
-        reset_dof_vel_random_interval=0.0,
+        reset_dof_pos_random_interval_arm=0.1,
+        reset_dof_pos_random_interval_fingers=0.1,
+        reset_dof_vel_random_interval=0.5,
     )
     domain_randomization: DomainRandomizationCfg = DomainRandomizationCfg(
         use_obs_delay=False,
@@ -803,21 +897,8 @@ class SimToolRealAllenKeyTurningEnvCfg(SimToolRealTacMapEnvCfg):
         torque_prob_range=(1.0e-12, 1.0e-12),
     )
     obs: ObsCfg = ObsCfg(
-        obs_list=(
-            "joint_pos", "joint_vel", "prev_action_targets", "palm_pos",
-            "palm_rot", "object_rot", "fingertip_pos_rel_palm",
-            "keypoints_rel_palm", "keypoints_rel_goal", "object_scales",
-            "allen_turn_state", "allen_turn_geometry",
-        ),
-        state_list=(
-            "joint_pos", "joint_vel", "prev_action_targets", "palm_pos",
-            "palm_rot", "palm_vel", "object_rot", "object_vel",
-            "fingertip_pos_rel_palm", "keypoints_rel_palm",
-            "keypoints_rel_goal", "object_scales",
-            "closest_keypoint_max_dist", "closest_fingertip_dist",
-            "progress", "reward", "allen_turn_state", "allen_turn_geometry",
-            "allen_turn_grasp", "allen_turn_effort",
-        ),
+        obs_list=_BASE_OBS.obs_list,
+        state_list=_BASE_OBS.state_list,
         clamp_abs_observations=10.0,
     )
 

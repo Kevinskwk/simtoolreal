@@ -1,8 +1,8 @@
-# End-to-end ungrasped Allen-key acquisition and resistance-loaded turning.
+# Single-policy SimToolReal finetuning for resistance-loaded Allen-key turning.
 use_tacmap: false
 enable_vbts: false
 include_tacmap_in_policy: false
-enable_fingertip_tool_contact_sensors: true
+enable_fingertip_tool_contact_sensors: false
 enable_palm_tool_contact_sensor: true
 
 assets:
@@ -11,16 +11,51 @@ assets:
   workpiece_collision_enabled: false
   handle_head_types: [screwdriver]
   allen_key_lengths_m: [0.20, 0.22, 0.24, 0.264, 0.28, 0.30, 0.32]
-  allen_key_handle_across_flats_m: 0.030
+  allen_key_handle_across_flats_m: 0.020
   allen_key_short_leg_length_m: 0.060
   allen_key_elbow_x_m: 0.192
 
-allen_turn_calibrated_torque_nm: 0.0
-allen_turn_require_calibrated_load: true
-allen_turn_fixture_damping_nm_per_radps: 0.05
-allen_turn_resistance_transition_speed_radps: 0.20
+allen_turn_friction_ranges_nm:
+  [[0.040, 0.080], [0.060, 0.120], [0.100, 0.200], [0.160, 0.320],
+   [0.250, 0.500], [0.350, 0.700], [0.500, 1.000]]
+allen_turn_damping_ranges_nm_per_radps:
+  [[0.025, 0.070], [0.040, 0.100], [0.060, 0.150], [0.090, 0.220],
+   [0.130, 0.320], [0.180, 0.450], [0.250, 0.600]]
+allen_turn_stiction_stiffness_nm_per_rad: 1.0
+allen_turn_static_to_kinetic_friction_ratio: 1.5
+allen_turn_resistance_transition_speed_radps: 0.05
+allen_turn_friction_restick_speed_radps: 0.03
+allen_turn_loaded_grasp_minimum_contact_fingers: 2
+allen_turn_acquisition_hold_steps: 20
+allen_turn_palm_support_distance_stages_m: [0.105, 0.100, 0.095, 0.090, 0.085, 0.080, 0.075]
+allen_turn_palm_support_soft_margin_m: 0.040
+allen_turn_handle_approach_progress_weight: 20.0
+allen_turn_handle_approach_sigma_m: 0.10
+allen_turn_handle_proximity_penalty_weight: 0.05
+allen_turn_first_loaded_grasp_bonus: 10.0
+allen_turn_grasp_maintenance_reward_weight: 0.25
+allen_turn_subgoal_bonus: 8.0
+allen_turn_full_turn_bonus: 100.0
+allen_turn_regularization_scale_stages: [0.10, 0.25, 0.40, 0.55, 0.70, 0.85, 1.00]
+allen_turn_effort_soft_threshold_fraction: 0.45
+allen_turn_effort_penalty_weight: 2.0
+allen_turn_action_rate_penalty_weight: 0.01
 allen_turn_initial_arm_clearance_m: 0.055
-episode_length_s: 30.0
+allen_turn_handle_center_x_range_stages_m:
+  [[-0.10, 0.10], [-0.10, 0.10], [-0.10, 0.10], [-0.10, 0.10],
+   [-0.10, 0.10], [-0.10, 0.10], [-0.10, 0.10]]
+allen_turn_handle_center_y_range_stages_m:
+  [[-0.10, 0.10], [-0.10, 0.10], [-0.10, 0.10], [-0.10, 0.10],
+   [-0.10, 0.10], [-0.10, 0.10], [-0.10, 0.10]]
+allen_turn_easy_yaw_probability_stages: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+allen_turn_max_shoulder_to_handle_stages_m: [0.74, 0.76, 0.78, 0.80, 0.82, 0.84, 0.84]
+allen_turn_max_initial_palm_handle_distance_stages_m: [0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.35]
+allen_turn_initial_sampling_max_attempts: 128
+allen_turn_initial_robot_resampling_max_attempts: 16
+allen_turn_z_range_stages_m:
+  [[0.50, 0.60], [0.50, 0.60], [0.50, 0.60], [0.50, 0.60],
+   [0.50, 0.60], [0.50, 0.60], [0.50, 0.60]]
+episode_length_s: 45.0
 
 scene:
   num_envs: 12288
@@ -36,24 +71,22 @@ domain_randomization:
   torque_prob_range: [1.0e-12, 1.0e-12]
 
 reset:
-  reset_dof_pos_random_interval_arm: 0.0
-  reset_dof_pos_random_interval_fingers: 0.0
-  reset_dof_vel_random_interval: 0.0
+  reset_dof_pos_random_interval_arm: 0.1
+  reset_dof_pos_random_interval_fingers: 0.1
+  reset_dof_vel_random_interval: 0.5
 
 termination:
-  episode_length: 1800
+  episode_length: 2700
   success_steps: 1000000
   max_consecutive_successes: 0
 
 obs:
   obs_list: [joint_pos, joint_vel, prev_action_targets, palm_pos, palm_rot,
              object_rot, fingertip_pos_rel_palm, keypoints_rel_palm,
-             keypoints_rel_goal, object_scales, allen_turn_state,
-             allen_turn_geometry]
+             keypoints_rel_goal, object_scales]
   state_list: [joint_pos, joint_vel, prev_action_targets, palm_pos, palm_rot,
                palm_vel, object_rot, object_vel, fingertip_pos_rel_palm,
                keypoints_rel_palm, keypoints_rel_goal, object_scales,
-               closest_keypoint_max_dist, closest_fingertip_dist, progress,
-               reward, allen_turn_state, allen_turn_geometry,
-               allen_turn_grasp, allen_turn_effort]
+               closest_keypoint_max_dist, closest_fingertip_dist, lifted_object,
+               progress, successes, reward]
   clamp_abs_observations: 10.0

@@ -66,7 +66,7 @@ def main() -> None:
     parser.add_argument(
         "--acquisition_checkpoint",
         default=None,
-        help="Frozen vanilla checkpoint used only during stable-scrape grasp acquisition.",
+        help="Frozen vanilla checkpoint used only during a task's grasp-acquisition phase.",
     )
     parser.add_argument("--rl_device", default="cuda:0")
     parser.add_argument("--sim_device", default="cuda:0")
@@ -84,6 +84,11 @@ def main() -> None:
     parser.add_argument("--capture_viewer_len", type=int, default=600)
     parser.add_argument("--capture_viewer_interval", type=int, default=6000)
     parser.add_argument("--capture_viewer_env_id", type=int, default=0)
+    parser.add_argument(
+        "--capture_viewer_episode_aligned",
+        action="store_true",
+        help="Start each pose-viewer capture at a reset of the selected environment.",
+    )
     parser.add_argument("--capture_viewer_wandb_key", default="interactive_viewer")
     parser.add_argument(
         "--capture_viewer_github_raw_base",
@@ -126,6 +131,7 @@ def main() -> None:
     from rl_games.torch_runner import Runner
 
     import isaacsimenvs  # noqa: F401  triggers gym.register side effects
+    from isaacsimenvs.tasks.simtoolreal.utils.obs_utils import OBS_FIELD_SIZES
     from isaacsimenvs.utils.hydra_utils import hydra_task_config_with_yaml
     from isaacsimenvs.utils.rlgames_utils import (
         EnvStatsAlgoObserver,
@@ -176,6 +182,7 @@ def main() -> None:
                 capture_len=args_cli.capture_viewer_len,
                 capture_interval=args_cli.capture_viewer_interval,
                 env_id=args_cli.capture_viewer_env_id,
+                episode_aligned=args_cli.capture_viewer_episode_aligned,
                 wandb_key=args_cli.capture_viewer_wandb_key,
                 github_raw_base=args_cli.capture_viewer_github_raw_base,
                 url_check=args_cli.capture_viewer_url_check,
@@ -232,11 +239,36 @@ def main() -> None:
                     "--acquisition_checkpoint is only valid for a task that defines "
                     "frozen_acquisition_obs_dim"
                 )
-            actor_obs_dim = int(inner.cfg.observation_space)
-            if tuple(inner.cfg.obs.obs_list[-2:]) != (
-                "stable_target_tangent_velocity", "stable_phase"
-            ):
-                raise RuntimeError("Stable phase fields must be the actor observation suffix")
+            phase_field = str(getattr(
+                inner.cfg, "frozen_acquisition_phase_field", "stable_phase"
+            ))
+            phase_source = str(getattr(
+                inner.cfg, "frozen_acquisition_phase_source", "policy"
+            ))
+            if phase_source == "policy":
+                phase_fields = tuple(inner.cfg.obs.obs_list)
+                rollout_phase_source = "obs"
+            elif phase_source == "critic":
+                phase_fields = tuple(inner.cfg.obs.state_list)
+                rollout_phase_source = "states"
+            else:
+                raise ValueError(
+                    "frozen_acquisition_phase_source must be 'policy' or 'critic', "
+                    f"got {phase_source!r}"
+                )
+            if phase_field not in phase_fields:
+                raise RuntimeError(
+                    f"frozen acquisition phase field {phase_field!r} is absent "
+                    f"from {phase_source} observations"
+                )
+            phase_index = phase_fields.index(phase_field)
+            phase_offset = sum(
+                OBS_FIELD_SIZES[name] for name in phase_fields[:phase_index]
+            )
+            if OBS_FIELD_SIZES[phase_field] < 3:
+                raise RuntimeError(
+                    f"frozen acquisition phase field {phase_field!r} has fewer than 3 values"
+                )
             acquisition_coefficient = float(
                 getattr(inner.cfg, "frozen_acquisition_coefficient_id", 0.0)
             )
@@ -246,7 +278,8 @@ def main() -> None:
                 "enabled": True,
                 "checkpoint": str(Path(args_cli.acquisition_checkpoint).expanduser().resolve()),
                 "observation_dim": int(acquisition_obs_dim),
-                "phase_offset": actor_obs_dim - 3,
+                "phase_source": rollout_phase_source,
+                "phase_offset": phase_offset,
                 "coefficient_id": acquisition_coefficient,
             }
 

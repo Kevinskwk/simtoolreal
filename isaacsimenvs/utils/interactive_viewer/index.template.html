@@ -160,6 +160,31 @@
         font-size: 12px;
       }
 
+      #frame-scalars {
+        position: absolute;
+        top: 20px;
+        left: 20px;
+        display: none;
+        gap: 5px;
+        min-width: 250px;
+        padding: 12px 14px;
+        border: 1px solid var(--panel-border);
+        border-radius: 8px;
+        background: var(--panel);
+        font-size: 14px;
+      }
+
+      .scalar-row {
+        display: flex;
+        justify-content: space-between;
+        gap: 20px;
+      }
+
+      .scalar-value {
+        color: var(--accent);
+        font-weight: 700;
+      }
+
       .legend-row {
         display: flex;
         align-items: center;
@@ -200,9 +225,12 @@
     <div id="app">
       <div id="viewer"></div>
       <div id="error"></div>
+      <div id="frame-scalars"></div>
       <div id="palm-legend">
         <div class="legend-row"><span class="legend-swatch" style="background:#0de6ff"></span>Current palm</div>
-        <div class="legend-row"><span class="legend-swatch" style="background:#ff1abf"></span>Target palm</div>
+        <div id="target-palm-legend" class="legend-row"><span class="legend-swatch" style="background:#ff1abf"></span>Target palm</div>
+        <div id="tool-frame-legend" class="legend-row"><span class="legend-swatch" style="background:#ff8c0d"></span>Tool root frame</div>
+        <div id="handle-center-legend" class="legend-row"><span class="legend-swatch" style="background:#ffe60d"></span>Handle center</div>
       </div>
       <div id="hud">
         <div id="titlebar">
@@ -244,22 +272,28 @@
       const timelineEl = document.getElementById("timeline");
       const statusEl = document.getElementById("status");
       const frameMetaEl = document.getElementById("frame-meta");
+      const frameScalarsEl = document.getElementById("frame-scalars");
 
       const sceneConfig = JSON.parse(document.getElementById("scene-json").textContent);
       const trajectory = sceneConfig.trajectory;
       const robotConfigs = sceneConfig.robots;
-      if (
-        robotConfigs.some((config) => config.name === "current_palm")
-        && robotConfigs.some((config) => config.name === "target_palm")
-      ) {
+      const robotNames = new Set(robotConfigs.map((config) => config.name));
+      if (robotNames.has("current_palm")) {
         document.getElementById("palm-legend").style.display = "grid";
       }
+      document.getElementById("target-palm-legend").style.display = robotNames.has("target_palm") ? "flex" : "none";
+      document.getElementById("tool-frame-legend").style.display = robotNames.has("tool_frame") ? "flex" : "none";
+      document.getElementById("handle-center-legend").style.display = robotNames.has("handle_center") ? "flex" : "none";
 
       const timestamps = trajectory.timestamps;
       const positions = trajectory.positions;
       const jointNames = trajectory.joint_names;
       const objectTrajectories = trajectory.object_trajectories ?? {};
       const robotBaseTrajectory = trajectory.base_trajectory ?? null;
+      const frameScalars = trajectory.frame_scalars ?? {};
+      if (Object.keys(frameScalars).length) {
+        frameScalarsEl.style.display = "grid";
+      }
 
       if (!timestamps.length || timestamps.length !== positions.length) {
         throw new Error("Trajectory must contain matching timestamps and positions arrays.");
@@ -368,6 +402,17 @@
         const timestamp = timestamps[frameIndex];
         statusEl.textContent = `t = ${timestamp.toFixed(2)}s`;
         frameMetaEl.textContent = `Frame ${frameIndex + 1} / ${timestamps.length}`;
+        frameScalarsEl.replaceChildren(...Object.entries(frameScalars).map(([name, values]) => {
+          const row = document.createElement("div");
+          row.className = "scalar-row";
+          const label = document.createElement("span");
+          label.textContent = name;
+          const value = document.createElement("span");
+          value.className = "scalar-value";
+          value.textContent = Number(values[frameIndex]).toFixed(4);
+          row.append(label, value);
+          return row;
+        }));
       }
 
       function applyFrame(frameIndex) {

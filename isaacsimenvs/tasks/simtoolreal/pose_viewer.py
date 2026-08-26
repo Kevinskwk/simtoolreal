@@ -56,6 +56,19 @@ TARGET_PALM_MARKER_URDF = """<?xml version="1.0"?>
   </link>
 </robot>
 """
+TOOL_FRAME_MARKER_URDF = CURRENT_PALM_MARKER_URDF.replace(
+    "current_palm_marker", "tool_frame_marker"
+).replace("current_palm_frame", "tool_frame").replace(
+    "0.05 0.9 1 0.75", "1.0 0.55 0.05 0.85"
+)
+HANDLE_CENTER_MARKER_URDF = """<?xml version="1.0"?>
+<robot name="handle_center_marker">
+  <link name="handle_center">
+    <visual><geometry><sphere radius="0.012"/></geometry>
+      <material name="yellow"><color rgba="1.0 0.9 0.05 0.95"/></material></visual>
+  </link>
+</robot>
+"""
 
 
 def _to_numpy(value: Any) -> np.ndarray:
@@ -248,6 +261,7 @@ def capture_pose_viewer_frame(env, env_id: int) -> dict[str, Any]:
 
     frame = {
         "env_id": int(env_id),
+        "timestamp_s": float(env.episode_length_buf[env_id]) * float(env.step_dt),
         "robot_joint_names": joint_names,
         "robot_joint_pos": _to_numpy(joint_pos),
         "robot_base_pose": _pose_xyzw(robot_root_pos, env.robot.data.root_quat_w[env_id]),
@@ -255,6 +269,24 @@ def capture_pose_viewer_frame(env, env_id: int) -> dict[str, Any]:
         "goal_pose": _pose_xyzw(goal_pos, env.goal_viz.data.root_quat_w[env_id]),
         "table_pose": _pose_xyzw(table_pos, env.table.data.root_quat_w[env_id]),
     }
+    palm_pose_fn = getattr(env, "_current_palm_center_pose_w", None)
+    handle_pose_fn = getattr(env, "_current_handle_center_pose_w", None)
+    if palm_pose_fn is not None:
+        palm_positions, palm_quaternions = palm_pose_fn()
+        frame["current_palm_pose"] = _pose_xyzw(
+            palm_positions[env_id] - origin, palm_quaternions[env_id]
+        )
+        frame["tool_frame_pose"] = frame["object_pose"].copy()
+        if handle_pose_fn is not None:
+            handle_positions, handle_quaternions = handle_pose_fn()
+            frame["handle_center_pose"] = _pose_xyzw(
+                handle_positions[env_id] - origin, handle_quaternions[env_id]
+            )
+            frame["Palm-to-handle center (m)"] = float(
+                np.linalg.norm(
+                    _to_numpy(palm_positions[env_id] - handle_positions[env_id])
+                )
+            )
     if hole is not None:
         hole_pos = hole.data.root_pos_w[env_id] - origin
         frame["hole_pose"] = _pose_xyzw(hole_pos, hole.data.root_quat_w[env_id])
@@ -266,11 +298,12 @@ def capture_pose_viewer_frame(env, env_id: int) -> dict[str, Any]:
     target_palm_pos = getattr(env, "_adjustment_target_palm_pos_w", None)
     target_palm_quat = getattr(env, "_adjustment_target_palm_quat_w", None)
     if target_palm_pos is not None and target_palm_quat is not None:
-        current_palm_pos = env.robot.data.body_link_pos_w[env_id, env._palm_body_id]
-        current_palm_quat = env.robot.data.body_link_quat_w[env_id, env._palm_body_id]
-        frame["current_palm_pose"] = _pose_xyzw(
-            current_palm_pos - origin, current_palm_quat
-        )
+        if "current_palm_pose" not in frame:
+            current_palm_pos = env.robot.data.body_link_pos_w[env_id, env._palm_body_id]
+            current_palm_quat = env.robot.data.body_link_quat_w[env_id, env._palm_body_id]
+            frame["current_palm_pose"] = _pose_xyzw(
+                current_palm_pos - origin, current_palm_quat
+            )
         frame["target_palm_pose"] = _pose_xyzw(
             target_palm_pos[env_id] - origin, target_palm_quat[env_id]
         )
@@ -328,7 +361,13 @@ def build_pose_viewer_html(
             raw_base=raw_base,
         )
 
-    timestamps = np.arange(len(frames), dtype=np.float32) / 60.0
+    if all("timestamp_s" in frame for frame in frames):
+        timestamps = np.asarray(
+            [frame["timestamp_s"] for frame in frames], dtype=np.float32
+        )
+        timestamps -= timestamps[0]
+    else:
+        timestamps = np.arange(len(frames), dtype=np.float32) / 60.0
     robots = [
         make_url_robot(name="robot", urdf_url=robot_urdf_url, animated=True),
         make_embedded_robot(name="table", urdf_text=table_urdf_text),
@@ -344,18 +383,33 @@ def build_pose_viewer_html(
         "object": np.stack([frame["object_pose"] for frame in frames]),
         "goal": np.stack([frame["goal_pose"] for frame in frames]),
     }
-    if all("target_palm_pose" in frame for frame in frames):
-        if not all("current_palm_pose" in frame for frame in frames):
-            raise ValueError("target palm frames require matching current palm frames")
+    if all("current_palm_pose" in frame for frame in frames):
         robots.append(make_embedded_robot(
             name="current_palm", urdf_text=CURRENT_PALM_MARKER_URDF
-        ))
-        robots.append(make_embedded_robot(
-            name="target_palm", urdf_text=TARGET_PALM_MARKER_URDF
         ))
         object_poses["current_palm"] = np.stack([
             frame["current_palm_pose"] for frame in frames
         ])
+    if all("tool_frame_pose" in frame for frame in frames):
+        robots.append(make_embedded_robot(
+            name="tool_frame", urdf_text=TOOL_FRAME_MARKER_URDF
+        ))
+        object_poses["tool_frame"] = np.stack([
+            frame["tool_frame_pose"] for frame in frames
+        ])
+    if all("handle_center_pose" in frame for frame in frames):
+        robots.append(make_embedded_robot(
+            name="handle_center", urdf_text=HANDLE_CENTER_MARKER_URDF
+        ))
+        object_poses["handle_center"] = np.stack([
+            frame["handle_center_pose"] for frame in frames
+        ])
+    if all("target_palm_pose" in frame for frame in frames):
+        if not all("current_palm_pose" in frame for frame in frames):
+            raise ValueError("target palm frames require matching current palm frames")
+        robots.append(make_embedded_robot(
+            name="target_palm", urdf_text=TARGET_PALM_MARKER_URDF
+        ))
         object_poses["target_palm"] = np.stack([
             frame["target_palm_pose"] for frame in frames
         ])
@@ -377,6 +431,11 @@ def build_pose_viewer_html(
         robot_joint_positions=np.stack([frame["robot_joint_pos"] for frame in frames]),
         robots=robots,
         object_poses=object_poses,
+        frame_scalars={
+            "Palm-to-handle center (m)": np.asarray([
+                frame["Palm-to-handle center (m)"] for frame in frames
+            ])
+        } if all("Palm-to-handle center (m)" in frame for frame in frames) else None,
         robot_base_poses=np.stack([frame["robot_base_pose"] for frame in frames]),
         timestamps=timestamps,
     )
@@ -393,6 +452,7 @@ class SimToolRealPoseViewerWrapper(gym.Wrapper):
         capture_len: int,
         capture_interval: int,
         env_id: int = 0,
+        episode_aligned: bool = False,
         wandb_key: str = "interactive_viewer",
         github_raw_base: str | None = None,
         url_check: str = "skip",
@@ -411,6 +471,7 @@ class SimToolRealPoseViewerWrapper(gym.Wrapper):
         self.capture_len = int(capture_len)
         self.capture_interval = int(capture_interval)
         self.env_id = int(env_id)
+        self.episode_aligned = bool(episode_aligned)
         self.wandb_key = wandb_key
         self.github_raw_base = github_raw_base
         self.url_check = url_check
@@ -426,6 +487,8 @@ class SimToolRealPoseViewerWrapper(gym.Wrapper):
         self._step = 0
         self._capture_index = 0
         self._frames: list[dict[str, Any]] | None = []
+        self._capture_armed = False
+        self._next_capture_step = self.capture_interval
         # Per-capture buffers of (C, H, W) student-camera frames (numpy, [0, 1] floats).
         # _depth_frames is the policy's actual input (noise-on path).
         # _depth_frames_clean is the same view without depth augmentation,
@@ -438,31 +501,70 @@ class SimToolRealPoseViewerWrapper(gym.Wrapper):
         print(
             "[pose_viewer] enabled: "
             f"env_id={self.env_id} len={self.capture_len} interval={self.capture_interval} "
+            f"episode_aligned={self.episode_aligned} "
             f"output_dir={self.output_dir}",
             flush=True,
         )
+
+    def reset(self, **kwargs):
+        result = self.env.reset(**kwargs)
+        if self._frames is not None and not self._frames:
+            self._append_capture_frame()
+        return result
 
     def step(self, action):
         result = self.env.step(action)
         self._step += 1
 
-        if self._frames is None and self.capture_interval > 0 and self._step % self.capture_interval == 0:
-            self._frames = []
-            self._depth_frames = []
-            self._depth_frames_clean = []
+        selected_env_done = False
+        if self.episode_aligned:
+            terminated, truncated = result[2], result[3]
+            selected_env_done = bool(
+                terminated[self.env_id].item() or truncated[self.env_id].item()
+            )
 
         if self._frames is not None:
-            self._frames.append(capture_pose_viewer_frame(self.env.unwrapped, self.env_id))
-            depth_frame = self._capture_student_image()
-            if depth_frame is not None:
-                self._depth_frames.append(depth_frame)
-            clean_frame = self._capture_student_image_clean()
-            if clean_frame is not None:
-                self._depth_frames_clean.append(clean_frame)
-            if len(self._frames) >= self.capture_len:
+            if self.episode_aligned and selected_env_done:
+                # DirectRLEnv has already reset by now, so do not append that
+                # reset state to the episode which just ended.
                 self._finalize_capture()
+            else:
+                self._append_capture_frame()
+                if len(self._frames) >= self.capture_len:
+                    self._finalize_capture()
+
+        if self._frames is None and self.capture_interval > 0:
+            if self.episode_aligned:
+                if self._step >= self._next_capture_step:
+                    self._capture_armed = True
+                    while self._next_capture_step <= self._step:
+                        self._next_capture_step += self.capture_interval
+                if self._capture_armed and selected_env_done:
+                    # DirectRLEnv has reset the selected environment by this
+                    # point. Record that initial state, then the following
+                    # policy transitions.
+                    self._start_capture()
+                    self._append_capture_frame()
+                    self._capture_armed = False
+            elif self._step % self.capture_interval == 0:
+                self._start_capture()
 
         return result
+
+    def _start_capture(self) -> None:
+        self._frames = []
+        self._depth_frames = []
+        self._depth_frames_clean = []
+
+    def _append_capture_frame(self) -> None:
+        assert self._frames is not None
+        self._frames.append(capture_pose_viewer_frame(self.env.unwrapped, self.env_id))
+        depth_frame = self._capture_student_image()
+        if depth_frame is not None:
+            self._depth_frames.append(depth_frame)
+        clean_frame = self._capture_student_image_clean()
+        if clean_frame is not None:
+            self._depth_frames_clean.append(clean_frame)
 
     def _capture_student_image(self):
         """Pull the env_id slice of the student's input image, if the env exposes one.

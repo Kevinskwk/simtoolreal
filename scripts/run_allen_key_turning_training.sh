@@ -1,54 +1,36 @@
 #!/usr/bin/env bash
-# Finetune end-to-end Allen-key acquisition and loaded 360-degree turning.
+# Finetune SimToolReal with grasp-qualified 360-degree Allen-key turning.
 
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
-CALIBRATION_JSON="${CALIBRATION_JSON:-}"
 CHECKPOINT="${CHECKPOINT:-${ROOT}/pretrained_policy/model.pth}"
 NUM_ENVS="${NUM_ENVS:-12288}"
 MAX_EPOCHS="${MAX_EPOCHS:-12000}"
 SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-0}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
+WANDB_NAME="${WANDB_NAME:-allen_key_high_load_full_turn_${STAMP}}"
+PRETRAINED_SAPG_GROUPS=6
 
-if [[ -z "${CALIBRATION_JSON}" || ! -f "${CALIBRATION_JSON}" ]]; then
-  echo "ERROR: set CALIBRATION_JSON to a completed calibration.json" >&2
-  exit 2
-fi
 if [[ ! -f "${CHECKPOINT}" ]]; then
   echo "ERROR: checkpoint does not exist: ${CHECKPOINT}" >&2
   exit 2
 fi
 
-CALIBRATED_TORQUE="$(python - "${CALIBRATION_JSON}" <<'PY'
-import json
-import math
-import pathlib
-import sys
+if (( NUM_ENVS % PRETRAINED_SAPG_GROUPS != 0 )); then
+  echo "ERROR: NUM_ENVS=${NUM_ENVS} must be divisible by ${PRETRAINED_SAPG_GROUPS} to preserve the pretrained SAPG heads" >&2
+  exit 2
+fi
+EXPL_BLOCK_SIZE=$((NUM_ENVS / PRETRAINED_SAPG_GROUPS))
+# One reset frame plus up to 2700 policy transitions. A normal timeout is
+# finalized at its reset boundary and therefore contains exactly 2700 frames.
+CAPTURE_VIEWER_LEN="${CAPTURE_VIEWER_LEN:-2701}"
+CAPTURE_VIEWER_INTERVAL="${CAPTURE_VIEWER_INTERVAL:-6000}"
 
-path = pathlib.Path(sys.argv[1])
-payload = json.loads(path.read_text())
-if payload.get("schema_version") != 1:
-    raise SystemExit(f"ERROR: unsupported calibration schema in {path}")
-value = payload.get("recommended_training_torque_nm")
-if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-    raise SystemExit(f"ERROR: calibration has invalid recommended torque: {value!r}")
-if int(payload.get("num_grasps", 0)) < 8:
-    raise SystemExit("ERROR: calibration used fewer than eight grasps")
-print(f"{value:.9g}")
-PY
-)"
-
-echo "[allen-turn] calibrated maximum=${CALIBRATED_TORQUE} N m"
 if [[ "${SKIP_PREFLIGHT}" != "1" ]]; then
   python scripts/validate_allen_key_turning_task.py \
-    --test-torque-nm "$(python - "${CALIBRATED_TORQUE}" <<'PY'
-import sys
-print(max(0.02, 0.2 * float(sys.argv[1])))
-PY
-)" \
     --output "${ROOT}/outputs/allen_key_turning_validation/preflight_${STAMP}.html" \
     --headless
 fi
@@ -58,17 +40,18 @@ python isaacsimenvs/train.py \
   --agent rl_games_sapg_cfg_entry_point \
   --headless \
   --capture_viewer \
+  --capture_viewer_len "${CAPTURE_VIEWER_LEN}" \
+  --capture_viewer_interval "${CAPTURE_VIEWER_INTERVAL}" \
+  --capture_viewer_episode_aligned \
   --checkpoint "${CHECKPOINT}" \
-  --checkpoint_load_mode expand_obs \
+  --checkpoint_load_mode weights \
   --wandb_activate \
   --wandb_project simtoolreal \
-  --wandb_name "allen_key_end_to_end_turning_${STAMP}" \
-  env.allen_turn_calibrated_torque_nm="${CALIBRATED_TORQUE}" \
-  env.allen_turn_require_calibrated_load=true \
+  --wandb_name "${WANDB_NAME}" \
   env.scene.num_envs="${NUM_ENVS}" \
   agent.params.config.max_epochs="${MAX_EPOCHS}" \
   agent.params.config.minibatch_size=98304 \
   agent.params.config.central_value_config.minibatch_size=98304 \
-  agent.params.config.expl_coef_block_size=4096 \
+  agent.params.config.expl_coef_block_size="${EXPL_BLOCK_SIZE}" \
   agent.params.config.learning_rate=5e-5 \
   agent.params.config.central_value_config.learning_rate=5e-5
