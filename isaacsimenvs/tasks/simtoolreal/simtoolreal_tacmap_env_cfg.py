@@ -863,13 +863,13 @@ class SimToolRealAllenKeyTurningEnvCfg(SimToolRealTacMapEnvCfg):
         (0.025, 0.070), (0.040, 0.100), (0.060, 0.150), (0.090, 0.220),
         (0.130, 0.320), (0.180, 0.450), (0.250, 0.600),
     )
-    allen_turn_stiction_stiffness_nm_per_rad: float = 1.0
-    allen_turn_static_to_kinetic_friction_ratio: float = 1.5
-    # Bound the combined Coulomb and viscous reaction. Without this cap, a
-    # contact transient can turn damping into an arbitrarily large impulse.
+    # A force-limited zero-velocity angular drive implements regularized
+    # Coulomb friction plus viscous damping on the standalone revolute joint.
+    # Its effort cap bounds contact transients.
     allen_turn_max_fixture_torque_multiplier: float = 2.0
+    # Used only to estimate the native joint's dissipative reaction for logs.
     allen_turn_resistance_transition_speed_radps: float = 0.05
-    allen_turn_friction_restick_speed_radps: float = 0.03
+    allen_turn_stationary_speed_radps: float = 0.03
     allen_turn_curriculum_min_episodes: int = 4096
     allen_turn_curriculum_success_threshold: float = 0.60
 

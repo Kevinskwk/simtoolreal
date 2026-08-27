@@ -21,10 +21,9 @@ allen_turn_friction_ranges_nm:
 allen_turn_damping_ranges_nm_per_radps:
   [[0.025, 0.070], [0.040, 0.100], [0.060, 0.150], [0.090, 0.220],
    [0.130, 0.320], [0.180, 0.450], [0.250, 0.600]]
-allen_turn_stiction_stiffness_nm_per_rad: 1.0
-allen_turn_static_to_kinetic_friction_ratio: 1.5
+allen_turn_max_fixture_torque_multiplier: 2.0
 allen_turn_resistance_transition_speed_radps: 0.05
-allen_turn_friction_restick_speed_radps: 0.03
+allen_turn_stationary_speed_radps: 0.03
 allen_turn_loaded_grasp_minimum_contact_fingers: 2
 allen_turn_acquisition_hold_steps: 20
 allen_turn_palm_support_distance_stages_m: [0.105, 0.100, 0.095, 0.090, 0.085, 0.080, 0.075]

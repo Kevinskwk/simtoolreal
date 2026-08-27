@@ -242,6 +242,56 @@ def stick_slip_torsional_friction(
     return torque, stuck, restuck, clipped
 
 
+def fixture_resistance_estimate(
+    angular_velocity_radps: torch.Tensor,
+    *,
+    coulomb_friction_nm: float | torch.Tensor,
+    damping_nm_per_radps: float | torch.Tensor,
+    maximum_total_torque_multiplier: float,
+    transition_speed_radps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Estimate native joint resistance for diagnostics, not force sensing."""
+    if not bool(torch.isfinite(angular_velocity_radps).all()):
+        raise ValueError("fixture angular velocity contains NaN or Inf")
+    if (
+        not math.isfinite(maximum_total_torque_multiplier)
+        or maximum_total_torque_multiplier < 1.0
+    ):
+        raise ValueError("fixture torque multiplier must be finite and at least one")
+    if not math.isfinite(transition_speed_radps) or transition_speed_radps <= 0.0:
+        raise ValueError("fixture transition speed must be finite and positive")
+
+    def coefficient(value: float | torch.Tensor, name: str) -> torch.Tensor:
+        result = torch.as_tensor(
+            value,
+            dtype=angular_velocity_radps.dtype,
+            device=angular_velocity_radps.device,
+        )
+        if result.ndim == 0:
+            result = result.expand_as(angular_velocity_radps)
+        elif result.shape != angular_velocity_radps.shape:
+            raise ValueError(
+                f"{name} must be scalar or match angular velocity shape"
+            )
+        if not bool(torch.isfinite(result).all()) or bool((result < 0.0).any()):
+            raise ValueError(f"{name} must be finite and non-negative")
+        return result
+
+    friction = coefficient(coulomb_friction_nm, "coulomb_friction_nm")
+    damping = coefficient(damping_nm_per_radps, "damping_nm_per_radps")
+    effective_damping = friction / transition_speed_radps + damping
+    unclipped_estimate = -effective_damping * angular_velocity_radps
+    torque_cap = maximum_total_torque_multiplier * friction
+    estimate = torch.maximum(
+        torch.minimum(unclipped_estimate, torque_cap), -torque_cap
+    )
+    drive_clipped = unclipped_estimate.abs() > torque_cap
+    power = estimate * angular_velocity_radps
+    if bool((power > 1.0e-7).any()):
+        raise RuntimeError("fixture resistance estimate injects mechanical energy")
+    return estimate, drive_clipped, power
+
+
 def turn_goal_pose(
     initial_position: torch.Tensor,
     initial_quaternion: torch.Tensor,
@@ -631,6 +681,7 @@ def generate_allen_key_urdf_pool(
 __all__ = [
     "allen_key_urdf_text",
     "finger_effort_soft_penalty",
+    "fixture_resistance_estimate",
     "gate_positive_progress",
     "generate_allen_key_urdf_pool",
     "loaded_grasp_quality",

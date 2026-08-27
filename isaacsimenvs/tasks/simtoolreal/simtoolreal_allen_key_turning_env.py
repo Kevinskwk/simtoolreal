@@ -21,14 +21,13 @@ from .utils.action_utils import apply_action_pipeline
 from .utils.allen_key_turning_utils import (
     deep_grasp_quality,
     finger_effort_soft_penalty,
+    fixture_resistance_estimate,
     loaded_grasp_quality,
-    stick_slip_torsional_friction,
     translational_force_imbalance_penalty,
     turn_goal_pose,
     update_consecutive_grasp_hold,
     update_productive_regrasp_state,
     update_unwrapped_angle,
-    wrap_to_pi,
     yaw_from_quaternion,
 )
 from .utils.logging_utils import log_step_metrics
@@ -175,15 +174,18 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         self._turn_effort_max_ratio = torch.zeros(n, device=device)
         self._turn_effort_saturation = torch.zeros(n, device=device)
         self._turn_effort_mean_ratio = torch.zeros(n, device=device)
-        self._turn_stiction_yaw = torch.zeros(n, device=device)
-        self._turn_friction_stuck = torch.ones(n, dtype=torch.bool, device=device)
-        self._turn_fixture_torque_nm = torch.zeros(n, device=device)
-        self._turn_fixture_torque_clipped = torch.zeros(
+        self._turn_fixture_stationary = torch.ones(n, dtype=torch.bool, device=device)
+        self._turn_fixture_resistance_estimate_nm = torch.zeros(n, device=device)
+        self._turn_fixture_drive_clipped = torch.zeros(
             n, dtype=torch.bool, device=device
         )
-        self._turn_fixture_torque_peak_nm = torch.zeros(n, device=device)
-        self._turn_fixture_torque_clipped_steps = torch.zeros(
+        self._turn_fixture_resistance_peak_nm = torch.zeros(n, device=device)
+        self._turn_fixture_drive_clipped_steps = torch.zeros(
             n, dtype=torch.long, device=device
+        )
+        self._turn_fixture_dissipative_power_w = torch.zeros(n, device=device)
+        self._turn_fixture_positive_power = torch.zeros(
+            n, dtype=torch.bool, device=device
         )
         self._turn_coulomb_friction_nm = torch.zeros(n, device=device)
         self._turn_damping_nm_per_radps = torch.zeros(n, device=device)
@@ -246,6 +248,7 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         self.scene.write_data_to_sim()
         self._create_turn_fixture_joints()
         self._turn_fixture_joints_created = True
+        self._write_turn_fixture_joint_resistance(all_env_ids)
 
     @staticmethod
     def _validate_cfg(cfg: SimToolRealAllenKeyTurningEnvCfg) -> None:
@@ -344,20 +347,12 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
             raise ValueError("Allen-key initial hand clearance must be non-negative")
         if float(cfg.allen_turn_initial_arm_clearance_m) <= 0.0:
             raise ValueError("Allen-key initial arm clearance must be positive")
-        if float(cfg.allen_turn_stiction_stiffness_nm_per_rad) <= 0.0:
-            raise ValueError("Allen-key fixture stiction stiffness must be positive")
-        if float(cfg.allen_turn_static_to_kinetic_friction_ratio) < 1.0:
-            raise ValueError("Allen-key static friction must be at least kinetic friction")
-        if float(cfg.allen_turn_max_fixture_torque_multiplier) < float(
-            cfg.allen_turn_static_to_kinetic_friction_ratio
-        ):
-            raise ValueError(
-                "Allen-key fixture torque cap must cover the static-friction limit"
-            )
+        if float(cfg.allen_turn_max_fixture_torque_multiplier) < 1.0:
+            raise ValueError("Allen-key fixture torque multiplier must be at least one")
         if float(cfg.allen_turn_resistance_transition_speed_radps) <= 0.0:
             raise ValueError("Allen-key resistance transition speed must be positive")
-        if float(cfg.allen_turn_friction_restick_speed_radps) <= 0.0:
-            raise ValueError("Allen-key friction re-stick speed must be positive")
+        if float(cfg.allen_turn_stationary_speed_radps) <= 0.0:
+            raise ValueError("Allen-key stationary-speed threshold must be positive")
         if int(cfg.allen_turn_initial_sampling_max_attempts) <= 0:
             raise ValueError("Allen-key initial sampling attempts must be positive")
         if int(cfg.allen_turn_initial_robot_resampling_max_attempts) <= 0:
@@ -564,6 +559,7 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         """Constrain every key to its socket with a physical screw-axis joint."""
         stage = get_current_stage()
         pivot_tool = tuple(float(value) for value in self.cfg.allen_turn_screw_pivot_tool_m)
+        self._turn_fixture_joint_paths: list[str] = []
         for env_id in range(self.cfg.scene.num_envs):
             root = f"/World/envs/env_{env_id}"
             workpiece_path = f"{root}/Workpiece/workpiece_root"
@@ -591,6 +587,84 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
             joint.CreateLocalPos1Attr().Set(Gf.Vec3f(*pivot_tool))
             joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, Gf.Vec3f(0.0)))
             joint.CreateAxisAttr().Set(UsdPhysics.Tokens.z)
+            joint_prim = joint.GetPrim()
+            drive = UsdPhysics.DriveAPI.Apply(joint_prim, UsdPhysics.Tokens.angular)
+            if not drive:
+                raise RuntimeError(
+                    f"failed to apply angular DriveAPI to fixture joint {joint_prim.GetPath()}"
+                )
+            drive.CreateTypeAttr().Set("force")
+            drive.CreateStiffnessAttr().Set(0.0)
+            drive.CreateDampingAttr().Set(0.0)
+            drive.CreateTargetVelocityAttr().Set(0.0)
+            drive.CreateMaxForceAttr().Set(0.0)
+            self._turn_fixture_joint_paths.append(str(joint_prim.GetPath()))
+
+    def _write_turn_fixture_joint_resistance(self, env_ids: torch.Tensor) -> None:
+        """Author and verify resistance on the standalone PhysX revolute joints."""
+        if not self._turn_fixture_joints_created:
+            return
+        env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
+        if env_ids.numel() == 0:
+            return
+        if len(self._turn_fixture_joint_paths) != self.num_envs:
+            raise RuntimeError("Allen-key fixture joint registry is incomplete")
+
+        stage = get_current_stage()
+        ids = env_ids.detach().cpu().tolist()
+        friction_values = self._turn_coulomb_friction_nm[env_ids].detach().cpu().tolist()
+        damping_values = self._turn_damping_nm_per_radps[env_ids].detach().cpu().tolist()
+        multiplier = float(self.cfg.allen_turn_max_fixture_torque_multiplier)
+        radians_per_degree = math.pi / 180.0
+        for env_id, friction_nm, damping_nm_per_radps in zip(
+            ids, friction_values, damping_values
+        ):
+            joint_path = self._turn_fixture_joint_paths[env_id]
+            joint_prim = stage.GetPrimAtPath(joint_path)
+            if not joint_prim.IsValid():
+                raise RuntimeError(f"Allen-key fixture joint disappeared: {joint_path}")
+            drive = UsdPhysics.DriveAPI(joint_prim, UsdPhysics.Tokens.angular)
+            if not drive:
+                raise RuntimeError(
+                    f"Allen-key fixture resistance APIs are missing: {joint_path}"
+                )
+
+            # PhysxJointAPI friction is articulation-only, so this standalone
+            # fixture uses a force-limited zero-velocity drive. The first term
+            # is a regularized Coulomb model; angular drive gains are authored
+            # per degree in USD.
+            effective_damping_nm_per_radps = (
+                float(friction_nm)
+                / float(self.cfg.allen_turn_resistance_transition_speed_radps)
+                + float(damping_nm_per_radps)
+            )
+            damping_usd = effective_damping_nm_per_radps * radians_per_degree
+            drive_cap_nm = multiplier * float(friction_nm)
+            drive.GetStiffnessAttr().Set(0.0)
+            drive.GetDampingAttr().Set(damping_usd)
+            drive.GetTargetVelocityAttr().Set(0.0)
+            drive.GetMaxForceAttr().Set(drive_cap_nm)
+
+            drive_type = drive.GetTypeAttr().Get()
+            if drive_type is None or str(drive_type) != "force":
+                raise RuntimeError(
+                    f"Allen-key fixture drive is not force-based for {joint_path}: "
+                    f"actual={drive_type}"
+                )
+            authored = {
+                "drive stiffness": (drive.GetStiffnessAttr().Get(), 0.0),
+                "drive damping": (drive.GetDampingAttr().Get(), damping_usd),
+                "drive target velocity": (drive.GetTargetVelocityAttr().Get(), 0.0),
+                "drive max force": (drive.GetMaxForceAttr().Get(), drive_cap_nm),
+            }
+            for name, (actual, expected) in authored.items():
+                if actual is None or not math.isclose(
+                    float(actual), float(expected), rel_tol=1.0e-5, abs_tol=1.0e-7
+                ):
+                    raise RuntimeError(
+                        f"Allen-key {name} write failed for {joint_path}: "
+                        f"expected={expected}, actual={actual}"
+                    )
 
     def _current_palm_center_pose_w(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the physical palm mesh-center pose, not the merged wrist frame."""
@@ -625,6 +699,7 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         )
         self._turn_coulomb_friction_nm[env_ids] = friction
         self._turn_damping_nm_per_radps[env_ids] = damping
+        self._write_turn_fixture_joint_resistance(env_ids)
 
     def _reset_idx(self, env_ids) -> None:
         if env_ids is None:
@@ -780,13 +855,14 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         self._turn_pivot_w[env_ids] = pivot
         self._turn_initial_yaw[env_ids] = yaw
         self._turn_previous_yaw[env_ids] = yaw
-        self._turn_stiction_yaw[env_ids] = yaw
-        self._turn_friction_stuck[env_ids] = True
+        self._turn_fixture_stationary[env_ids] = True
         self._sample_resistance_coefficients(env_ids)
-        self._turn_fixture_torque_nm[env_ids] = 0.0
-        self._turn_fixture_torque_clipped[env_ids] = False
-        self._turn_fixture_torque_peak_nm[env_ids] = 0.0
-        self._turn_fixture_torque_clipped_steps[env_ids] = 0
+        self._turn_fixture_resistance_estimate_nm[env_ids] = 0.0
+        self._turn_fixture_drive_clipped[env_ids] = False
+        self._turn_fixture_resistance_peak_nm[env_ids] = 0.0
+        self._turn_fixture_drive_clipped_steps[env_ids] = 0
+        self._turn_fixture_dissipative_power_w[env_ids] = 0.0
+        self._turn_fixture_positive_power[env_ids] = False
         self._turn_cumulative_angle[env_ids] = 0.0
         self._turn_angle_delta[env_ids] = 0.0
         first_target = direction * math.radians(
@@ -1045,52 +1121,40 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
         )
         self._turn_previous_actions.copy_(actions)
         apply_action_pipeline(self, actions)
-        torque = torch.zeros(self.num_envs, 3, device=self.device)
-        current_yaw = yaw_from_quaternion(self.object.data.root_quat_w)
         angular_velocity = self.object.data.root_ang_vel_w[:, 2]
-        angular_displacement = wrap_to_pi(
-            current_yaw - self._turn_stiction_yaw
+        resistance_estimate, drive_clipped, dissipative_power = (
+            fixture_resistance_estimate(
+                angular_velocity,
+                coulomb_friction_nm=self._turn_coulomb_friction_nm,
+                damping_nm_per_radps=self._turn_damping_nm_per_radps,
+                maximum_total_torque_multiplier=float(
+                    self.cfg.allen_turn_max_fixture_torque_multiplier
+                ),
+                transition_speed_radps=float(
+                    self.cfg.allen_turn_resistance_transition_speed_radps
+                ),
+            )
         )
-        maximum_torque = (
-            float(self.cfg.allen_turn_max_fixture_torque_multiplier)
-            * self._turn_coulomb_friction_nm
+        positive_power = dissipative_power > 1.0e-7
+        if bool(positive_power.any()):
+            env_id = int(torch.nonzero(positive_power, as_tuple=False)[0])
+            raise RuntimeError(
+                "Allen-key fixture resistance estimate injects energy: "
+                f"env={env_id}, torque={float(resistance_estimate[env_id]):.6f} N m, "
+                f"omega={float(angular_velocity[env_id]):.6f} rad/s, "
+                f"power={float(dissipative_power[env_id]):.6f} W"
+            )
+        self._turn_fixture_stationary.copy_(
+            angular_velocity.abs() <= float(self.cfg.allen_turn_stationary_speed_radps)
         )
-        resistance, stuck, restuck, clipped = stick_slip_torsional_friction(
-            angular_displacement,
-            angular_velocity,
-            self._turn_friction_stuck,
-            kinetic_limit_nm=self._turn_coulomb_friction_nm,
-            static_to_kinetic_ratio=float(
-                self.cfg.allen_turn_static_to_kinetic_friction_ratio
-            ),
-            stiction_stiffness_nm_per_rad=float(
-                self.cfg.allen_turn_stiction_stiffness_nm_per_rad
-            ),
-            damping_nm_per_radps=self._turn_damping_nm_per_radps,
-            maximum_abs_torque_nm=maximum_torque,
-            kinetic_transition_speed_radps=float(
-                self.cfg.allen_turn_resistance_transition_speed_radps
-            ),
-            restick_speed_radps=float(
-                self.cfg.allen_turn_friction_restick_speed_radps
-            ),
-        )
-        self._turn_stiction_yaw.copy_(torch.where(
-            restuck, current_yaw, self._turn_stiction_yaw
+        self._turn_fixture_resistance_estimate_nm.copy_(resistance_estimate)
+        self._turn_fixture_drive_clipped.copy_(drive_clipped)
+        self._turn_fixture_resistance_peak_nm.copy_(torch.maximum(
+            self._turn_fixture_resistance_peak_nm, resistance_estimate.abs()
         ))
-        self._turn_friction_stuck.copy_(stuck)
-        self._turn_fixture_torque_nm.copy_(resistance)
-        self._turn_fixture_torque_clipped.copy_(clipped)
-        self._turn_fixture_torque_peak_nm.copy_(torch.maximum(
-            self._turn_fixture_torque_peak_nm, resistance.abs()
-        ))
-        self._turn_fixture_torque_clipped_steps.add_(clipped.long())
-        torque[:, 2] = resistance
-        self.object.set_external_force_and_torque(
-            torch.zeros(self.num_envs, 1, 3, device=self.device),
-            torque[:, None, :],
-            is_global=True,
-        )
+        self._turn_fixture_drive_clipped_steps.add_(drive_clipped.long())
+        self._turn_fixture_dissipative_power_w.copy_(dissipative_power)
+        self._turn_fixture_positive_power.copy_(positive_power)
 
     def _apply_action(self) -> None:
         self.robot.set_joint_position_target(self._cur_targets)
@@ -1991,29 +2055,40 @@ class SimToolRealAllenKeyTurningEnv(SimToolRealTacMapEnv):
             "allen_turn/initial_shoulder_to_handle_max_m": (
                 self._turn_initial_shoulder_to_handle_m.max()
             ),
-            "allen_turn/fixture_torque_abs_mean_nm": (
-                self._turn_fixture_torque_nm.abs().mean()
+            "allen_turn/fixture_resistance_estimate_abs_mean_nm": (
+                self._turn_fixture_resistance_estimate_nm.abs().mean()
             ),
-            "allen_turn/fixture_torque_abs_max_nm": (
-                self._turn_fixture_torque_nm.abs().max()
+            "allen_turn/fixture_resistance_estimate_abs_max_nm": (
+                self._turn_fixture_resistance_estimate_nm.abs().max()
             ),
-            "allen_turn/fixture_torque_episode_peak_mean_nm": (
-                self._turn_fixture_torque_peak_nm.mean()
+            "allen_turn/fixture_resistance_estimate_episode_peak_mean_nm": (
+                self._turn_fixture_resistance_peak_nm.mean()
             ),
-            "allen_turn/fixture_torque_episode_peak_max_nm": (
-                self._turn_fixture_torque_peak_nm.max()
+            "allen_turn/fixture_resistance_estimate_episode_peak_max_nm": (
+                self._turn_fixture_resistance_peak_nm.max()
             ),
-            "allen_turn/fixture_torque_clip_ratio": (
-                self._turn_fixture_torque_clipped.float().mean()
+            "allen_turn/fixture_drive_clip_ratio": (
+                self._turn_fixture_drive_clipped.float().mean()
             ),
-            "allen_turn/fixture_torque_clipped_steps_mean": (
-                self._turn_fixture_torque_clipped_steps.float().mean()
+            "allen_turn/fixture_drive_clipped_steps_mean": (
+                self._turn_fixture_drive_clipped_steps.float().mean()
             ),
-            "allen_turn/fixture_torque_limit_mean_nm": (
+            "allen_turn/fixture_total_resistance_limit_mean_nm": (
                 float(self.cfg.allen_turn_max_fixture_torque_multiplier)
                 * self._turn_coulomb_friction_nm.mean()
             ),
-            "allen_turn/fixture_stuck_ratio": self._turn_friction_stuck.float().mean(),
+            "allen_turn/fixture_stationary_ratio": (
+                self._turn_fixture_stationary.float().mean()
+            ),
+            "allen_turn/fixture_dissipative_power_mean_w": (
+                self._turn_fixture_dissipative_power_w.mean()
+            ),
+            "allen_turn/fixture_dissipative_power_min_w": (
+                self._turn_fixture_dissipative_power_w.min()
+            ),
+            "allen_turn/fixture_positive_power_ratio": (
+                self._turn_fixture_positive_power.float().mean()
+            ),
             "allen_turn/coulomb_friction_mean_nm": (
                 self._turn_coulomb_friction_nm.mean()
             ),

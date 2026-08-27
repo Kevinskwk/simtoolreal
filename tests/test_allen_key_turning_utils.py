@@ -158,6 +158,31 @@ def test_stick_slip_friction_rejects_mismatched_coefficient_shape():
         )
 
 
+def test_native_fixture_resistance_estimate_is_dissipative_and_bounded():
+    velocity = torch.tensor([-2.0, 0.0, 2.0])
+    estimate, clipped, power = module.fixture_resistance_estimate(
+        velocity,
+        coulomb_friction_nm=torch.tensor([0.08, 0.08, 0.08]),
+        damping_nm_per_radps=0.07,
+        maximum_total_torque_multiplier=2.0,
+        transition_speed_radps=0.05,
+    )
+    assert estimate.tolist() == pytest.approx([0.16, 0.0, -0.16], abs=1e-6)
+    assert clipped.tolist() == [True, False, True]
+    assert bool((power <= 0.0).all())
+
+
+def test_native_fixture_resistance_estimate_rejects_bad_coefficients():
+    with pytest.raises(ValueError, match="non-negative"):
+        module.fixture_resistance_estimate(
+            torch.ones(2),
+            coulomb_friction_nm=-0.1,
+            damping_nm_per_radps=0.1,
+            maximum_total_torque_multiplier=2.0,
+            transition_speed_radps=0.05,
+        )
+
+
 def test_finger_effort_penalty_ignores_normal_grip_and_penalizes_excess():
     torque = torch.tensor([[0.2, 0.7, 1.0]])
     limits = torch.ones_like(torque)

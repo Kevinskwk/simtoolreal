@@ -295,6 +295,18 @@ def capture_pose_viewer_frame(env, env_id: int) -> dict[str, Any]:
         frame["workpiece_pose"] = _pose_xyzw(
             workpiece_pos, workpiece.data.root_quat_w[env_id]
         )
+    if hasattr(env, "_turn_fixture_resistance_estimate_nm"):
+        turn_scalars = {
+            "Screw angular speed (rad/s)": env.object.data.root_ang_vel_w[:, 2],
+            "Fixture resistance estimate (N m)": (
+                env._turn_fixture_resistance_estimate_nm
+            ),
+            "Fixture dissipative power (W)": env._turn_fixture_dissipative_power_w,
+            "Fixture Coulomb friction (N m)": env._turn_coulomb_friction_nm,
+            "Fixture damping (N m s/rad)": env._turn_damping_nm_per_radps,
+        }
+        for label, values in turn_scalars.items():
+            frame[label] = float(values[env_id])
     target_palm_pos = getattr(env, "_adjustment_target_palm_pos_w", None)
     target_palm_quat = getattr(env, "_adjustment_target_palm_quat_w", None)
     if target_palm_pos is not None and target_palm_quat is not None:
@@ -426,16 +438,25 @@ def build_pose_viewer_html(
             frame["workpiece_pose"] for frame in frames
         ])
 
+    scalar_labels = (
+        "Palm-to-handle center (m)",
+        "Screw angular speed (rad/s)",
+        "Fixture resistance estimate (N m)",
+        "Fixture dissipative power (W)",
+        "Fixture Coulomb friction (N m)",
+        "Fixture damping (N m s/rad)",
+    )
+    frame_scalars = {
+        label: np.asarray([frame[label] for frame in frames])
+        for label in scalar_labels
+        if all(label in frame for frame in frames)
+    }
     return create_html(
         joint_names=frames[0]["robot_joint_names"],
         robot_joint_positions=np.stack([frame["robot_joint_pos"] for frame in frames]),
         robots=robots,
         object_poses=object_poses,
-        frame_scalars={
-            "Palm-to-handle center (m)": np.asarray([
-                frame["Palm-to-handle center (m)"] for frame in frames
-            ])
-        } if all("Palm-to-handle center (m)" in frame for frame in frames) else None,
+        frame_scalars=frame_scalars or None,
         robot_base_poses=np.stack([frame["robot_base_pose"] for frame in frames]),
         timestamps=timestamps,
     )

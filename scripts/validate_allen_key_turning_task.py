@@ -22,6 +22,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-envs", type=int, default=8)
     parser.add_argument("--steps", type=int, default=60)
     parser.add_argument("--initial-angular-speed-radps", type=float, default=2.0)
+    parser.add_argument("--spin-down-max-steps", type=int, default=30)
+    parser.add_argument("--spin-down-stop-speed-radps", type=float, default=0.05)
+    parser.add_argument("--spin-down-max-travel-deg", type=float, default=30.0)
     parser.add_argument(
         "--output",
         type=Path,
@@ -77,6 +80,12 @@ def main() -> None:
         raise ValueError("--steps must be at least 20")
     if float(ARGS.initial_angular_speed_radps) <= 0.0:
         raise ValueError("--initial-angular-speed-radps must be positive")
+    if not 1 <= int(ARGS.spin_down_max_steps) <= int(ARGS.steps):
+        raise ValueError("--spin-down-max-steps must lie in [1, --steps]")
+    if float(ARGS.spin_down_stop_speed_radps) <= 0.0:
+        raise ValueError("--spin-down-stop-speed-radps must be positive")
+    if float(ARGS.spin_down_max_travel_deg) <= 0.0:
+        raise ValueError("--spin-down-max-travel-deg must be positive")
     cfg = SimToolRealAllenKeyTurningEnvCfg()
     cfg.scene.num_envs = int(ARGS.num_envs)
     stage_count = len(cfg.allen_turn_friction_ranges_nm)
@@ -266,9 +275,8 @@ def main() -> None:
         inner._turn_initial_tool_quat.copy_(quaternion)
         inner._turn_initial_yaw.zero_()
         inner._turn_previous_yaw.zero_()
-        inner._turn_stiction_yaw.zero_()
-        inner._turn_friction_stuck.fill_(True)
-        inner._turn_fixture_torque_nm.zero_()
+        inner._turn_fixture_stationary.fill_(True)
+        inner._turn_fixture_resistance_estimate_nm.zero_()
         inner._turn_cumulative_angle.zero_()
         inner._write_turn_goal(env_ids, torch.zeros(inner.num_envs, device=inner.device))
         frames.append(capture_pose_viewer_frame(inner, 0))
@@ -279,20 +287,19 @@ def main() -> None:
             require_finite(step, observation, reward)
             if bool(terminated.any()) or bool(truncated.any()):
                 raise RuntimeError("fixture task ended while settling the revolute joint")
-        inner._turn_stiction_yaw.copy_(yaw_from_quaternion(inner.object.data.root_quat_w))
         inner.object.write_root_velocity_to_sim(
             torch.zeros(inner.num_envs, 6, device=inner.device), env_ids=env_ids
         )
         passive_initial_yaw = yaw_from_quaternion(inner.object.data.root_quat_w).clone()
-        passive_max_fixture_torque = torch.zeros(
+        passive_max_fixture_resistance = torch.zeros(
             inner.num_envs, device=inner.device
         )
         for step in range(10):
             observation, reward, terminated, truncated, _ = env.step(action)
             require_finite(step, observation, reward)
-            passive_max_fixture_torque = torch.maximum(
-                passive_max_fixture_torque,
-                inner._turn_fixture_torque_nm.abs(),
+            passive_max_fixture_resistance = torch.maximum(
+                passive_max_fixture_resistance,
+                inner._turn_fixture_resistance_estimate_nm.abs(),
             )
             if bool(terminated.any()) or bool(truncated.any()):
                 raise RuntimeError("fixture task ended during passive smoke phase")
@@ -385,9 +392,7 @@ def main() -> None:
         inner._turn_damping_nm_per_radps.fill_(float(
             inner.cfg.allen_turn_damping_ranges_nm_per_radps[0][1]
         ))
-        static_limit_nm = kinetic_limit_nm * float(
-            inner.cfg.allen_turn_static_to_kinetic_friction_ratio
-        )
+        inner._write_turn_fixture_joint_resistance(env_ids)
         inner._turn_target_angle.copy_(directions * math.radians(30.0))
         initial_angular_speed = float(ARGS.initial_angular_speed_radps)
         initial_velocity = torch.zeros(inner.num_envs, 6, device=inner.device)
@@ -395,34 +400,62 @@ def main() -> None:
         inner.object.write_root_velocity_to_sim(
             initial_velocity, env_ids=env_ids
         )
-        inner._turn_friction_stuck.fill_(False)
+        inner._turn_fixture_stationary.fill_(False)
         inner._turn_previous_yaw.copy_(yaw_from_quaternion(inner.object.data.root_quat_w))
         inner._turn_cumulative_angle.zero_()
         initial_angle.zero_()
         inner._write_turn_goal(env_ids, inner._turn_target_angle)
-        first_fixture_torque = None
+        first_resistance_estimate = None
+        stop_steps = torch.full(
+            (inner.num_envs,), -1, dtype=torch.long, device=inner.device
+        )
         for step in range(int(ARGS.steps)):
             observation, reward, terminated, truncated, _ = env.step(action)
             require_finite(step + 10, observation, reward)
-            if first_fixture_torque is None:
-                first_fixture_torque = inner._turn_fixture_torque_nm.clone()
+            if first_resistance_estimate is None:
+                first_resistance_estimate = (
+                    inner._turn_fixture_resistance_estimate_nm.clone()
+                )
+            speed = inner.object.data.root_ang_vel_w[:, 2].abs()
+            newly_stopped = (stop_steps < 0) & (
+                speed <= float(ARGS.spin_down_stop_speed_radps)
+            )
+            stop_steps[newly_stopped] = step + 1
             if bool(terminated.any()) or bool(truncated.any()):
                 raise RuntimeError("fixture task ended during loaded smoke phase")
             if step in (0, int(ARGS.steps) // 2, int(ARGS.steps) - 1):
                 frames.append(capture_pose_viewer_frame(inner, 0))
         directed_motion = directions * (inner._turn_cumulative_angle - initial_angle)
-        if first_fixture_torque is None or not bool(
-            (directions * first_fixture_torque < 0.0).all()
+        if first_resistance_estimate is None or not bool(
+            (directions * first_resistance_estimate < 0.0).all()
         ):
             raise RuntimeError(
-                "friction torque did not oppose the initial angular velocity"
+                "fixture resistance estimate did not oppose initial angular velocity"
             )
         final_angular_speed = inner.object.data.root_ang_vel_w[:, 2].abs()
-        if not bool((final_angular_speed < initial_angular_speed).all()):
+        failed_to_stop = (stop_steps < 0) | (
+            stop_steps > int(ARGS.spin_down_max_steps)
+        )
+        if bool(failed_to_stop.any()):
             raise RuntimeError(
-                "friction and damping failed to dissipate the initial angular motion: "
-                f"final_speed={final_angular_speed.tolist()}"
+                "native fixture drive failed the no-contact spin-down gate: "
+                f"stop_steps={stop_steps.tolist()}, "
+                f"final_speed={final_angular_speed.tolist()}, "
+                f"limit_steps={int(ARGS.spin_down_max_steps)}, "
+                f"stop_speed={float(ARGS.spin_down_stop_speed_radps):.4f} rad/s"
             )
+        if float(torch.rad2deg(directed_motion.abs()).max()) > float(
+            ARGS.spin_down_max_travel_deg
+        ):
+            raise RuntimeError(
+                "native joint resistance allowed excessive no-contact rotation: "
+                f"travel_deg={torch.rad2deg(directed_motion).tolist()}, "
+                f"limit={float(ARGS.spin_down_max_travel_deg):.3f} deg"
+            )
+        if bool(inner._turn_fixture_positive_power.any()):
+            raise RuntimeError("fixture resistance injected positive mechanical power")
+        if bool(inner._turn_palm_contact.any()) or bool(inner._turn_finger_contact.any()):
+            raise RuntimeError("robot contacted the key during fixture-only spin-down")
         if float(inner._turn_constraint_position_error.max()) > float(
             inner.cfg.allen_turn_constraint_position_tolerance_m
         ):
@@ -464,22 +497,29 @@ def main() -> None:
             )
             inner._turn_coulomb_friction_nm.fill_(friction)
             inner._turn_damping_nm_per_radps.fill_(damping)
-            inner._turn_stiction_yaw.copy_(yaw_from_quaternion(inner.object.data.root_quat_w))
-            inner._turn_friction_stuck.fill_(True)
-            inner._turn_fixture_torque_peak_nm.zero_()
-            inner._turn_fixture_torque_clipped_steps.zero_()
+            inner._write_turn_fixture_joint_resistance(env_ids)
+            inner._turn_fixture_stationary.fill_(True)
+            inner._turn_fixture_resistance_peak_nm.zero_()
+            inner._turn_fixture_drive_clipped_steps.zero_()
             for settle_step in range(3):
                 observation, reward, terminated, truncated, _ = env.step(action)
                 require_finite(1000 + stage * 100 + settle_step, observation, reward)
+            inner._turn_previous_yaw.copy_(
+                yaw_from_quaternion(inner.object.data.root_quat_w)
+            )
+            inner._turn_cumulative_angle.zero_()
             initial_velocity[:, 5] = directions * initial_angular_speed
             inner.object.write_root_velocity_to_sim(initial_velocity, env_ids=env_ids)
-            inner._turn_friction_stuck.fill_(False)
-            inner._turn_stiction_yaw.copy_(yaw_from_quaternion(inner.object.data.root_quat_w))
+            inner._turn_fixture_stationary.fill_(False)
             peak_pivot_error = torch.zeros(inner.num_envs, device=inner.device)
             peak_tilt_error = torch.zeros(inner.num_envs, device=inner.device)
-            peak_torque = torch.zeros(inner.num_envs, device=inner.device)
+            peak_resistance = torch.zeros(inner.num_envs, device=inner.device)
             clip_steps = torch.zeros(inner.num_envs, dtype=torch.long, device=inner.device)
-            first_torque = None
+            first_resistance = None
+            stage_stop_steps = torch.full(
+                (inner.num_envs,), -1, dtype=torch.long, device=inner.device
+            )
+            stage_initial_angle = torch.zeros_like(inner._turn_cumulative_angle)
             for loaded_step in range(int(ARGS.steps)):
                 observation, reward, terminated, truncated, _ = env.step(action)
                 require_finite(
@@ -491,26 +531,63 @@ def main() -> None:
                     raise RuntimeError(
                         f"fixture task ended during curriculum stage {stage}"
                     )
-                if first_torque is None:
-                    first_torque = inner._turn_fixture_torque_nm.clone()
+                if first_resistance is None:
+                    first_resistance = (
+                        inner._turn_fixture_resistance_estimate_nm.clone()
+                    )
+                stage_speed = inner.object.data.root_ang_vel_w[:, 2].abs()
+                newly_stopped = (stage_stop_steps < 0) & (
+                    stage_speed <= float(ARGS.spin_down_stop_speed_radps)
+                )
+                stage_stop_steps[newly_stopped] = loaded_step + 1
                 peak_pivot_error = torch.maximum(
                     peak_pivot_error, inner._turn_constraint_position_error
                 )
                 peak_tilt_error = torch.maximum(
                     peak_tilt_error, inner._turn_constraint_tilt_error
                 )
-                peak_torque = torch.maximum(
-                    peak_torque, inner._turn_fixture_torque_nm.abs()
+                peak_resistance = torch.maximum(
+                    peak_resistance,
+                    inner._turn_fixture_resistance_estimate_nm.abs(),
                 )
-                clip_steps += inner._turn_fixture_torque_clipped.long()
-            if first_torque is None or not bool((directions * first_torque < 0.0).all()):
+                clip_steps += inner._turn_fixture_drive_clipped.long()
+                if bool(inner._turn_fixture_positive_power.any()):
+                    raise RuntimeError(
+                        f"stage {stage} fixture resistance injected positive power"
+                    )
+                if bool(inner._turn_palm_contact.any()) or bool(
+                    inner._turn_finger_contact.any()
+                ):
+                    raise RuntimeError(
+                        f"robot contacted the key during stage {stage} spin-down"
+                    )
+            if first_resistance is None or not bool(
+                (directions * first_resistance < 0.0).all()
+            ):
                 raise RuntimeError(
-                    f"stage {stage} fixture torque did not oppose initial motion"
+                    f"stage {stage} resistance estimate did not oppose initial motion"
                 )
-            if float(peak_torque.max()) > torque_limit + 1.0e-5:
+            if float(peak_resistance.max()) > torque_limit + 1.0e-5:
                 raise RuntimeError(
-                    f"stage {stage} exceeded fixture torque cap: "
-                    f"peak={float(peak_torque.max()):.6f}, limit={torque_limit:.6f}"
+                    f"stage {stage} exceeded fixture resistance estimate cap: "
+                    f"peak={float(peak_resistance.max()):.6f}, limit={torque_limit:.6f}"
+                )
+            stage_failed_to_stop = (stage_stop_steps < 0) | (
+                stage_stop_steps > int(ARGS.spin_down_max_steps)
+            )
+            if bool(stage_failed_to_stop.any()):
+                raise RuntimeError(
+                    f"stage {stage} failed no-contact spin-down gate: "
+                    f"stop_steps={stage_stop_steps.tolist()}, "
+                    f"final_speed={inner.object.data.root_ang_vel_w[:, 2].abs().tolist()}"
+                )
+            stage_travel = inner._turn_cumulative_angle - stage_initial_angle
+            if float(torch.rad2deg(stage_travel.abs()).max()) > float(
+                ARGS.spin_down_max_travel_deg
+            ):
+                raise RuntimeError(
+                    f"stage {stage} allowed excessive no-contact travel: "
+                    f"travel_deg={torch.rad2deg(stage_travel).tolist()}"
                 )
             if float(peak_pivot_error.max()) > float(
                 inner.cfg.allen_turn_constraint_position_tolerance_m
@@ -531,7 +608,9 @@ def main() -> None:
                 "friction_nm": friction,
                 "damping_nm_per_radps": damping,
                 "torque_limit_nm": torque_limit,
-                "peak_torque_nm": float(peak_torque.max()),
+                "peak_resistance_estimate_nm": float(peak_resistance.max()),
+                "spin_down_stop_steps": stage_stop_steps.tolist(),
+                "spin_down_travel_deg": torch.rad2deg(stage_travel).tolist(),
                 "clip_step_ratio": float(
                     clip_steps.float().sum() / (inner.num_envs * int(ARGS.steps))
                 ),
@@ -566,14 +645,16 @@ def main() -> None:
             ),
             "table_collision_probe_force_n": probe_contact_force_n,
             "kinetic_friction_limit_nm": kinetic_limit_nm,
-            "static_friction_limit_nm": static_limit_nm,
             "initial_angular_speed_radps": initial_angular_speed,
+            "spin_down_stop_speed_radps": float(ARGS.spin_down_stop_speed_radps),
+            "spin_down_max_steps": int(ARGS.spin_down_max_steps),
+            "spin_down_stop_steps": stop_steps.tolist(),
             "final_angular_speed_radps": final_angular_speed.tolist(),
             "passive_yaw_drift_max_deg": float(
                 torch.rad2deg(passive_yaw_delta).max()
             ),
-            "passive_fixture_torque_max_nm": float(
-                passive_max_fixture_torque.max()
+            "passive_fixture_resistance_estimate_max_nm": float(
+                passive_max_fixture_resistance.max()
             ),
             "directed_motion_deg": torch.rad2deg(directed_motion).tolist(),
             "maximum_pivot_error_m": float(inner._turn_constraint_position_error.max()),
