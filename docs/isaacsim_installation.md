@@ -1,5 +1,7 @@
 # IsaacSim (Isaac Lab) installation
 
+> This file preserves the original upstream `uv` setup. For the extended research branch and its additional tactile, plotting, probing, and Allen-key dependencies, follow [sharpa_conda_environment.md](sharpa_conda_environment.md) instead.
+
 The `isaacsimenvs/` package runs the SimToolReal task in Isaac Sim via Isaac Lab. It requires **Python 3.11** (Isaac Sim 5.x / Isaac Lab 2.3.x requirement) and lives in a **second venv** at `.venv_isaacsim/`, separate from the Python 3.8 Isaac Gym venv that [isaacgym_installation.md](isaacgym_installation.md) sets up. The two environments are independent — never install Isaac Gym packages into `.venv_isaacsim` or vice versa.
 
 ## Prerequisites

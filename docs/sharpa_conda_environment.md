@@ -1,12 +1,35 @@
-# Conda environment setup for SimToolReal + TacMap (`sharpa`)
+# Reproduce the extended SimToolReal environment with conda (`sharpa`)
 
-This guide recreates the conda environment currently used for Isaac Sim / Isaac Lab training in this repo. It is based on the SimToolReal Isaac Sim setup in `docs/isaacsim_installation.md`, but uses a conda environment named `sharpa` instead of `.venv_isaacsim`, and includes the TacMap tactile-sensor requirements.
+This is the canonical setup guide for the research extensions in this fork: TacMap, scraping/contact experiments, probing tools, grasp adjustment, and Allen-key turning. It follows the original SimToolReal Isaac Sim setup in `docs/isaacsim_installation.md`, uses a conda environment named `sharpa`, and adds the packages required by the newer environments and analysis scripts.
 
-This environment is for the `isaacsimenvs/` pipeline, not the legacy `isaacgymenvs/` pipeline. Keep Isaac Gym and Isaac Sim in separate environments.
+This environment covers the active `isaacsimenvs/` training/evaluation pipeline, the local Viser demo, and experiment analysis. It does not attempt to combine the legacy `isaacgymenvs/` stack or robot deployment/ROS dependencies into one environment. Follow their dedicated documentation and keep those environments separate.
 
-## Current known-good versions
+For an exact handoff to another machine, reproduce all three layers:
 
-The active `sharpa` environment on this machine uses:
+1. The same Git branch or commit.
+2. The Python/Isaac environment in this guide.
+3. Any ignored checkpoints, datasets, or run outputs needed for the work being resumed.
+
+## Repository revision
+
+The added research code is published on the fork and is not present in the original upstream `main` branch. Clone the current branch directly:
+
+```bash
+mkdir -p ~/sharpa
+cd ~/sharpa
+git clone --branch feature/allen-key-adjustment-gate --single-branch \
+  https://github.com/Kevinskwk/simtoolreal.git simtoolreal
+cd simtoolreal
+git remote add upstream https://github.com/tylerlum/simtoolreal.git
+git status -sb
+git rev-parse HEAD
+```
+
+If the work moves to another branch later, use the branch or commit from the source machine instead. A Codex agent should inspect `git status -sb`, `git branch -vv`, and the requested experiment script before installing or running anything.
+
+## Known-good versions
+
+The reproducible package baseline recorded and exercised on this machine uses:
 
 - Python `3.11.15`
 - Isaac Sim Python packages `5.1.0.0`
@@ -16,10 +39,13 @@ The active `sharpa` environment on this machine uses:
 - `warp-lang 1.12.1`
 - `gym 0.23.1`
 - `gymnasium 1.2.0`
-- `hydra-core 1.3.2`
+- `hydra-core 1.3.2` and `omegaconf 2.3.0`
+- `numpy 1.26.0` and `scipy 1.15.3`
 - `wandb 0.26.0`
 - local SimToolReal repo installed editable with `--no-deps`
 - repo-local vendored `rl_games/` used by `isaacsimenvs/train.py`
+
+The remaining direct dependencies and their tested versions are tracked in `requirements-isaacsim-extra.txt`.
 
 ## System prerequisites
 
@@ -81,41 +107,37 @@ pip install "isaaclab[isaacsim,all]==2.3.2.post1" --extra-index-url https://pypi
 
 The current env resolved Isaac Sim packages to `5.1.0.0`. Do not casually upgrade Isaac Lab: SimToolReal uses Isaac Lab direct-RL APIs and converter behavior that can change across releases.
 
-## Clone the repo
-
-For a fresh clone:
-
-```bash
-mkdir -p ~/sharpa
-cd ~/sharpa
-git clone https://github.com/tylerlum/simtoolreal.git simtoolreal
-cd simtoolreal
-```
-
-For the existing local working tree:
-
-```bash
-cd /path/to/simtoolreal
-```
-
 ## Install repo-local RL and SimToolReal packages
 
-Install the repo-local `rl_games` first. This repo has a vendored `rl_games/` fork, and local training changes rely on that code path.
+Install the repo-local `rl_games` fork without resolving its generic dependencies, then install the tested Isaac Sim dependency set. Installing it with `--no-deps` avoids pulling a second GUI OpenCV wheel alongside the headless wheel.
 
 ```bash
-pip install -e ./rl_games/
+cd ~/sharpa/simtoolreal
+pip install -e ./rl_games/ --no-deps
+pip install -r requirements-isaacsim-extra.txt
 ```
 
-Install the packages needed by SimToolReal / Isaac Sim training. Keep the root install as `--no-deps`: the root `pyproject.toml` contains legacy Isaac Gym pins such as old `numpy`, old `warp-lang`, and `isaacgym-stubs`, which conflict with Python 3.11 / Isaac Sim.
+Register the repo packages. Keep this install as `--no-deps`: the root `pyproject.toml` contains legacy Isaac Gym pins such as old `numpy`, old `warp-lang`, and `isaacgym-stubs`, which conflict with Python 3.11 / Isaac Sim.
 
 ```bash
-pip install \
-  omegaconf hydra-core "gym==0.23.1" gymnasium scipy numpy yourdfpy requests tqdm tyro \
-  "imageio[ffmpeg]" wandb termcolor tensorboard tensorboardX pytest pytest-mock flaky \
-  matplotlib pandas opencv-python-headless trimesh shapely coacd "typing_extensions>=4.13"
-
 pip install -e . --no-deps
 ```
+
+Do not replace the requirements file with `pip install -e .` or `pip install -e ./rl_games/` without `--no-deps`. Those dependency declarations cover other environments and are not a valid lock for this Isaac Sim setup.
+
+## Download required external data
+
+The original pretrained policy is intentionally ignored by Git. Download it before running evaluation or finetuning:
+
+```bash
+python download_pretrained_policy.py
+test -s pretrained_policy/model.pth
+test -s pretrained_policy/config.yaml
+```
+
+TacMap maps and the Allen-key assets are tracked in Git and require no separate download. DexToolBench datasets are optional unless running the benchmark; follow `docs/dextoolbench.md` for those files.
+
+Git also ignores `outputs/`, downloaded checkpoints, generated grasp banks, W&B local run data, and rendered videos. Copy the specific artifacts separately if the new machine must resume an existing run. Prefer an absolute checkpoint path and verify it with `test -s /path/to/model.pth` before launch.
 
 ## TacMap-specific requirements
 
@@ -160,7 +182,7 @@ export OMNI_KIT_CACHE_PATH=/tmp/$USER/ov_cache
 mkdir -p "$OMNI_KIT_CACHE_PATH"
 ```
 
-If you use W&B:
+If you use W&B, authenticate once on the new machine:
 
 ```bash
 wandb login
@@ -174,6 +196,12 @@ Basic import check:
 cd /path/to/simtoolreal
 conda activate sharpa
 python -c "import torch, isaaclab, isaacsim; print('torch:', torch.__version__, 'cuda:', torch.cuda.is_available()); print('isaaclab:', isaaclab.__file__); print('isaacsim:', isaacsim.__file__)"
+```
+
+Confirm that Python resolves the vendored RL fork:
+
+```bash
+python -c "import sys; from pathlib import Path; sys.path.insert(0, str(Path.cwd() / 'rl_games')); import rl_games; print(rl_games.__file__)"
 ```
 
 Do not import `isaacsimenvs` in this top-level check. Task registration imports
@@ -190,22 +218,33 @@ python -m py_compile \
   rl_games/rl_games/torch_runner.py
 ```
 
-Run lightweight local unit tests:
+Run lightweight local unit tests without starting Isaac Sim:
 
 ```bash
-python -m pytest tests/test_expand_obs_checkpoint.py
+python -m pytest -q tests
 ```
 
 Some TacMap/Isaac Lab tests may skip unless Isaac Lab submodules are initialized through Isaac Sim's app launcher. That is normal for pure unit-test runs.
 
-Run one Isaac Sim smoke test. This starts Kit and is slow the first time:
+Run the AppLauncher and task-registration smoke tests. Each starts Kit and can be slow on first launch:
+
+```bash
+python isaacsimenvs/tests/test_load_isaacsim.py
+python isaacsimenvs/tests/test_gym_register.py
+```
+
+Then construct and step a small environment:
 
 ```bash
 python isaacsimenvs/tests/test_simtoolreal_env_smoke.py \
   --num_envs 8 --num_assets_per_type 2 --steps 10
 ```
 
+Only after these checks pass should a new machine launch a large environment count.
+
 ## Training commands
+
+Download `pretrained_policy/model.pth` first. The original task remains the best end-to-end installation check:
 
 Official SimToolReal Isaac Sim task:
 
@@ -249,6 +288,16 @@ python isaacsimenvs/train.py \
   agent.params.config.learning_rate=5e-5 \
   agent.params.config.central_value_config.learning_rate=5e-5
 ```
+
+The current Allen-key workflow has a deterministic preflight that does not start training or require W&B:
+
+```bash
+python scripts/validate_allen_key_turning_task.py \
+  --output outputs/allen_key_turning_validation/install_smoke.html \
+  --headless
+```
+
+For real training, use `scripts/run_allen_key_turning_training.sh` and set the intended `NUM_ENVS`, `MAX_EPOCHS`, and optional `CHECKPOINT`. Read the script first because its defaults evolve with the experiment. Do not run a second Isaac Sim process on a GPU already used by training.
 
 ## Notes on current TacMap training settings
 
@@ -343,7 +392,7 @@ nvidia-smi
 
 Only run one Isaac Sim training process per GPU unless you have explicitly partitioned resources.
 
-## Optional: export a lockfile snapshot
+## Record the completed installation
 
 After setup, save an exact package snapshot:
 
@@ -353,3 +402,23 @@ conda run -n sharpa python -m pip freeze > docs/sharpa_pip_freeze.txt
 ```
 
 These snapshots are useful for reproduction, but the setup commands above are easier to audit than installing directly from a full freeze.
+
+Also record the source revision and GPU stack with the experiment:
+
+```bash
+mkdir -p outputs/reproduction
+git rev-parse HEAD > outputs/reproduction/source_commit.txt
+nvidia-smi > outputs/reproduction/nvidia_smi.txt
+```
+
+The snapshot files are ignored by Git because they contain machine-specific transitive packages. `requirements-isaacsim-extra.txt` is the reviewed, portable dependency list.
+
+## Minimal handoff checklist for another Codex agent
+
+Give the agent the repository URL, branch or commit, target GPU, and checkpoint/data locations. It should then:
+
+1. Follow this guide without installing root dependencies.
+2. Run the CUDA import check and all three Isaac Sim smoke tests.
+3. Download the original pretrained policy or verify transferred checkpoints.
+4. Run the task-specific deterministic preflight before using the production environment count.
+5. Report exact failing commands and tracebacks; it must not silently skip missing sensors, assets, checkpoints, or validation failures.

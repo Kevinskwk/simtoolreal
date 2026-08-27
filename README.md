@@ -50,9 +50,11 @@ simtoolreal
 
 # Installation
 
-The recommended setup runs SimToolReal in **Isaac Sim** (via Isaac Lab, Python 3.11, pip-installable): see the [IsaacSim Installation](docs/isaacsim_installation.md) documentation.
+The recommended setup runs SimToolReal in **Isaac Sim** via Isaac Lab and Python 3.11. For the original upstream environment, see [IsaacSim Installation](docs/isaacsim_installation.md). For this fork's TacMap, scraping, probing, grasp-adjustment, and Allen-key extensions, use the reproducible [conda environment guide](docs/sharpa_conda_environment.md); it includes the added dependencies, correct research branch, external checkpoint download, and validation sequence.
 
 The legacy **Isaac Gym** environment (Python 3.8, manual binary download) is covered in the [IsaacGym Installation](docs/isaacgym_installation.md) documentation. The two environments live in separate venvs (`.venv_isaacsim` and `.venv`) and can coexist.
+
+The commands below retain the original `.venv_isaacsim/bin/python` form. When using the conda setup, run `conda activate sharpa` and use `python` in its place.
 
 # Quick Start
 
