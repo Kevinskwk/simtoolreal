@@ -26,6 +26,7 @@ def parse_args() -> argparse.Namespace:
         "--policy-config", type=Path, default=ROOT / "pretrained_policy/config.yaml"
     )
     parser.add_argument("--num-envs", type=int, default=256)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--curriculum-stage", type=int, default=6)
     parser.add_argument("--maximum-steps", type=int, default=1800)
     parser.add_argument("--viewer-env-ids", type=int, nargs="*", default=(0, 1, 2, 3))
@@ -132,6 +133,7 @@ def main() -> None:
     cfg = SimToolRealAllenKeyTurningEnvCfg()
     validate_inputs()
     cfg.sim.device = str(ARGS.device)
+    cfg.seed = int(ARGS.seed)
     if ARGS.compact_gpu_buffers:
         if int(ARGS.num_envs) > 16:
             raise ValueError("--compact-gpu-buffers requires --num-envs <= 16")
@@ -188,6 +190,7 @@ def main() -> None:
         "allen_turn_contact_topology_changes",
         "allen_turn_contact_losses",
         "allen_turn_contact_reacquisitions",
+        "allen_turn_productive_regrasps",
         "allen_turn_arm_joint_margin_rad",
     )
     results = {
@@ -323,8 +326,10 @@ def main() -> None:
             ))
         succeeded = arrays["allen_turn_full_success"] > 0.5
         acquired = arrays["allen_turn_ever_loaded_grasp"] > 0.5
+        productive_regrasp = arrays["allen_turn_productive_regrasps"] > 0.5
         summary = {
             "checkpoint": str(ARGS.checkpoint.resolve()),
+            "seed": int(ARGS.seed),
             "curriculum_stage": int(ARGS.curriculum_stage),
             "coulomb_friction_range_nm": list(
                 cfg.allen_turn_friction_ranges_nm[int(ARGS.curriculum_stage)]
@@ -367,6 +372,18 @@ def main() -> None:
             "apparent_regrasp_rate": float(regrasp.mean()),
             "apparent_regrasp_success_rate": float(
                 succeeded[regrasp].mean() if regrasp.any() else 0.0
+            ),
+            "productive_regrasp_rate": float(productive_regrasp.mean()),
+            "productive_regrasps_mean": float(
+                arrays["allen_turn_productive_regrasps"].mean()
+            ),
+            "full_turn_success_given_productive_regrasp": float(
+                succeeded[productive_regrasp].mean()
+                if productive_regrasp.any() else 0.0
+            ),
+            "full_turn_success_without_productive_regrasp": float(
+                succeeded[~productive_regrasp].mean()
+                if (~productive_regrasp).any() else 0.0
             ),
             "output_dir": str(output_dir.resolve()),
         }
